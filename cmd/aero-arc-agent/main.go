@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/makinje/aero-arc-agent/internal/agent"
@@ -61,7 +63,10 @@ func RunAgent(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("failed to construct agent: %v", err)
 	}
 
-	return a.Start(ctx)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	return a.Start(ctx, sigCh)
 }
 
 func main() {

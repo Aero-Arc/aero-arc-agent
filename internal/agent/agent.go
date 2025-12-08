@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -52,25 +53,39 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 
 // Start runs the MAVLink ingest loop and the gRPC reconnect/stream lifecycle
 // until the provided context is cancelled or a fatal error occurs.
-func (a *Agent) Start(ctx context.Context) error {
+func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	errCh := make(chan error, 2)
-
 	go func() {
-		errCh <- a.runMAVLink(ctx)
+		a.runMAVLink(ctx)
 	}()
 
 	go func() {
-		errCh <- a.runWithReconnect(ctx)
+		a.runWithReconnect(ctx)
 	}()
 
-	// Return on first error; the cancel will cause the other loop to exit.
-	err := <-errCh
-	cancel()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-sig:
+			slog.LogAttrs(ctx, slog.LevelInfo, "agent received shutdown signal", slog.String("signal", fmt.Sprintf("%v", sig)))
+			a.shutdown(ctx)
+			cancel()
+			return nil
+		}
+	}
+}
 
-	return err
+func (a *Agent) shutdown(ctx context.Context) error {
+	a.node.Close()
+	a.conn.Close()
+	a.gateway = nil
+	a.conn = nil
+	// TODO: Close any other resources that need to be closed.
+	// specifically, the bidirectional telemetry stream.
+	return nil
 }
 
 // runMAVLink owns the lifecycle of the gomavlib node.
