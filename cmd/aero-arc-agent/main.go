@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/makinje/aero-arc-agent/internal/agent"
 	"github.com/urfave/cli/v3"
-	"google.golang.org/grpc"
 )
 
 var agentCmd = cli.Command{
@@ -37,6 +39,16 @@ var agentCmd = cli.Command{
 			Value: 8080,
 			Usage: "The port of the server to connect to",
 		},
+		&cli.DurationFlag{
+			Name:  "backoff-initial",
+			Value: 1 * time.Second,
+			Usage: "Initial reconnect backoff duration",
+		},
+		&cli.DurationFlag{
+			Name:  "backoff-max",
+			Value: 30 * time.Second,
+			Usage: "Maximum reconnect backoff duration",
+		},
 	},
 }
 
@@ -46,16 +58,15 @@ func RunAgent(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("failed to get agent options: %v", err)
 	}
 
-	conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", options.ServerAddress, options.ServerPort))
+	a, err := agent.NewAgent(options)
 	if err != nil {
-		return fmt.Errorf("failed to connect to server: %v", err)
+		return fmt.Errorf("failed to construct agent: %v", err)
 	}
 
-	agent.NewAgent(options)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	defer conn.Close()
-
-	return nil
+	return a.Start(ctx, sigCh)
 }
 
 func main() {

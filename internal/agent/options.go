@@ -1,12 +1,25 @@
 package agent
 
-import "github.com/urfave/cli/v3"
+import (
+	"fmt"
+	"time"
+
+	"github.com/urfave/cli/v3"
+)
 
 type AgentOptions struct {
 	SerialPath    string
 	SerialBaud    int
 	ServerAddress string
 	ServerPort    int
+
+	// Computed relay target in host:port form.
+	RelayTarget string
+
+	// Reconnect/backoff configuration.
+	BackoffInitial time.Duration
+	BackoffMax     time.Duration
+
 	ConsulAddress string
 	ConsulPort    int
 	ConsulToken   string
@@ -35,5 +48,9 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		SerialBaud:    c.Int("serial-baud"),
 		ServerAddress: c.String("server-address"),
 		ServerPort:    c.Int("server-port"),
+		RelayTarget:   fmt.Sprintf("%s:%d", c.String("server-address"), c.Int("server-port")),
+
+		BackoffInitial: c.Duration("backoff-initial"),
+		BackoffMax:     c.Duration("backoff-max"),
 	}, nil
 }

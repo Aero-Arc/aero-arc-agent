@@ -13,4 +13,6 @@ var (
 	ErrConsulAgentIDNotSet     = errors.New("consul agent ID not set")
 	ErrConsulUnsupported       = errors.New("consul unsupported")
 	ErrFailedToConnectToServer = errors.New("failed to connect to server")
+
+	ErrGatewayNotInitialized = errors.New("agent gateway client not initialized")
 )
