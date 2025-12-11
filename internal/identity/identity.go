@@ -1,7 +1,6 @@
 package identity
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,12 +18,8 @@ import (
 // possible from hardware, OS, and persisted identifiers without ever
 // panicking or logging.
 type Identity struct {
-	HardwareID  string
-	MachineID   string
-	MACAddress  string
 	GeneratedID string
 	FinalID     string
-	Method      string
 }
 
 var cachedIdentity Identity
@@ -68,87 +63,14 @@ func Resolve() Identity {
 // internal so that tests can exercise the full resolution logic with mocked
 // dependencies.
 func resolveWithEnv(env resolverEnv) Identity {
-	hardwareID := resolveHardwareID(env)
-	machineID := resolveMachineID(env)
-	macAddress := resolveMACAddress(env)
+	generatedID := resolveGeneratedID(env)
 
-	var generatedID string
-	if hardwareID == "" && machineID == "" {
-		generatedID = resolveGeneratedID(env)
-	}
-
-	finalID := computeFinalID(hardwareID, machineID, macAddress, generatedID)
-	method := determineMethod(hardwareID, machineID, generatedID)
+	finalID := computeFinalID(generatedID)
 
 	return Identity{
-		HardwareID:  hardwareID,
-		MachineID:   machineID,
-		MACAddress:  macAddress,
 		GeneratedID: generatedID,
 		FinalID:     finalID,
-		Method:      method,
 	}
-}
-
-// resolveHardwareID attempts to gather a stable hardware-anchored identifier
-// from a variety of platform-specific sources.
-func resolveHardwareID(env resolverEnv) string {
-	// 1. Device-tree serials (common on embedded boards).
-	if id := readDeviceTreeSerial(env, "/proc/device-tree/serial-number"); id != "" {
-		return id
-	}
-	if id := readDeviceTreeSerial(env, "/sys/firmware/devicetree/base/serial-number"); id != "" {
-		return id
-	}
-
-	// 2. Raspberry Pi CPU serial from /proc/cpuinfo.
-	if id := readRaspberryPiSerial(env); id != "" {
-		return id
-	}
-
-	// 3. Jetson UID.
-	if id := readIDFromFile(env, "/sys/module/tegra_fuse/parameters/tegra_chip_uid", false); id != "" {
-		return id
-	}
-
-	// 4. eMMC CID.
-	if id := readIDFromFile(env, "/sys/block/mmcblk0/device/cid", false); id != "" {
-		return id
-	}
-
-	// 5. DMI UUID.
-	if id := readIDFromFile(env, "/sys/class/dmi/id/product_uuid", false); id != "" {
-		return id
-	}
-
-	return ""
-}
-
-// resolveMachineID reads the OS-provided machine-id, if any.
-func resolveMachineID(env resolverEnv) string {
-	id := readIDFromFile(env, "/etc/machine-id", false)
-	return id
-}
-
-// resolveMACAddress returns the MAC address of the first non-loopback
-// interface that has a hardware address.
-func resolveMACAddress(env resolverEnv) string {
-	ifaces, err := env.interfaces()
-	if err != nil {
-		return ""
-	}
-
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if len(iface.HardwareAddr) == 0 {
-			continue
-		}
-		return iface.HardwareAddr.String()
-	}
-
-	return ""
 }
 
 // resolveGeneratedID returns a persisted UUID stored at
@@ -161,7 +83,6 @@ func resolveGeneratedID(env resolverEnv) string {
 	}
 
 	path := filepath.Join(home, ".aeroarc", "agent-id")
-
 	// Attempt to load an existing ID.
 	if data, err := env.readFile(path); err == nil {
 		if id := normalizeID(string(data)); id != "" {
@@ -185,58 +106,6 @@ func resolveGeneratedID(env resolverEnv) string {
 	return uuid
 }
 
-// readDeviceTreeSerial reads a device-tree serial-number file, stripping
-// trailing NUL terminators and whitespace as required on ARM platforms.
-func readDeviceTreeSerial(env resolverEnv, path string) string {
-	return readIDFromFile(env, path, true)
-}
-
-// readRaspberryPiSerial parses the CPU serial from /proc/cpuinfo on
-// Raspberry Pi systems.
-func readRaspberryPiSerial(env resolverEnv) string {
-	data, err := env.readFile("/proc/cpuinfo")
-	if err != nil {
-		return ""
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "Serial") {
-			continue
-		}
-
-		// Format is typically: "Serial  : 00000000abcdef01"
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		serial := normalizeID(parts[1])
-		if serial != "" {
-			return serial
-		}
-	}
-
-	return ""
-}
-
-// readIDFromFile reads the contents of a file and returns a normalized
-// identifier string, optionally stripping NUL bytes which are common in
-// device-tree blobs.
-func readIDFromFile(env resolverEnv, path string, stripNull bool) string {
-	data, err := env.readFile(path)
-	if err != nil {
-		return ""
-	}
-	if stripNull {
-		// Device-tree files often contain NUL padding; strip all NUL bytes.
-		data = bytes.ReplaceAll(data, []byte{0x00}, nil)
-	}
-
-	return normalizeID(string(data))
-}
-
 // normalizeID trims whitespace and NUL characters from the provided string.
 func normalizeID(s string) string {
 	// Remove NUL from both ends, then whitespace.
@@ -246,34 +115,18 @@ func normalizeID(s string) string {
 }
 
 // computeFinalID constructs the composite identity digest as:
-// sha256(hardwareID + machineID + macAddress + generatedID), hex-encoded.
-func computeFinalID(hardwareID, machineID, macAddress, generatedID string) string {
+// sha256(UUIDv4), hex-encoded.
+func computeFinalID(generatedID string) string {
 	h := sha256.New()
-	_, _ = h.Write([]byte(hardwareID))
-	_, _ = h.Write([]byte(machineID))
-	_, _ = h.Write([]byte(macAddress))
 	_, _ = h.Write([]byte(generatedID))
 	sum := h.Sum(nil)
 	return hex.EncodeToString(sum)
 }
 
-// determineMethod returns the resolution method string based on which
-// identifiers were actually discovered.
-func determineMethod(hardwareID, machineID, generatedID string) string {
-	switch {
-	case hardwareID != "":
-		return "hardware"
-	case machineID != "":
-		return "machine-id"
-	case generatedID != "":
-		return "generated"
-	default:
-		return ""
-	}
-}
-
 // generateUUIDv4 produces an RFC 4122 version 4 UUID string using
 // crypto/rand. Errors are returned rather than panicking.
+// 1 in a billion chance of collision after 103 trillion UUIDs
+// https://en.wikipedia.org/wiki/Universally_unique_identifier#:~:text=Thus%2C%20the%20probability%20to%20find,later%20in%20the%20manufacturing%20process.
 func generateUUIDv4() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

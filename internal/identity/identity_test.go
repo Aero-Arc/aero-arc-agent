@@ -1,226 +1,56 @@
 package identity
 
 import (
-	"bytes"
 	"crypto/sha256"
-	"net"
+	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-// helper to build a resolverEnv with only file contents mocked.
-func newFileEnv(files map[string]string) resolverEnv {
-	return resolverEnv{
-		readFile: func(path string) ([]byte, error) {
-			if v, ok := files[path]; ok {
-				return []byte(v), nil
-			}
-			return nil, os.ErrNotExist
-		},
-		interfaces: func() ([]net.Interface, error) {
-			return nil, nil
-		},
-		userHomeDir: func() (string, error) {
-			return "", os.ErrNotExist
-		},
-		mkdirAll: func(path string, perm os.FileMode) error {
-			return nil
-		},
-		writeFile: func(name string, data []byte, perm os.FileMode) error {
-			return nil
-		},
+func TestNormalizeIDTrimsWhitespaceAndNulls(t *testing.T) {
+	raw := "\x00  abc-123  \n\x00"
+	got := normalizeID(raw)
+	if want := "abc-123"; got != want {
+		t.Fatalf("normalizeID(%q) = %q, want %q", raw, got, want)
 	}
 }
 
-func TestReadDeviceTreeSerialStripsNullsAndWhitespace(t *testing.T) {
-	files := map[string]string{
-		"/proc/device-tree/serial-number": "ABC123\x00\x00\n",
+func TestComputeFinalIDMatchesSHA256OfUUID(t *testing.T) {
+	uuid := "550e8400-e29b-41d4-a716-446655440000"
+	sum := sha256.Sum256([]byte(uuid))
+	want := hex.EncodeToString(sum[:])
+
+	got := computeFinalID(uuid)
+	if got != want {
+		t.Fatalf("computeFinalID(%q) = %q, want %q", uuid, got, want)
 	}
-	env := newFileEnv(files)
-
-	id := readDeviceTreeSerial(env, "/proc/device-tree/serial-number")
-	if id != "ABC123" {
-		t.Fatalf("expected 'ABC123', got %q", id)
-	}
-}
-
-func TestReadRaspberryPiSerialParsing(t *testing.T) {
-	const cpuinfo = `
-processor	: 0
-model name	: ARMv7 Processor rev 4 (v7l)
-Serial		: 00000000deadbeef
-`
-	env := newFileEnv(map[string]string{
-		"/proc/cpuinfo": cpuinfo,
-	})
-
-	id := readRaspberryPiSerial(env)
-	if id != "00000000deadbeef" {
-		t.Fatalf("expected Raspberry Pi serial '00000000deadbeef', got %q", id)
-	}
-}
-
-func TestResolveHardwareIDFallbackOrder(t *testing.T) {
-	files := map[string]string{
-		// First path missing.
-		"/sys/firmware/devicetree/base/serial-number": "DTREE123",
-	}
-	env := newFileEnv(files)
-
-	id := resolveHardwareID(env)
-	if id != "DTREE123" {
-		t.Fatalf("expected hardware ID from second device-tree path, got %q", id)
-	}
-}
-
-func TestResolveMachineIDTrimmed(t *testing.T) {
-	env := newFileEnv(map[string]string{
-		"/etc/machine-id": "  machine-id-xyz \n",
-	})
-
-	id := resolveMachineID(env)
-	if id != "machine-id-xyz" {
-		t.Fatalf("expected trimmed machine-id 'machine-id-xyz', got %q", id)
-	}
-}
-
-func TestResolveMACAddressSkipsLoopback(t *testing.T) {
-	env := resolverEnv{
-		readFile: func(path string) ([]byte, error) {
-			return nil, os.ErrNotExist
-		},
-		interfaces: func() ([]net.Interface, error) {
-			return []net.Interface{
-				{
-					Name:         "lo",
-					Flags:        net.FlagLoopback,
-					HardwareAddr: net.HardwareAddr{0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-				},
-				{
-					Name:         "eth0",
-					Flags:        0,
-					HardwareAddr: net.HardwareAddr{0xde, 0xad, 0xbe, 0xef, 0x00, 0x01},
-				},
-			}, nil
-		},
-		userHomeDir: func() (string, error) {
-			return "", os.ErrNotExist
-		},
-		mkdirAll: func(path string, perm os.FileMode) error {
-			return nil
-		},
-		writeFile: func(name string, data []byte, perm os.FileMode) error {
-			return nil
-		},
-	}
-
-	mac := resolveMACAddress(env)
-	if mac != "de:ad:be:ef:00:01" {
-		t.Fatalf("expected eth0 MAC 'de:ad:be:ef:00:01', got %q", mac)
-	}
-}
-
-func TestCompositeHashStability(t *testing.T) {
-	env := resolverEnv{
-		readFile: func(path string) ([]byte, error) {
-			switch path {
-			case "/proc/device-tree/serial-number":
-				return []byte("HWID123"), nil
-			case "/etc/machine-id":
-				return []byte("MID456"), nil
-			default:
-				return nil, os.ErrNotExist
-			}
-		},
-		interfaces: func() ([]net.Interface, error) {
-			return []net.Interface{
-				{
-					Name:         "eth0",
-					HardwareAddr: net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
-				},
-			}, nil
-		},
-		userHomeDir: func() (string, error) {
-			return "", os.ErrNotExist
-		},
-		mkdirAll: func(path string, perm os.FileMode) error {
-			return nil
-		},
-		writeFile: func(name string, data []byte, perm os.FileMode) error {
-			return nil
-		},
-	}
-
-	id1 := resolveWithEnv(env)
-	id2 := resolveWithEnv(env)
-
-	if id1.FinalID != id2.FinalID {
-		t.Fatalf("expected stable final ID, got %q and %q", id1.FinalID, id2.FinalID)
-	}
-
-	// Also verify the hash matches our direct computation of the same inputs.
-	expectedBytes := sha256.Sum256([]byte("HWID123" + "MID456" + "aa:bb:cc:dd:ee:ff"))
-	expected := strings.ToLower(hexEncode(expectedBytes[:]))
-	if id1.FinalID != expected {
-		t.Fatalf("expected final ID %q, got %q", expected, id1.FinalID)
-	}
-}
-
-func hexEncode(b []byte) string {
-	const hexChars = "0123456789abcdef"
-	var buf bytes.Buffer
-	for _, v := range b {
-		buf.WriteByte(hexChars[v>>4])
-		buf.WriteByte(hexChars[v&0x0f])
-	}
-	return buf.String()
 }
 
 func TestGeneratedIDPersistence(t *testing.T) {
 	tempHome := t.TempDir()
 
-	var writtenPath string
-	var writtenData []byte
-
 	env := resolverEnv{
-		readFile: func(path string) ([]byte, error) {
-			// Only allow reads from the generated ID path; simulate missing on first call.
-			if path == filepath.Join(tempHome, ".aeroarc", "agent-id") {
-				if writtenData != nil {
-					return writtenData, nil
-				}
-				return nil, os.ErrNotExist
-			}
-			return nil, os.ErrNotExist
-		},
-		interfaces: func() ([]net.Interface, error) {
-			return nil, nil
-		},
-		userHomeDir: func() (string, error) {
-			return tempHome, nil
-		},
-		mkdirAll: func(path string, perm os.FileMode) error {
-			return os.MkdirAll(path, perm)
-		},
-		writeFile: func(name string, data []byte, perm os.FileMode) error {
-			writtenPath = name
-			writtenData = append([]byte(nil), data...)
-			return os.WriteFile(name, data, perm)
-		},
+		readFile:    os.ReadFile,
+		interfaces:  nil,
+		userHomeDir: func() (string, error) { return tempHome, nil },
+		mkdirAll:    os.MkdirAll,
+		writeFile:   os.WriteFile,
 	}
 
+	// First resolution should create and persist a new UUID.
 	id1 := resolveWithEnv(env)
 	if id1.GeneratedID == "" {
 		t.Fatalf("expected generated ID to be set")
 	}
-	if method := determineMethod("", "", id1.GeneratedID); method != "generated" {
-		t.Fatalf("expected method 'generated', got %q", method)
-	}
 
-	if writtenPath == "" {
-		t.Fatalf("expected generated ID to be written to disk")
+	idFile := filepath.Join(tempHome, ".aeroarc", "agent-id")
+	data, err := os.ReadFile(idFile)
+	if err != nil {
+		t.Fatalf("expected agent-id file to exist: %v", err)
+	}
+	if got := string(data); got != id1.GeneratedID {
+		t.Fatalf("expected file contents %q, got %q", id1.GeneratedID, got)
 	}
 
 	// Second resolution should load the same ID from disk.
@@ -230,68 +60,33 @@ func TestGeneratedIDPersistence(t *testing.T) {
 	}
 }
 
-func TestResolveMethodSelection(t *testing.T) {
-	cases := []struct {
-		hw, mid, gid string
-		expected     string
-	}{
-		{hw: "hw", mid: "mid", gid: "gid", expected: "hardware"},
-		{hw: "hw", mid: "", gid: "", expected: "hardware"},
-		{hw: "", mid: "mid", gid: "gid", expected: "machine-id"},
-		{hw: "", mid: "", gid: "gid", expected: "generated"},
-		{hw: "", mid: "", gid: "", expected: ""},
-	}
-
-	for _, tc := range cases {
-		method := determineMethod(tc.hw, tc.mid, tc.gid)
-		if method != tc.expected {
-			t.Fatalf("determineMethod(%q,%q,%q) = %q, expected %q",
-				tc.hw, tc.mid, tc.gid, method, tc.expected)
-		}
-	}
-}
-
-func TestResolveUsesHardwarePreferredOverMachineID(t *testing.T) {
+func TestResolveWithMissingHomeReturnsEmptyGeneratedID(t *testing.T) {
 	env := resolverEnv{
-		readFile: func(path string) ([]byte, error) {
-			switch path {
-			case "/proc/device-tree/serial-number":
-				return []byte("HWID123"), nil
-			case "/etc/machine-id":
-				return []byte("MID456"), nil
-			default:
-				return nil, os.ErrNotExist
-			}
-		},
-		interfaces: func() ([]net.Interface, error) {
-			return nil, nil
-		},
-		userHomeDir: func() (string, error) {
-			return "", os.ErrNotExist
-		},
-		mkdirAll: func(path string, perm os.FileMode) error {
-			return nil
-		},
-		writeFile: func(name string, data []byte, perm os.FileMode) error {
-			return nil
-		},
+		readFile:    os.ReadFile,
+		interfaces:  nil,
+		userHomeDir: func() (string, error) { return "", os.ErrNotExist },
+		mkdirAll:    os.MkdirAll,
+		writeFile:   os.WriteFile,
 	}
 
 	id := resolveWithEnv(env)
-	if id.HardwareID != "HWID123" {
-		t.Fatalf("expected hardware ID 'HWID123', got %q", id.HardwareID)
-	}
-	if id.Method != "hardware" {
-		t.Fatalf("expected method 'hardware', got %q", id.Method)
-	}
 	if id.GeneratedID != "" {
-		t.Fatalf("expected no generated ID when hardware or machine-id is present")
+		t.Fatalf("expected empty GeneratedID when home directory is unavailable, got %q", id.GeneratedID)
+	}
+
+	sum := sha256.Sum256([]byte(""))
+	want := hex.EncodeToString(sum[:])
+	if id.FinalID != want {
+		t.Fatalf("expected FinalID %q when GeneratedID empty, got %q", want, id.FinalID)
 	}
 }
 
-func TestResolvePublicFunctionDoesNotPanic(t *testing.T) {
-	// This is a smoke test; if Resolve panics, the test will fail.
-	_ = Resolve()
-}
+func TestResolveStableWithinProcess(t *testing.T) {
+	id1 := Resolve()
+	id2 := Resolve()
 
+	if id1 != id2 {
+		t.Fatalf("expected Resolve to return same identity within a process, got %+v and %+v", id1, id2)
+	}
+}
 
