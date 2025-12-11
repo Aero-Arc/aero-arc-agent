@@ -10,6 +10,7 @@ import (
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/makinje/aero-arc-agent/internal/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -57,6 +58,17 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Resolve Identity
+	identity := identity.Resolve()
+	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
+
+	var err error
+	a.gateway, a.conn, err = a.getAgentGatewayClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Run MAVLink loop
 	go func() {
 		a.runMAVLink(ctx)
 	}()
@@ -137,8 +149,39 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	return nil
 }
 
+func (a *Agent) getAgentGatewayClient(ctx context.Context) (agentv1.AgentGatewayClient, *grpc.ClientConn, error) {
+	backoff := a.backoffInitial
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+	maxBackoff := a.backoffMax
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+
+	for {
+		conn, err := a.establishRelayConnection(context.Background())
+		if err != nil {
+			slog.LogAttrs(
+				ctx, slog.LevelError,
+				ErrFailedRelayGrpcConnection.Error(),
+				slog.String("target", a.options.RelayTarget),
+				slog.String("error", err.Error()),
+				slog.Int64("backoff_ms", backoff.Milliseconds()),
+			)
+
+			sleepWithContext(ctx, backoff)
+
+			backoff = nextBackoff(backoff, maxBackoff)
+			continue
+		}
+
+		return agentv1.NewAgentGatewayClient(conn), conn, nil
+	}
+}
+
 // dialRelay establishes a gRPC connection to the relay using the configured target.
-func (a *Agent) dialRelay(ctx context.Context) (*grpc.ClientConn, error) {
+func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -148,11 +191,9 @@ func (a *Agent) dialRelay(ctx context.Context) (*grpc.ClientConn, error) {
 		slog.String("target", a.options.RelayTarget),
 	)
 
-	conn, err := grpc.DialContext(
-		dialCtx,
+	conn, err := grpc.NewClient(
 		a.options.RelayTarget,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrFailedToConnectToServer, err)
@@ -254,26 +295,6 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-
-		conn, err := a.dialRelay(ctx)
-		if err != nil {
-			slog.LogAttrs(
-				ctx, slog.LevelError,
-				"agent_connect_failed",
-				slog.String("target", a.options.RelayTarget),
-				slog.String("error", err.Error()),
-				slog.Int64("backoff_ms", backoff.Milliseconds()),
-			)
-
-			if !sleepWithContext(ctx, backoff) {
-				return ctx.Err()
-			}
-			backoff = nextBackoff(backoff, maxBackoff)
-			continue
-		}
-
-		a.conn = conn
-		a.gateway = agentv1.NewAgentGatewayClient(conn)
 
 		regCtx, cancelReg := context.WithTimeout(ctx, 10*time.Second)
 		err = a.register(regCtx)
