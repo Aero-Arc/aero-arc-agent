@@ -10,6 +10,7 @@ import (
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/makinje/aero-arc-agent/internal/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -25,6 +26,14 @@ type Agent struct {
 	// reconnection/backoff settings – wired from AgentOptions.
 	backoffInitial time.Duration
 	backoffMax     time.Duration
+
+	// Internal hooks primarily for testing; in production these are wired to
+	// the concrete implementations below.
+	dialFn        func(ctx context.Context) (*grpc.ClientConn, error)
+	registerFn    func(ctx context.Context) error
+	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error)
+	streamLoopFn  func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error
+	sleepWithBack func(ctx context.Context, d time.Duration) bool
 }
 
 func NewAgent(options *AgentOptions) (*Agent, error) {
@@ -35,7 +44,7 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 		options.BackoffMax = 30 * time.Second
 	}
 
-	return &Agent{
+	a := &Agent{
 		node: &gomavlib.Node{
 			Endpoints: []gomavlib.EndpointConf{
 				gomavlib.EndpointSerial{
@@ -48,7 +57,16 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 		options:        options,
 		backoffInitial: options.BackoffInitial,
 		backoffMax:     options.BackoffMax,
-	}, nil
+	}
+
+	// Wire default implementations for lifecycle hooks.
+	a.dialFn = a.establishRelayConnection
+	a.registerFn = a.register
+	a.openStreamFn = a.openTelemetryStream
+	a.streamLoopFn = a.runStreamLoop
+	a.sleepWithBack = sleepWithContext
+
+	return a, nil
 }
 
 // Start runs the MAVLink ingest loop and the gRPC reconnect/stream lifecycle
@@ -57,6 +75,11 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Resolve Identity
+	identity := identity.Resolve()
+	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
+
+	// Run MAVLink loop
 	go func() {
 		a.runMAVLink(ctx)
 	}()
@@ -138,7 +161,7 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 }
 
 // dialRelay establishes a gRPC connection to the relay using the configured target.
-func (a *Agent) dialRelay(ctx context.Context) (*grpc.ClientConn, error) {
+func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -148,11 +171,9 @@ func (a *Agent) dialRelay(ctx context.Context) (*grpc.ClientConn, error) {
 		slog.String("target", a.options.RelayTarget),
 	)
 
-	conn, err := grpc.DialContext(
-		dialCtx,
+	conn, err := grpc.NewClient(
 		a.options.RelayTarget,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrFailedToConnectToServer, err)
@@ -168,7 +189,10 @@ func (a *Agent) register(ctx context.Context) error {
 	}
 
 	// TODO: Populate RegisterRequest with real identity/metadata fields once AgentOptions exposes them.
-	req := &agentv1.RegisterRequest{}
+	req := &agentv1.RegisterRequest{
+		AgentId: identity.Resolve().FinalID,
+		// TODO: Add more fields here.
+	}
 
 	slog.LogAttrs(
 		ctx, slog.LevelInfo,
@@ -238,8 +262,9 @@ func (a *Agent) runStreamLoop(ctx context.Context, stream grpc.BidiStreamingClie
 	}
 }
 
-// runWithReconnect orchestrates connect → register → stream with exponential
-// backoff and context-aware cancellation.
+// runWithReconnect orchestrates dial → register → stream with exponential
+// backoff and context-aware cancellation. It owns the full lifecycle of the
+// gRPC connection and telemetry stream.
 func (a *Agent) runWithReconnect(ctx context.Context) error {
 	backoff := a.backoffInitial
 	if backoff <= 0 {
@@ -255,7 +280,8 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			return err
 		}
 
-		conn, err := a.dialRelay(ctx)
+		// 1. Establish connection.
+		conn, err := a.dialFn(ctx)
 		if err != nil {
 			slog.LogAttrs(
 				ctx, slog.LevelError,
@@ -265,7 +291,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 				slog.Int64("backoff_ms", backoff.Milliseconds()),
 			)
 
-			if !sleepWithContext(ctx, backoff) {
+			if !a.sleepWithBack(ctx, backoff) {
 				return ctx.Err()
 			}
 			backoff = nextBackoff(backoff, maxBackoff)
@@ -275,8 +301,9 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		a.conn = conn
 		a.gateway = agentv1.NewAgentGatewayClient(conn)
 
+		// 2. Register with the relay.
 		regCtx, cancelReg := context.WithTimeout(ctx, 10*time.Second)
-		err = a.register(regCtx)
+		err = a.registerFn(regCtx)
 		cancelReg()
 		if err != nil {
 			slog.LogAttrs(
@@ -291,14 +318,15 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			a.conn = nil
 			a.gateway = nil
 
-			if !sleepWithContext(ctx, backoff) {
+			if !a.sleepWithBack(ctx, backoff) {
 				return ctx.Err()
 			}
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
 
-		stream, err := a.openTelemetryStream(ctx)
+		// 3. Open telemetry stream.
+		stream, err := a.openStreamFn(ctx)
 		if err != nil {
 			slog.LogAttrs(
 				ctx, slog.LevelError,
@@ -312,14 +340,15 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			a.conn = nil
 			a.gateway = nil
 
-			if !sleepWithContext(ctx, backoff) {
+			if !a.sleepWithBack(ctx, backoff) {
 				return ctx.Err()
 			}
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
 
-		err = a.runStreamLoop(ctx, stream)
+		// 4. Run the stream loop until it ends or context is cancelled.
+		err = a.streamLoopFn(ctx, stream)
 
 		slog.LogAttrs(
 			ctx, slog.LevelInfo,
@@ -353,7 +382,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 				slog.Int64("backoff_ms", backoff.Milliseconds()),
 			)
 
-			if !sleepWithContext(ctx, backoff) {
+			if !a.sleepWithBack(ctx, backoff) {
 				return ctx.Err()
 			}
 			backoff = nextBackoff(backoff, maxBackoff)
