@@ -190,7 +190,7 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 
 	// TODO: Use a proper TLS config with a valid certificate.
 	creds := credentials.NewTLS(&tls.Config{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: a.options.SkipTLSVerify,
 	})
 
 	slog.LogAttrs(

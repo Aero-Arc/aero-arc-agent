@@ -26,8 +26,9 @@ type AgentOptions struct {
 	ConsulToken   string
 	ConsulAgentID string
 
-	APIKey         string
-	EventQueueSize int
+	APIKey              string
+	EventQueueSize      int
+	SkipTLSVerification bool
 }
 
 func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {

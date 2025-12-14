@@ -54,6 +54,11 @@ var agentCmd = cli.Command{
 			Value: 1000,
 			Usage: "The size of the event queue",
 		},
+		&cli.BoolFlag{
+			Name:  "skip-tls-verification",
+			Value: false,
+			Usage: "Skip TLS verification",
+		},
 	},
 }
 
