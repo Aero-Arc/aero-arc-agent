@@ -25,15 +25,16 @@ type Agent struct {
 	options *AgentOptions
 
 	// reconnection/backoff settings – wired from AgentOptions.
-	backoffInitial time.Duration
-	backoffMax     time.Duration
+	backoffInitial  time.Duration
+	backoffMax      time.Duration
+	eventFrameQueue chan *agentv1.TelemetryFrame
 
 	// Internal hooks primarily for testing; in production these are wired to
 	// the concrete implementations below.
 	dialFn        func(ctx context.Context) (*grpc.ClientConn, error)
 	registerFn    func(ctx context.Context) error
 	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error)
-	streamLoopFn  func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error
+	ackLoopFn     func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error
 	sleepWithBack func(ctx context.Context, d time.Duration) bool
 }
 
@@ -55,16 +56,17 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 			},
 			Dialect: common.Dialect,
 		},
-		options:        options,
-		backoffInitial: options.BackoffInitial,
-		backoffMax:     options.BackoffMax,
+		options:         options,
+		backoffInitial:  options.BackoffInitial,
+		backoffMax:      options.BackoffMax,
+		eventFrameQueue: make(chan *agentv1.TelemetryFrame, options.EventQueueSize),
 	}
 
 	// Wire default implementations for lifecycle hooks.
 	a.dialFn = a.establishRelayConnection
 	a.registerFn = a.register
 	a.openStreamFn = a.openTelemetryStream
-	a.streamLoopFn = a.runStreamLoop
+	a.ackLoopFn = a.runAckLoop
 	a.sleepWithBack = sleepWithContext
 
 	return a, nil
@@ -125,13 +127,27 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 			return ctx.Err()
 		default:
 			if frameEvt, ok := evt.(*gomavlib.EventFrame); ok {
-				// TODO: Handle frame (enqueue for telemetry pipeline).
 				slog.LogAttrs(
 					ctx, slog.LevelInfo,
 					"mavlink_frame_received",
 					slog.String("frame-message", fmt.Sprintf("%+v", frameEvt.Message())),
 				)
+				// TODO Handle sending to WAL here.
+				// Convert to WAL should give back a TelemetryFrame.
+				telemetryFrame, err := a.sendToWAL(ctx, frameEvt)
+				if err != nil {
+					slog.LogAttrs(
+						ctx, slog.LevelError,
+						"failed_to_send_to_wal",
+						slog.String("error", err.Error()),
+					)
+					// TODO: when we error here, we probably want to retry with a
+					// error queue.
+					// We should also consider backoff.
+					continue
+				}
 
+				a.eventFrameQueue <- telemetryFrame
 				continue
 			}
 
@@ -162,6 +178,11 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	return nil
 }
 
+func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*agentv1.TelemetryFrame, error) {
+	// TODO: Implement this.
+	return nil, nil
+}
+
 // dialRelay establishes a gRPC connection to the relay using the configured target.
 func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -169,7 +190,7 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 
 	// TODO: Use a proper TLS config with a valid certificate.
 	creds := credentials.NewTLS(&tls.Config{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: a.options.SkipTLSVerification,
 	})
 
 	slog.LogAttrs(
@@ -253,7 +274,8 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 
 // runStreamLoop handles the receive side of the telemetry stream. Outbound
 // sends will be wired in a later iteration once the queue is implemented.
-func (a *Agent) runStreamLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -264,11 +286,35 @@ func (a *Agent) runStreamLoop(ctx context.Context, stream grpc.BidiStreamingClie
 				return err
 			}
 
-			slog.LogAttrs(
-				ctx, slog.LevelDebug,
-				"telemetry_ack_received",
-				slog.String("ack", fmt.Sprintf("%+v", ack)),
-			)
+			err = a.handleTelemetryAck(ctx, ack)
+			if err != nil {
+				// TODO: Handle error? Should we retry? Definitely shouldn't just exit.
+				return err
+			}
+		}
+	}
+}
+
+func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAck) error {
+	slog.LogAttrs(
+		ctx, slog.LevelDebug,
+		"telemetry_ack_received",
+		slog.String("ack", fmt.Sprintf("%+v", ack)),
+	)
+
+	return nil
+}
+
+func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case frame := <-a.eventFrameQueue:
+			err := stream.Send(frame)
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -308,6 +354,9 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
+
+		connCtx, cancelConn := context.WithCancel(ctx)
+		defer cancelConn()
 
 		a.conn = conn
 		a.gateway = agentv1.NewAgentGatewayClient(conn)
@@ -358,8 +407,26 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			continue
 		}
 
-		// 4. Run the stream loop until it ends or context is cancelled.
-		err = a.streamLoopFn(ctx, stream)
+		errChan := make(chan error, 2)
+
+		// 4. Handle telemetry frames.
+		go func() {
+			errChan <- a.handleTelemetryFrames(connCtx, stream)
+		}()
+
+		// 5. Run the ack loop until it ends or context is cancelled.
+		go func() {
+			errChan <- a.ackLoopFn(connCtx, stream)
+		}()
+
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case err := <-errChan:
+			slog.LogAttrs(ctx, slog.LevelInfo, "stream_ended", slog.String("error", fmt.Sprint(err)))
+		}
+
+		cancelConn()
 
 		slog.LogAttrs(
 			ctx, slog.LevelInfo,
@@ -368,6 +435,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			slog.String("error", fmt.Sprintf("%v", err)),
 		)
 
+		// Cleanup and Reconnect
 		_ = stream.CloseSend()
 		_ = conn.Close()
 		a.conn = nil

@@ -26,7 +26,9 @@ type AgentOptions struct {
 	ConsulToken   string
 	ConsulAgentID string
 
-	APIKey string
+	APIKey              string
+	EventQueueSize      int
+	SkipTLSVerification bool
 }
 
 func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
@@ -56,5 +58,6 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		BackoffInitial: c.Duration("backoff-initial"),
 		BackoffMax:     c.Duration("backoff-max"),
 		APIKey:         os.Getenv("AERO_ARC_API_KEY"),
+		EventQueueSize: c.Int("event-queue-size"),
 	}, nil
 }

@@ -3,11 +3,14 @@ package agent
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestNextBackoff(t *testing.T) {
@@ -51,8 +54,8 @@ func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 		t.Fatalf("openStreamFn should not be called on dial failure")
 		return nil, nil
 	}
-	a.streamLoopFn = func(ctx context.Context, _ grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
-		t.Fatalf("streamLoopFn should not be called on dial failure")
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+		t.Fatalf("ackLoopFn should not be called on dial failure")
 		return nil
 	}
 	a.sleepWithBack = func(c context.Context, d time.Duration) bool {
@@ -74,4 +77,138 @@ func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 	}
 }
 
+// Mock Stream Implementation
+type mockStream struct {
+	grpc.ClientStream
+	recvFunc func() (*agentv1.TelemetryAck, error)
+	sendFunc func(*agentv1.TelemetryFrame) error
+}
 
+func (m *mockStream) Recv() (*agentv1.TelemetryAck, error) {
+	if m.recvFunc != nil {
+		return m.recvFunc()
+	}
+	return nil, io.EOF
+}
+
+func (m *mockStream) Send(f *agentv1.TelemetryFrame) error {
+	if m.sendFunc != nil {
+		return m.sendFunc(f)
+	}
+	return nil
+}
+
+func (m *mockStream) CloseSend() error { return nil }
+
+// Stub implementations for grpc.ClientStream
+func (m *mockStream) Header() (metadata.MD, error)      { return nil, nil }
+func (m *mockStream) Trailer() metadata.MD              { return nil }
+func (m *mockStream) Context() context.Context          { return context.Background() }
+func (m *mockStream) SendMsg(msg interface{}) error     { return nil }
+func (m *mockStream) RecvMsg(msg interface{}) error     { return nil }
+
+func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Need a valid eventFrameQueue because handleTelemetryFrames reads from it
+	a := &Agent{
+		options:         &AgentOptions{RelayTarget: "test:1234"},
+		backoffInitial:  time.Millisecond,
+		backoffMax:      10 * time.Millisecond,
+		eventFrameQueue: make(chan *agentv1.TelemetryFrame, 10),
+	}
+
+	dialCount := 0
+	registerCount := 0
+	streamOpenCount := 0
+
+	// We want to simulate:
+	// 1. Successful connection
+	// 2. Successful stream open
+	// 3. Loop runs, then fails
+	// 4. Reconnect attempts (dial called again)
+	// 5. Shutdown
+
+	// Channel to signal when we have reconnected so we can cancel
+	reconnected := make(chan struct{})
+
+	a.dialFn = func(ctx context.Context) (*grpc.ClientConn, error) {
+		dialCount++
+		if dialCount > 1 {
+			// Signal that we attempted a reconnect
+			select {
+			case reconnected <- struct{}{}:
+			default:
+			}
+			// Just return error or hang to avoid spinning
+			return nil, errors.New("simulated dial fail on reconnect")
+		}
+		// Return a dummy connection
+		return grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	a.registerFn = func(ctx context.Context) error {
+		registerCount++
+		return nil
+	}
+
+	a.openStreamFn = func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error) {
+		streamOpenCount++
+		return &mockStream{
+			recvFunc: func() (*agentv1.TelemetryAck, error) {
+				// Block slightly then return error to simulate disconnect
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(10 * time.Millisecond):
+					return nil, errors.New("simulated stream error")
+				}
+			},
+		}, nil
+	}
+
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+		// Just call Recv until error
+		for {
+			_, err := stream.Recv()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	a.sleepWithBack = func(c context.Context, d time.Duration) bool {
+		// Don't actually sleep in test, just check context
+		return c.Err() == nil
+	}
+
+	// Run in background
+	errCh := make(chan error)
+	go func() {
+		errCh <- a.runWithReconnect(ctx)
+	}()
+
+	// Wait for reconnect signal
+	select {
+	case <-reconnected:
+		// Success: it tried to reconnect
+		cancel() // Stop the loop
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for reconnect attempt")
+	}
+
+	// Wait for runWithReconnect to exit
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context canceled, got %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for runWithReconnect to exit")
+	}
+
+	if dialCount < 2 {
+		t.Errorf("expected at least 2 dial attempts (initial + reconnect), got %d", dialCount)
+	}
+}

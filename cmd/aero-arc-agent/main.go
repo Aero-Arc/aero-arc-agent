@@ -49,6 +49,16 @@ var agentCmd = cli.Command{
 			Value: 30 * time.Second,
 			Usage: "Maximum reconnect backoff duration",
 		},
+		&cli.IntFlag{
+			Name:  "event-queue-size",
+			Value: 1000,
+			Usage: "The size of the event queue",
+		},
+		&cli.BoolFlag{
+			Name:  "skip-tls-verification",
+			Value: false,
+			Usage: "Skip TLS verification",
+		},
 	},
 }
 
