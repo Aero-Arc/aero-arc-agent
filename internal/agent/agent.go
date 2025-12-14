@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,7 +13,7 @@ import (
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/makinje/aero-arc-agent/internal/identity"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 )
 
 type Agent struct {
@@ -130,6 +131,7 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 					"mavlink_frame_received",
 					slog.String("frame-message", fmt.Sprintf("%+v", frameEvt.Message())),
 				)
+
 				continue
 			}
 
@@ -165,6 +167,11 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	// TODO: Use a proper TLS config with a valid certificate.
+	creds := credentials.NewTLS(&tls.Config{
+		InsecureSkipVerify: true,
+	})
+
 	slog.LogAttrs(
 		dialCtx, slog.LevelInfo,
 		"agent_connecting",
@@ -173,7 +180,11 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 
 	conn, err := grpc.NewClient(
 		a.options.RelayTarget,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
+		grpc.WithPerRPCCredentials(TokenAuth{
+			Token:  a.options.APIKey,
+			Secure: true,
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrFailedToConnectToServer, err)

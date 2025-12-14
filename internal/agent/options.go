@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -24,6 +25,8 @@ type AgentOptions struct {
 	ConsulPort    int
 	ConsulToken   string
 	ConsulAgentID string
+
+	APIKey string
 }
 
 func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
@@ -52,5 +55,6 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 
 		BackoffInitial: c.Duration("backoff-initial"),
 		BackoffMax:     c.Duration("backoff-max"),
+		APIKey:         os.Getenv("AERO_ARC_API_KEY"),
 	}, nil
 }
