@@ -14,6 +14,7 @@ import (
 	"github.com/makinje/aero-arc-agent/internal/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 )
 
 type Agent struct {
@@ -220,10 +221,9 @@ func (a *Agent) register(ctx context.Context) error {
 		return ErrGatewayNotInitialized
 	}
 
-	// TODO: Populate RegisterRequest with real identity/metadata fields once AgentOptions exposes them.
+	agentID := identity.Resolve().FinalID
 	req := &agentv1.RegisterRequest{
-		AgentId: identity.Resolve().FinalID,
-		// TODO: Add more fields here.
+		AgentId: agentID,
 	}
 
 	slog.LogAttrs(
@@ -232,7 +232,8 @@ func (a *Agent) register(ctx context.Context) error {
 		slog.String("target", a.options.RelayTarget),
 	)
 
-	_, err := a.gateway.Register(ctx, req)
+	regCtx := metadata.AppendToOutgoingContext(ctx, "x-agent-id", agentID)
+	_, err := a.gateway.Register(regCtx, req)
 	if err != nil {
 		return err
 	}
