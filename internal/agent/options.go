@@ -29,6 +29,7 @@ type AgentOptions struct {
 	APIKey              string
 	EventQueueSize      int
 	SkipTLSVerification bool
+	WALPath             string
 }
 
 func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
@@ -55,9 +56,11 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		ServerPort:    c.Int("server-port"),
 		RelayTarget:   fmt.Sprintf("%s:%d", c.String("server-address"), c.Int("server-port")),
 
-		BackoffInitial: c.Duration("backoff-initial"),
-		BackoffMax:     c.Duration("backoff-max"),
-		APIKey:         os.Getenv("AERO_ARC_API_KEY"),
-		EventQueueSize: c.Int("event-queue-size"),
+		BackoffInitial:      c.Duration("backoff-initial"),
+		BackoffMax:          c.Duration("backoff-max"),
+		APIKey:              os.Getenv("AERO_ARC_API_KEY"),
+		EventQueueSize:      c.Int("event-queue-size"),
+		WALPath:             c.String("wal-path"),
+		SkipTLSVerification: c.Bool("skip-tls-verification"),
 	}, nil
 }

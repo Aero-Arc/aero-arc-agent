@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/makinje/aero-arc-agent/internal/identity"
+	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
@@ -19,6 +21,7 @@ import (
 
 type Agent struct {
 	node *gomavlib.Node
+	wal  *wal.WAL
 
 	conn    *grpc.ClientConn
 	gateway agentv1.AgentGatewayClient
@@ -83,6 +86,18 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	identity := identity.Resolve()
 	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
 
+	// Initialize WAL
+	if a.options.WALPath != "" {
+		w, err := wal.New(a.options.WALPath)
+		if err != nil {
+			return fmt.Errorf("failed to initialize WAL: %w", err)
+		}
+		a.wal = w
+		slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
+	} else {
+		slog.LogAttrs(ctx, slog.LevelWarn, "wal_disabled_no_path")
+	}
+
 	// Run MAVLink loop
 	go func() {
 		a.runMAVLink(ctx)
@@ -107,7 +122,12 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 
 func (a *Agent) shutdown(ctx context.Context) error {
 	a.node.Close()
-	a.conn.Close()
+	if a.wal != nil {
+		a.wal.Close()
+	}
+	if a.conn != nil {
+		a.conn.Close()
+	}
 	a.gateway = nil
 	a.conn = nil
 	// TODO: Close any other resources that need to be closed.
@@ -180,8 +200,32 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 }
 
 func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*agentv1.TelemetryFrame, error) {
-	// TODO: Implement this.
-	return nil, nil
+	// Serialize the frame message to JSON (or binary if preferred/available)
+	payload, err := json.Marshal(frame.Message())
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal frame message: %w", err)
+	}
+
+	// Write to WAL if configured
+	if a.wal != nil {
+		if err := a.wal.Write(ctx, payload); err != nil {
+			return nil, fmt.Errorf("wal write failed: %w", err)
+		}
+	}
+
+	// Construct and return the TelemetryFrame
+	// Note: We use the system ID from the frame if available, or 0.
+	// We assume the proto has Payload and Timestamp fields.
+	// Adjust fields based on actual proto definition.
+
+	msgName := fmt.Sprintf("%T", frame.Message())
+
+	return &agentv1.TelemetryFrame{
+		RawMavlink:   payload,
+		SentAtUnixNs: time.Now().UnixNano(),
+		MsgName:      msgName,
+		DroneId:      identity.Resolve().FinalID,
+	}, nil
 }
 
 // dialRelay establishes a gRPC connection to the relay using the configured target.
