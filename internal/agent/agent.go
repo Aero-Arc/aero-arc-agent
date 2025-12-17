@@ -31,7 +31,7 @@ type Agent struct {
 	// reconnection/backoff settings – wired from AgentOptions.
 	backoffInitial  time.Duration
 	backoffMax      time.Duration
-	eventFrameQueue chan *agentv1.TelemetryFrame
+	eventFrameQueue chan *QueuedFrame
 
 	// Internal hooks primarily for testing; in production these are wired to
 	// the concrete implementations below.
@@ -63,7 +63,7 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 		options:         options,
 		backoffInitial:  options.BackoffInitial,
 		backoffMax:      options.BackoffMax,
-		eventFrameQueue: make(chan *agentv1.TelemetryFrame, options.EventQueueSize),
+		eventFrameQueue: make(chan *QueuedFrame, options.EventQueueSize),
 	}
 
 	// Wire default implementations for lifecycle hooks.
@@ -94,6 +94,13 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 		}
 		a.wal = w
 		slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
+
+		// Run minimal cleanup on startup to keep size bounded.
+		// Retain last 10,000 delivered frames for debugging/audit.
+		if err := w.CleanupDelivered(ctx, 10000); err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, "wal_cleanup_failed", slog.String("error", err.Error()))
+			// Non-fatal, continue startup.
+		}
 	} else {
 		slog.LogAttrs(ctx, slog.LevelWarn, "wal_disabled_no_path")
 	}
@@ -199,32 +206,40 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*agentv1.TelemetryFrame, error) {
+func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*QueuedFrame, error) {
 	// Serialize the frame message to JSON (or binary if preferred/available)
 	payload, err := json.Marshal(frame.Message())
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal frame message: %w", err)
 	}
 
-	// Write to WAL if configured
-	if a.wal != nil {
-		if err := a.wal.Write(ctx, payload); err != nil {
-			return nil, fmt.Errorf("wal write failed: %w", err)
-		}
-	}
-
-	// Construct and return the TelemetryFrame
-	// Note: We use the system ID from the frame if available, or 0.
-	// We assume the proto has Payload and Timestamp fields.
-	// Adjust fields based on actual proto definition.
-
 	msgName := fmt.Sprintf("%T", frame.Message())
 
-	return &agentv1.TelemetryFrame{
+	// Construct the TelemetryFrame to return
+	tFrame := &agentv1.TelemetryFrame{
 		RawMavlink:   payload,
 		SentAtUnixNs: time.Now().UnixNano(),
 		MsgName:      msgName,
 		DroneId:      identity.Resolve().FinalID,
+	}
+
+	var walID int64
+
+	// Write to WAL if configured
+	if a.wal != nil {
+		// NOTE: In a full production system, we might want to batch these writes
+		// or handle them asynchronously to avoid blocking the MAVLink ingest loop.
+		// For now, we write synchronously to ensure durability.
+		id, err := a.wal.Append(ctx, payload)
+		if err != nil {
+			return nil, fmt.Errorf("wal append failed: %w", err)
+		}
+		walID = id
+	}
+
+	return &QueuedFrame{
+		Frame: tFrame,
+		WALID: walID,
 	}, nil
 }
 
@@ -351,14 +366,72 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 }
 
 func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+	// 1. Drain WAL before accepting new telemetry (Replay Loop)
+	if a.wal != nil {
+		slog.LogAttrs(ctx, slog.LevelInfo, "wal_replay_starting")
+		for {
+			entries, err := a.wal.ReadUndelivered(ctx, 100)
+			if err != nil {
+				slog.LogAttrs(ctx, slog.LevelError, "wal_read_error", slog.String("error", err.Error()))
+				// If we can't read the WAL, we probably shouldn't proceed with new frames either?
+				// For now, let's retry with backoff or just return error to force reconnect loop.
+				return err
+			}
+
+			if len(entries) == 0 {
+				break
+			}
+
+			for _, entry := range entries {
+				// Re-construct the frame from payload
+				// Note: We might be missing metadata (MsgName) if we didn't store it in the WAL separately or in the payload.
+				// The payload stored is the JSON of the MAVLink message.
+				// We can try to unmarshal it or just send it as RawMavlink.
+				// For v0.1, we stored RawMavlink = payload.
+
+				// Warning: We need MsgName for the proto if possible, but we only stored payload.
+				// That's acceptable for v0.1 replay.
+
+				tFrame := &agentv1.TelemetryFrame{
+					RawMavlink:   entry.Payload,
+					SentAtUnixNs: time.Now().UnixNano(), // New send time? Or original?
+					// Original would be better but we didn't store it in a field we can easily get back without parsing.
+					// entry.CreatedAt is available from WAL.
+					// Let's use that if we want, but SentAtUnixNs usually implies "time sent to network".
+					DroneId: identity.Resolve().FinalID,
+					MsgName: "WAL_REPLAY", // Placeholder since we lost the type info in the blob
+				}
+
+				err := stream.Send(tFrame)
+				if err != nil {
+					return err // connection dropped → retry later
+				}
+
+				if err := a.wal.MarkDelivered(ctx, entry.ID); err != nil {
+					slog.LogAttrs(ctx, slog.LevelError, "wal_mark_delivered_error", slog.Int64("id", entry.ID), slog.String("error", err.Error()))
+					// Non-fatal, but means we might replay it again.
+				}
+			}
+		}
+		slog.LogAttrs(ctx, slog.LevelInfo, "wal_replay_complete")
+	}
+
+	// 2. Handle Live Telemetry
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case frame := <-a.eventFrameQueue:
-			err := stream.Send(frame)
+		case queuedFrame := <-a.eventFrameQueue:
+			err := stream.Send(queuedFrame.Frame)
 			if err != nil {
 				return err
+			}
+
+			// Mark as delivered if it was WAL-backed
+			if a.wal != nil && queuedFrame.WALID > 0 {
+				if err := a.wal.MarkDelivered(ctx, queuedFrame.WALID); err != nil {
+					slog.LogAttrs(ctx, slog.LevelError, "wal_mark_delivered_error_live", slog.Int64("id", queuedFrame.WALID), slog.String("error", err.Error()))
+				}
 			}
 		}
 	}

@@ -101,11 +101,11 @@ func (m *mockStream) Send(f *agentv1.TelemetryFrame) error {
 func (m *mockStream) CloseSend() error { return nil }
 
 // Stub implementations for grpc.ClientStream
-func (m *mockStream) Header() (metadata.MD, error)      { return nil, nil }
-func (m *mockStream) Trailer() metadata.MD              { return nil }
-func (m *mockStream) Context() context.Context          { return context.Background() }
-func (m *mockStream) SendMsg(msg interface{}) error     { return nil }
-func (m *mockStream) RecvMsg(msg interface{}) error     { return nil }
+func (m *mockStream) Header() (metadata.MD, error)  { return nil, nil }
+func (m *mockStream) Trailer() metadata.MD          { return nil }
+func (m *mockStream) Context() context.Context      { return context.Background() }
+func (m *mockStream) SendMsg(msg interface{}) error { return nil }
+func (m *mockStream) RecvMsg(msg interface{}) error { return nil }
 
 func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,7 +116,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 		options:         &AgentOptions{RelayTarget: "test:1234"},
 		backoffInitial:  time.Millisecond,
 		backoffMax:      10 * time.Millisecond,
-		eventFrameQueue: make(chan *agentv1.TelemetryFrame, 10),
+		eventFrameQueue: make(chan *QueuedFrame, 10),
 	}
 
 	dialCount := 0
