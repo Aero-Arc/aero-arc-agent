@@ -183,4 +183,3 @@ func mustNewWAL(t *testing.T) *WAL {
 	}
 	return w
 }
-
