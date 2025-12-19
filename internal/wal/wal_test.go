@@ -102,8 +102,8 @@ func TestWAL_CleanupDelivered(t *testing.T) {
 	ctx := context.Background()
 
 	// Append 10 items
-	var ids []int64
-	for i := 0; i < 10; i++ {
+	var ids []uint64
+	for i := uint64(0); i < 10; i++ {
 		id, err := w.Append(ctx, []byte{byte(i)})
 		if err != nil {
 			t.Fatal(err)

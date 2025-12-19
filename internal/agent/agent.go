@@ -31,7 +31,7 @@ type Agent struct {
 	// reconnection/backoff settings – wired from AgentOptions.
 	backoffInitial  time.Duration
 	backoffMax      time.Duration
-	eventFrameQueue chan *QueuedFrame
+	eventFrameQueue chan *agentv1.TelemetryFrame
 
 	// Internal hooks primarily for testing; in production these are wired to
 	// the concrete implementations below.
@@ -63,7 +63,7 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 		options:         options,
 		backoffInitial:  options.BackoffInitial,
 		backoffMax:      options.BackoffMax,
-		eventFrameQueue: make(chan *QueuedFrame, options.EventQueueSize),
+		eventFrameQueue: make(chan *agentv1.TelemetryFrame, options.EventQueueSize),
 	}
 
 	// Wire default implementations for lifecycle hooks.
@@ -206,7 +206,7 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*QueuedFrame, error) {
+func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*agentv1.TelemetryFrame, error) {
 	// Serialize the frame message to JSON (or binary if preferred/available)
 	payload, err := json.Marshal(frame.Message())
 	if err != nil {
@@ -223,8 +223,6 @@ func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*Que
 		AgentId:      identity.Resolve().FinalID,
 	}
 
-	var walID int64
-
 	// Write to WAL if configured
 	if a.wal != nil {
 		// NOTE: In a full production system, we might want to batch these writes
@@ -234,13 +232,11 @@ func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*Que
 		if err != nil {
 			return nil, fmt.Errorf("wal append failed: %w", err)
 		}
-		walID = id
+		//TODO: fix this conversion. Should it be int64 or uint64?
+		tFrame.Seq = uint64(id)
 	}
 
-	return &QueuedFrame{
-		Frame: tFrame,
-		WALID: walID,
-	}, nil
+	return tFrame, nil
 }
 
 // dialRelay establishes a gRPC connection to the relay using the configured target.
@@ -362,6 +358,10 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 		slog.String("ack", fmt.Sprintf("%+v", ack)),
 	)
 
+	if _, err := a.wal.MarkDelivered(ctx, ack.Seq); err != nil {
+		return fmt.Errorf("failed to mark telemetry ack as delivered: %w", err)
+	}
+
 	return nil
 }
 
@@ -393,6 +393,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				// That's acceptable for v0.1 replay.
 
 				tFrame := &agentv1.TelemetryFrame{
+					Seq:          uint64(entry.ID),
 					RawMavlink:   entry.Payload,
 					SentAtUnixNs: time.Now().UnixNano(), // New send time? Or original?
 					// Original would be better but we didn't store it in a field we can easily get back without parsing.
@@ -406,11 +407,6 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				if err != nil {
 					return err // connection dropped → retry later
 				}
-
-				if err := a.wal.MarkDelivered(ctx, entry.ID); err != nil {
-					slog.LogAttrs(ctx, slog.LevelError, "wal_mark_delivered_error", slog.Int64("id", entry.ID), slog.String("error", err.Error()))
-					// Non-fatal, but means we might replay it again.
-				}
 			}
 		}
 		slog.LogAttrs(ctx, slog.LevelInfo, "wal_replay_complete")
@@ -422,17 +418,16 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		case <-ctx.Done():
 			return ctx.Err()
 		case queuedFrame := <-a.eventFrameQueue:
-			err := stream.Send(queuedFrame.Frame)
+			err := stream.Send(queuedFrame)
 			if err != nil {
 				return err
 			}
 
-			// Mark as delivered if it was WAL-backed
-			if a.wal != nil && queuedFrame.WALID > 0 {
-				if err := a.wal.MarkDelivered(ctx, queuedFrame.WALID); err != nil {
-					slog.LogAttrs(ctx, slog.LevelError, "wal_mark_delivered_error_live", slog.Int64("id", queuedFrame.WALID), slog.String("error", err.Error()))
-				}
+			if _, err := a.wal.MarkPending(ctx, queuedFrame.Seq); err != nil {
+				return fmt.Errorf("failed to mark telemetry frame as pending: %w", err)
 			}
+
+			continue
 		}
 	}
 }

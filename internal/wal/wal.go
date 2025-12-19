@@ -128,7 +128,7 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	return entries, nil
 }
 
-func (w *WAL) updateDeliveryStatus(ctx context.Context, seq int64, status DeliveryStatus) (int64, error) {
+func (w *WAL) updateDeliveryStatus(ctx context.Context, seq uint64, status DeliveryStatus) (int64, error) {
 	// Only update if the status is different to ensure idempotency.
 	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ? AND delivery_status != ?`
 
@@ -141,15 +141,15 @@ func (w *WAL) updateDeliveryStatus(ctx context.Context, seq int64, status Delive
 }
 
 // MarkDelivered marks a specific log entry as delivered.
-func (w *WAL) MarkDelivered(ctx context.Context, seq int64) (int64, error) {
+func (w *WAL) MarkDelivered(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusDelivered)
 }
 
-func (w *WAL) MarkPending(ctx context.Context, seq int64) (int64, error) {
+func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
-func (w *WAL) MarkWritten(ctx context.Context, seq int64) (int64, error) {
+func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
 }
 
