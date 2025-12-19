@@ -220,7 +220,7 @@ func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*Que
 		RawMavlink:   payload,
 		SentAtUnixNs: time.Now().UnixNano(),
 		MsgName:      msgName,
-		DroneId:      identity.Resolve().FinalID,
+		AgentId:      identity.Resolve().FinalID,
 	}
 
 	var walID int64
@@ -398,7 +398,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 					// Original would be better but we didn't store it in a field we can easily get back without parsing.
 					// entry.CreatedAt is available from WAL.
 					// Let's use that if we want, but SentAtUnixNs usually implies "time sent to network".
-					DroneId: identity.Resolve().FinalID,
+					AgentId: identity.Resolve().FinalID,
 					MsgName: "WAL_REPLAY", // Placeholder since we lost the type info in the blob
 				}
 

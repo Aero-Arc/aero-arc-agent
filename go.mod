@@ -5,7 +5,7 @@ go 1.24.0
 toolchain go1.24.9
 
 require (
-	github.com/aero-arc/aero-arc-protos v0.0.0-20251206051328-5124686515dc
+	github.com/aero-arc/aero-arc-protos v0.0.0-20251219015509-09def04964ec
 	google.golang.org/grpc v1.77.0
 	modernc.org/sqlite v1.40.1
 )
