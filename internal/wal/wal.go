@@ -58,12 +58,13 @@ func configureDB(db *sql.DB) error {
 }
 
 func initDB(db *sql.DB) error {
+	// for seq we would need to emit 1000frames a second over 200million years to overflow
 	query := `
 	CREATE TABLE IF NOT EXISTS telemetry_frames (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		seq INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at INTEGER NOT NULL,
 		payload BLOB NOT NULL,
-		delivered INTEGER NOT NULL DEFAULT 0
+		delivery_status INTEGER NOT NULL DEFAULT 0
 	);
 	`
 	_, err := db.Exec(query)
@@ -73,7 +74,7 @@ func initDB(db *sql.DB) error {
 
 	indexQuery := `
 	CREATE INDEX IF NOT EXISTS idx_telemetry_undelivered
-	ON telemetry_frames (delivered, id);
+	ON telemetry_frames (delivery_status, seq);
 	`
 	_, err = db.Exec(indexQuery)
 	if err != nil {
@@ -85,8 +86,8 @@ func initDB(db *sql.DB) error {
 
 // Append appends a raw telemetry frame payload to the log and returns its ID.
 func (w *WAL) Append(ctx context.Context, payload []byte) (int64, error) {
-	query := `INSERT INTO telemetry_frames (created_at, payload, delivered) VALUES (?, ?, 0)`
-	res, err := w.db.ExecContext(ctx, query, time.Now().UnixNano(), payload)
+	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
+	res, err := w.db.ExecContext(ctx, query, time.Now().UnixNano(), payload, DeliveryStatusWritten)
 	if err != nil {
 		return 0, fmt.Errorf("failed to append frame to wal: %w", err)
 	}
@@ -99,13 +100,13 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 		return nil, fmt.Errorf("limit must be > 0")
 	}
 	query := `
-	SELECT id, created_at, payload
+	SELECT seq, created_at, payload
 	FROM telemetry_frames
-	WHERE delivered = 0
-	ORDER BY id ASC
+	WHERE delivery_status < ?
+	ORDER BY seq ASC
 	LIMIT ?
 	`
-	rows, err := w.db.QueryContext(ctx, query, limit)
+	rows, err := w.db.QueryContext(ctx, query, DeliveryStatusDelivered, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query undelivered frames: %w", err)
 	}
@@ -127,28 +128,29 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	return entries, nil
 }
 
+func (w *WAL) updateDeliveryStatus(ctx context.Context, seq int64, status DeliveryStatus) (int64, error) {
+	// Only update if the status is different to ensure idempotency.
+	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ? AND delivery_status != ?`
+
+	res, err := w.db.ExecContext(ctx, query, status, seq, status)
+	if err != nil {
+		return 0, fmt.Errorf("failed to update delivery status: %w", err)
+	}
+
+	return res.RowsAffected()
+}
+
 // MarkDelivered marks a specific log entry as delivered.
-func (w *WAL) MarkDelivered(ctx context.Context, id int64) error {
-	query := `UPDATE telemetry_frames SET delivered = 1 WHERE id = ? AND delivered = 0`
-	res, err := w.db.ExecContext(ctx, query, id)
-	if err != nil {
-		return fmt.Errorf("failed to mark frame %d delivered: %w", id, err)
-	}
+func (w *WAL) MarkDelivered(ctx context.Context, seq int64) (int64, error) {
+	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusDelivered)
+}
 
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
+func (w *WAL) MarkPending(ctx context.Context, seq int64) (int64, error) {
+	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
+}
 
-	if rows == 0 {
-		// This is not necessarily an error - it could have been marked delivered already
-		// or concurrently by another goroutine (if we had concurrency).
-		// For now, we return nil as the goal "ensure it is marked delivered" is met.
-		// If debugging is needed, we could return a specific error or bool.
-		return nil
-	}
-
-	return nil
+func (w *WAL) MarkWritten(ctx context.Context, seq int64) (int64, error) {
+	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
 }
 
 // CleanupDelivered deletes delivered frames that are older than the specified retention count.
@@ -160,20 +162,20 @@ func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 	}
 
 	// Find the ID threshold. We want to keep the last `retentionCount` delivered frames.
-	// We delete everything where delivered=1 AND id < (SELECT min(id) FROM (SELECT id FROM telemetry_frames WHERE delivered=1 ORDER BY id DESC LIMIT retentionCount))
+	// We delete everything where delivered=1 AND seq < (SELECT min(seq) FROM (SELECT seq FROM telemetry_frames WHERE delivered=1 ORDER BY seq DESC LIMIT retentionCount))
 	// Or simpler: DELETE FROM telemetry_frames WHERE delivered=1 AND id NOT IN (SELECT id FROM telemetry_frames WHERE delivered=1 ORDER BY id DESC LIMIT ?)
 
 	query := `
 	DELETE FROM telemetry_frames 
-	WHERE delivered = 1 
-	AND id NOT IN (
-		SELECT id FROM telemetry_frames 
-		WHERE delivered = 1 
-		ORDER BY id DESC 
+	WHERE delivery_status = ? 
+	AND seq NOT IN (
+		SELECT seq FROM telemetry_frames 
+		WHERE delivery_status = ? 
+		ORDER BY seq DESC 
 		LIMIT ?
 	)`
 
-	_, err := w.db.ExecContext(ctx, query, retentionCount)
+	_, err := w.db.ExecContext(ctx, query, DeliveryStatusDelivered, DeliveryStatusDelivered, retentionCount)
 	if err != nil {
 		return fmt.Errorf("failed to cleanup delivered frames: %w", err)
 	}
