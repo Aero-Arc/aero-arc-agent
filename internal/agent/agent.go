@@ -83,6 +83,15 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Ensure resources are cleaned up on exit.
+	defer func() {
+		// Use a fresh context for shutdown since 'ctx' might be cancelled.
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelShutdown()
+		// We ignore the error here as we are shutting down anyway.
+		_ = a.shutdown(shutdownCtx)
+	}()
+
 	// Resolve Identity
 	identity := identity.Resolve()
 	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
@@ -127,8 +136,7 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 			return ctx.Err()
 		case <-sig:
 			slog.LogAttrs(ctx, slog.LevelInfo, "agent received shutdown signal", slog.String("signal", fmt.Sprintf("%v", sig)))
-			a.shutdown(ctx)
-			cancel()
+			cancel() // Signal all loops to stop
 			return nil
 		}
 	}
@@ -140,7 +148,9 @@ func (a *Agent) shutdown(ctx context.Context) error {
 	}
 
 	a.node.Close()
-	a.wal.Close()
+	if a.wal != nil {
+		a.wal.Close()
+	}
 
 	a.gateway = nil
 	a.conn = nil
