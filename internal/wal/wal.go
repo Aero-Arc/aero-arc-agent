@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,6 +24,7 @@ type WAL struct {
 }
 
 // New creates or opens a WAL at the specified path.
+// TODO: Add time.Duration for the WAL cleanup interval.
 func New(path string) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -85,9 +88,14 @@ func initDB(db *sql.DB) error {
 }
 
 // Append appends a raw telemetry frame payload to the log and returns its ID.
-func (w *WAL) Append(ctx context.Context, payload []byte) (int64, error) {
+func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64, error) {
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
-	res, err := w.db.ExecContext(ctx, query, time.Now().UnixNano(), payload, DeliveryStatusWritten)
+	encoded, err := proto.Marshal(tFrame)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal telemetry frame: %w", err)
+	}
+
+	res, err := w.db.ExecContext(ctx, query, time.Now().UnixNano(), encoded, DeliveryStatusWritten)
 	if err != nil {
 		return 0, fmt.Errorf("failed to append frame to wal: %w", err)
 	}
@@ -128,7 +136,7 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	return entries, nil
 }
 
-func (w *WAL) updateDeliveryStatus(ctx context.Context, seq int64, status DeliveryStatus) (int64, error) {
+func (w *WAL) updateDeliveryStatus(ctx context.Context, seq uint64, status DeliveryStatus) (int64, error) {
 	// Only update if the status is different to ensure idempotency.
 	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ? AND delivery_status != ?`
 
@@ -141,15 +149,15 @@ func (w *WAL) updateDeliveryStatus(ctx context.Context, seq int64, status Delive
 }
 
 // MarkDelivered marks a specific log entry as delivered.
-func (w *WAL) MarkDelivered(ctx context.Context, seq int64) (int64, error) {
+func (w *WAL) MarkDelivered(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusDelivered)
 }
 
-func (w *WAL) MarkPending(ctx context.Context, seq int64) (int64, error) {
+func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
-func (w *WAL) MarkWritten(ctx context.Context, seq int64) (int64, error) {
+func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
 }
 

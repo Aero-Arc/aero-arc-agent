@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,13 +13,16 @@ import (
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/makinje/aero-arc-agent/internal/identity"
+	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 type Agent struct {
 	node *gomavlib.Node
+	wal  *wal.WAL
 
 	conn    *grpc.ClientConn
 	gateway agentv1.AgentGatewayClient
@@ -79,9 +83,43 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Ensure resources are cleaned up on exit.
+	defer func() {
+		// Use a fresh context for shutdown since 'ctx' might be cancelled.
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelShutdown()
+		// We ignore the error here as we are shutting down anyway.
+		_ = a.shutdown(shutdownCtx)
+	}()
+
 	// Resolve Identity
 	identity := identity.Resolve()
 	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
+
+	// Initialize WAL
+	w, err := wal.New(a.options.WALPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize WAL: %w", err)
+	}
+	a.wal = w
+	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
+
+	// Run WAL cleanup loop
+	go func() {
+		timer := time.NewTicker(10 * time.Second)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				if err := a.wal.CleanupDelivered(ctx, 10000); err != nil {
+					slog.LogAttrs(ctx, slog.LevelError, "wal_cleanup_failed", slog.String("error", err.Error()))
+					// Non-fatal, continue cleanup.
+				}
+			}
+		}
+	}()
 
 	// Run MAVLink loop
 	go func() {
@@ -98,16 +136,22 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 			return ctx.Err()
 		case <-sig:
 			slog.LogAttrs(ctx, slog.LevelInfo, "agent received shutdown signal", slog.String("signal", fmt.Sprintf("%v", sig)))
-			a.shutdown(ctx)
-			cancel()
+			cancel() // Signal all loops to stop
 			return nil
 		}
 	}
 }
 
 func (a *Agent) shutdown(ctx context.Context) error {
+	if a.conn != nil {
+		a.conn.Close()
+	}
+
 	a.node.Close()
-	a.conn.Close()
+	if a.wal != nil {
+		a.wal.Close()
+	}
+
 	a.gateway = nil
 	a.conn = nil
 	// TODO: Close any other resources that need to be closed.
@@ -120,7 +164,6 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	if err := a.node.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize node: %v", err)
 	}
-	defer a.node.Close()
 
 	for evt := range a.node.Events() {
 		select {
@@ -148,8 +191,12 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 					continue
 				}
 
-				a.eventFrameQueue <- telemetryFrame
-				continue
+				select {
+				case a.eventFrameQueue <- telemetryFrame:
+				default:
+					// TODO: Give other backpressure options in the future.
+					slog.LogAttrs(ctx, slog.LevelWarn, "event_frame_queue_full, dropping telemetry frame", slog.String("error", "queue is full"))
+				}
 			}
 
 			if _, ok := evt.(*gomavlib.EventChannelOpen); ok {
@@ -180,8 +227,33 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 }
 
 func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*agentv1.TelemetryFrame, error) {
-	// TODO: Implement this.
-	return nil, nil
+	payload, err := json.Marshal(frame.Message())
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal frame message: %w", err)
+	}
+
+	msgName := fmt.Sprintf("%T", frame.Message())
+
+	// Construct the TelemetryFrame to return
+	tFrame := &agentv1.TelemetryFrame{
+		RawMavlink:   payload,
+		SentAtUnixNs: time.Now().UnixNano(),
+		MsgName:      msgName,
+		AgentId:      identity.Resolve().FinalID,
+	}
+
+	// Write to WAL if configured
+	// NOTE: In a full production system, we might want to batch these writes
+	// or handle them asynchronously to avoid blocking the MAVLink ingest loop.
+	// For now, we write synchronously to ensure durability.
+	id, err := a.wal.Append(ctx, tFrame)
+	if err != nil {
+		return nil, fmt.Errorf("wal append failed: %w", err)
+	}
+	//TODO: fix this conversion. Should it be int64 or uint64?
+	tFrame.Seq = uint64(id)
+
+	return tFrame, nil
 }
 
 // dialRelay establishes a gRPC connection to the relay using the configured target.
@@ -303,17 +375,81 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 		slog.String("ack", fmt.Sprintf("%+v", ack)),
 	)
 
+	if _, err := a.wal.MarkDelivered(ctx, ack.Seq); err != nil {
+		return fmt.Errorf("failed to mark telemetry ack as delivered: %w", err)
+	}
+
 	return nil
 }
 
 func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+	// 1. Drain WAL before accepting new telemetry (Replay Loop)
+	slog.LogAttrs(ctx, slog.LevelInfo, "wal_replay_starting")
+	for {
+		entries, err := a.wal.ReadUndelivered(ctx, 100)
+		if err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, "wal_read_error", slog.String("error", err.Error()))
+			// If we can't read the WAL, we probably shouldn't proceed with new frames either?
+			// For now, let's retry with backoff or just return error to force reconnect loop.
+			return err
+		}
+
+		if len(entries) == 0 {
+			break
+		}
+
+		for _, entry := range entries {
+			// Re-construct the frame from payload
+			// Note: We might be missing metadata (MsgName) if we didn't store it in the WAL separately or in the payload.
+			// The payload stored is the JSON of the MAVLink message.
+			// We can try to unmarshal it or just send it as RawMavlink.
+			// For v0.1, we stored RawMavlink = payload.
+
+			// Warning: We need MsgName for the proto if possible, but we only stored payload.
+			// That's acceptable for v0.1 replay.
+
+			tFrame := &agentv1.TelemetryFrame{}
+			if err := proto.Unmarshal(entry.Payload, tFrame); err != nil {
+				return err
+			}
+
+			tFrame.Seq = uint64(entry.ID)
+
+			if rowsAffected, err := a.wal.MarkPending(ctx, tFrame.Seq); err != nil {
+				slog.LogAttrs(ctx, slog.LevelWarn, "failed to mark telemetry frame as pending", slog.String("error", err.Error()))
+			} else if rowsAffected == 0 {
+				slog.LogAttrs(ctx, slog.LevelWarn, "telemetry frame already marked as pending", slog.String("seq", fmt.Sprintf("%d", tFrame.Seq)))
+				// Frame is already marked as pending, so we can skip it.
+				continue
+			}
+
+			err := stream.Send(tFrame)
+			if err != nil {
+				return err // connection dropped → retry later
+			}
+		}
+	}
+	slog.LogAttrs(ctx, slog.LevelInfo, "wal_replay_complete")
+
+	// 2. Handle Live Telemetry
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case frame := <-a.eventFrameQueue:
-			err := stream.Send(frame)
+		case queuedFrame := <-a.eventFrameQueue:
+
+			if rowsAffected, err := a.wal.MarkPending(ctx, queuedFrame.Seq); err != nil {
+				slog.LogAttrs(ctx, slog.LevelWarn, "failed to mark telemetry frame as pending", slog.String("error", err.Error()))
+			} else if rowsAffected == 0 {
+				slog.LogAttrs(ctx, slog.LevelWarn, "telemetry frame already marked as pending", slog.String("seq", fmt.Sprintf("%d", queuedFrame.Seq)))
+				// Frame is already marked as pending, so we can skip it.
+				continue
+			}
+
+			err := stream.Send(queuedFrame)
 			if err != nil {
+				slog.LogAttrs(ctx, slog.LevelWarn, "failed to send telemetry frame", slog.String("error", err.Error()))
+				// If Send fails, return the error so the reconnect loop restarts the stream:
 				return err
 			}
 		}

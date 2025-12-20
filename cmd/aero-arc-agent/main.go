@@ -59,6 +59,12 @@ var agentCmd = cli.Command{
 			Value: false,
 			Usage: "Skip TLS verification",
 		},
+		&cli.StringFlag{
+			Name:     "wal-path",
+			Value:    "agent_wal.db",
+			Required: true,
+			Usage:    "Path to the Write-Ahead Log (SQLite) file (required)",
+		},
 	},
 }
 
