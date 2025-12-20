@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 )
 
@@ -85,9 +87,14 @@ func initDB(db *sql.DB) error {
 }
 
 // Append appends a raw telemetry frame payload to the log and returns its ID.
-func (w *WAL) Append(ctx context.Context, payload []byte) (int64, error) {
+func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64, error) {
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
-	res, err := w.db.ExecContext(ctx, query, time.Now().UnixNano(), payload, DeliveryStatusWritten)
+	encoded, err := proto.Marshal(tFrame)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal telemetry frame: %w", err)
+	}
+
+	res, err := w.db.ExecContext(ctx, query, time.Now().UnixNano(), encoded, DeliveryStatusWritten)
 	if err != nil {
 		return 0, fmt.Errorf("failed to append frame to wal: %w", err)
 	}
