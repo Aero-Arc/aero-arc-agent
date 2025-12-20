@@ -95,12 +95,22 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	a.wal = w
 	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
 
-	// Run minimal cleanup on startup to keep size bounded.
-	// Retain last 10,000 delivered frames for debugging/audit.
-	if err := w.CleanupDelivered(ctx, 10000); err != nil {
-		slog.LogAttrs(ctx, slog.LevelError, "wal_cleanup_failed", slog.String("error", err.Error()))
-		// Non-fatal, continue startup.
-	}
+	// Run WAL cleanup loop
+	go func() {
+		timer := time.NewTicker(10 * time.Second)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				if err := a.wal.CleanupDelivered(ctx, 10000); err != nil {
+					slog.LogAttrs(ctx, slog.LevelError, "wal_cleanup_failed", slog.String("error", err.Error()))
+					// Non-fatal, continue cleanup.
+				}
+			}
+		}
+	}()
 
 	// Run MAVLink loop
 	go func() {
@@ -395,8 +405,12 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 
 			tFrame.Seq = uint64(entry.ID)
 
-			if _, err := a.wal.MarkPending(ctx, tFrame.Seq); err != nil {
+			if rowsAffected, err := a.wal.MarkPending(ctx, tFrame.Seq); err != nil {
 				slog.LogAttrs(ctx, slog.LevelWarn, "failed to mark telemetry frame as pending", slog.String("error", err.Error()))
+			} else if rowsAffected == 0 {
+				slog.LogAttrs(ctx, slog.LevelWarn, "telemetry frame already marked as pending", slog.String("seq", fmt.Sprintf("%d", tFrame.Seq)))
+				// Frame is already marked as pending, so we can skip it.
+				continue
 			}
 
 			err := stream.Send(tFrame)
@@ -414,8 +428,12 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 			return ctx.Err()
 		case queuedFrame := <-a.eventFrameQueue:
 
-			if _, err := a.wal.MarkPending(ctx, queuedFrame.Seq); err != nil {
+			if rowsAffected, err := a.wal.MarkPending(ctx, queuedFrame.Seq); err != nil {
 				slog.LogAttrs(ctx, slog.LevelWarn, "failed to mark telemetry frame as pending", slog.String("error", err.Error()))
+			} else if rowsAffected == 0 {
+				slog.LogAttrs(ctx, slog.LevelWarn, "telemetry frame already marked as pending", slog.String("seq", fmt.Sprintf("%d", queuedFrame.Seq)))
+				// Frame is already marked as pending, so we can skip it.
+				continue
 			}
 
 			err := stream.Send(queuedFrame)

@@ -24,6 +24,7 @@ type WAL struct {
 }
 
 // New creates or opens a WAL at the specified path.
+// TODO: Add time.Duration for the WAL cleanup interval.
 func New(path string) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
