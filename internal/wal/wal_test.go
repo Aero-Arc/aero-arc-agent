@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestWAL_Lifecycle(t *testing.T) {
@@ -36,7 +39,10 @@ func TestWAL_AppendAndRead(t *testing.T) {
 	}
 
 	for _, p := range payloads {
-		if _, err := w.Append(ctx, p); err != nil {
+		frame := &agentv1.TelemetryFrame{
+			RawMavlink: p,
+		}
+		if _, err := w.Append(ctx, frame); err != nil {
 			t.Fatalf("Append failed: %v", err)
 		}
 	}
@@ -52,8 +58,12 @@ func TestWAL_AppendAndRead(t *testing.T) {
 	}
 
 	for i, e := range entries {
-		if !bytes.Equal(e.Payload, payloads[i]) {
-			t.Errorf("Entry %d mismatch: got %s, want %s", i, e.Payload, payloads[i])
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(e.Payload, &frame); err != nil {
+			t.Fatalf("Failed to unmarshal frame: %v", err)
+		}
+		if !bytes.Equal(frame.RawMavlink, payloads[i]) {
+			t.Errorf("Entry %d mismatch: got %s, want %s", i, frame.RawMavlink, payloads[i])
 		}
 	}
 }
@@ -63,13 +73,13 @@ func TestWAL_MarkDelivered_Idempotency(t *testing.T) {
 	defer w.Close()
 	ctx := context.Background()
 
-	id, err := w.Append(ctx, []byte("test"))
+	id, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("test")})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// First mark should succeed (RowsAffected = 1)
-	rows, err := w.MarkDelivered(ctx, id)
+	rows, err := w.MarkDelivered(ctx, uint64(id))
 	if err != nil {
 		t.Fatalf("MarkDelivered failed: %v", err)
 	}
@@ -78,7 +88,7 @@ func TestWAL_MarkDelivered_Idempotency(t *testing.T) {
 	}
 
 	// Second mark should reflect no change (RowsAffected = 0)
-	rows, err = w.MarkDelivered(ctx, id)
+	rows, err = w.MarkDelivered(ctx, uint64(id))
 	if err != nil {
 		t.Fatalf("MarkDelivered (2nd) failed: %v", err)
 	}
@@ -104,11 +114,11 @@ func TestWAL_CleanupDelivered(t *testing.T) {
 	// Append 10 items
 	var ids []uint64
 	for i := uint64(0); i < 10; i++ {
-		id, err := w.Append(ctx, []byte{byte(i)})
+		id, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte{byte(i)}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		ids = append(ids, id)
+		ids = append(ids, uint64(id))
 	}
 
 	// Mark all as delivered
@@ -155,7 +165,7 @@ func TestWAL_ReadLimit(t *testing.T) {
 
 	// Append 5 items
 	for i := 0; i < 5; i++ {
-		w.Append(ctx, []byte("data"))
+		w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("data")})
 	}
 
 	// Read with limit 2
