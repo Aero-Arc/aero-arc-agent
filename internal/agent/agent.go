@@ -16,6 +16,7 @@ import (
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -65,6 +66,20 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 		backoffInitial:  options.BackoffInitial,
 		backoffMax:      options.BackoffMax,
 		eventFrameQueue: make(chan *agentv1.TelemetryFrame, options.EventQueueSize),
+	}
+
+	if options.Debug {
+		slog.LogAttrs(context.Background(), slog.LevelInfo, "debug mode enabled, using UDP mavlinkserver")
+		a.node = &gomavlib.Node{
+			Endpoints: []gomavlib.EndpointConf{
+				gomavlib.EndpointUDPServer{
+					Address: "0.0.0.0:14550",
+				},
+			},
+			OutVersion:  gomavlib.V2,
+			OutSystemID: 1,
+			Dialect:     common.Dialect,
+		}
 	}
 
 	// Wire default implementations for lifecycle hooks.
@@ -161,9 +176,13 @@ func (a *Agent) shutdown(ctx context.Context) error {
 
 // runMAVLink owns the lifecycle of the gomavlib node.
 func (a *Agent) runMAVLink(ctx context.Context) error {
+	slog.LogAttrs(ctx, slog.LevelInfo, "mavlink_node_initializing")
+
 	if err := a.node.Initialize(); err != nil {
 		return fmt.Errorf("failed to initialize node: %v", err)
 	}
+
+	slog.LogAttrs(ctx, slog.LevelInfo, "mavlink_node_initialized")
 
 	for evt := range a.node.Events() {
 		select {
@@ -262,9 +281,15 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 	defer cancel()
 
 	// TODO: Use a proper TLS config with a valid certificate.
-	creds := credentials.NewTLS(&tls.Config{
-		InsecureSkipVerify: a.options.SkipTLSVerification,
-	})
+	var creds credentials.TransportCredentials
+
+	if a.options.Debug {
+		creds = insecure.NewCredentials()
+	} else {
+		creds = credentials.NewTLS(&tls.Config{
+			InsecureSkipVerify: a.options.SkipTLSVerification,
+		})
+	}
 
 	slog.LogAttrs(
 		dialCtx, slog.LevelInfo,
@@ -277,7 +302,7 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 		grpc.WithTransportCredentials(creds),
 		grpc.WithPerRPCCredentials(TokenAuth{
 			Token:  a.options.APIKey,
-			Secure: true,
+			Secure: !a.options.Debug,
 		}),
 	)
 	if err != nil {
@@ -304,7 +329,7 @@ func (a *Agent) register(ctx context.Context) error {
 		slog.String("target", a.options.RelayTarget),
 	)
 
-	regCtx := metadata.AppendToOutgoingContext(ctx, "x-agent-id", agentID)
+	regCtx := metadata.AppendToOutgoingContext(ctx, "aero-arc-agent-id", agentID)
 	_, err := a.gateway.Register(regCtx, req)
 	if err != nil {
 		return err
@@ -331,7 +356,10 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 		slog.String("target", a.options.RelayTarget),
 	)
 
-	stream, err := a.gateway.TelemetryStream(ctx)
+	agentID := identity.Resolve().FinalID
+	streamCtx := metadata.AppendToOutgoingContext(ctx, "aero-arc-agent-id", agentID)
+
+	stream, err := a.gateway.TelemetryStream(streamCtx)
 	if err != nil {
 		return nil, err
 	}
