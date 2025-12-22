@@ -30,21 +30,10 @@ type AgentOptions struct {
 	EventQueueSize      int
 	SkipTLSVerification bool
 	WALPath             string
+	Debug               bool
 }
 
 func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
-	if !c.IsSet("serial-path") {
-		return nil, ErrSerialPathNotSet
-	}
-	if !c.IsSet("serial-baud") {
-		return nil, ErrSerialBaudNotSet
-	}
-	if !c.IsSet("server-address") {
-		return nil, ErrServerAddressNotSet
-	}
-	if !c.IsSet("server-port") {
-		return nil, ErrServerPortNotSet
-	}
 	if c.IsSet("consul-address") || c.IsSet("consul-port") || c.IsSet("consul-token") || c.IsSet("consul-agent-id") {
 		return nil, ErrConsulUnsupported
 	}
@@ -62,5 +51,6 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		EventQueueSize:      c.Int("event-queue-size"),
 		WALPath:             c.String("wal-path"),
 		SkipTLSVerification: c.Bool("skip-tls-verification"),
+		Debug:               c.Bool("debug"),
 	}, nil
 }

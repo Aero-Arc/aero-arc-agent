@@ -60,10 +60,14 @@ var agentCmd = cli.Command{
 			Usage: "Skip TLS verification",
 		},
 		&cli.StringFlag{
-			Name:     "wal-path",
-			Value:    "agent_wal.db",
-			Required: true,
-			Usage:    "Path to the Write-Ahead Log (SQLite) file (required)",
+			Name:  "wal-path",
+			Value: "agent_wal.db",
+			Usage: "Path to the Write-Ahead Log (SQLite) file (required)",
+		},
+		&cli.BoolFlag{
+			Name:  "debug",
+			Value: false,
+			Usage: "Enable debug mode. Mainly used for sim testing.",
 		},
 	},
 }
