@@ -20,12 +20,16 @@ type Entry struct {
 
 // WAL implements a Write-Ahead Log using SQLite.
 type WAL struct {
-	db *sql.DB
+	db           *sql.DB
+	doneChan     chan struct{}
+	batchChan    chan *agentv1.TelemetryFrame
+	batchSize    int64
+	batchTimeout time.Duration
 }
 
 // New creates or opens a WAL at the specified path.
 // TODO: Add time.Duration for the WAL cleanup interval.
-func New(path string) (*WAL, error) {
+func New(path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open wal db: %w", err)
@@ -41,7 +45,15 @@ func New(path string) (*WAL, error) {
 		return nil, err
 	}
 
-	return &WAL{db: db}, nil
+	wal := &WAL{
+		db:           db,
+		doneChan:     make(chan struct{}),
+		batchChan:    make(chan *agentv1.TelemetryFrame),
+		batchSize:    batchSize,
+		batchTimeout: batchTimeout,
+	}
+
+	return wal, nil
 }
 
 func configureDB(db *sql.DB) error {
@@ -87,6 +99,53 @@ func initDB(db *sql.DB) error {
 	return nil
 }
 
+func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) error {
+	select {
+	case w.batchChan <- tFrame:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// TODO: Figure out if we should drop or other backpressure methods
+		return nil
+	}
+}
+
+func (w *WAL) runBatchWriter() {
+	var batch []*agentv1.TelemetryFrame
+	ticker := time.NewTicker(w.batchTimeout)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		if _, err := w.AppendBatch(context.Background(), batch); err != nil {
+			// TODO: prolly should retry, dont panic, but need some sort of retry
+			fmt.Printf("WAL Batch Write Failed: %w", err)
+		}
+
+		batch = nil
+	}
+
+	for {
+		select {
+		case frame := <-w.batchChan:
+			batch = append(batch, frame)
+			if len(batch) >= int(w.batchSize) {
+				flush()
+				ticker.Reset(w.batchTimeout)
+			}
+		case <-ticker.C:
+			flush()
+		case <-w.doneChan:
+			flush()
+			return
+		}
+	}
+}
+
 // Append appends a raw telemetry frame payload to the log and returns its ID.
 func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64, error) {
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
@@ -100,6 +159,56 @@ func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64
 		return 0, fmt.Errorf("failed to append frame to wal: %w", err)
 	}
 	return res.LastInsertId()
+}
+
+func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame) (int64, error) {
+	if len(frames) == 0 {
+		return 0, nil
+	}
+
+	// start the transaction
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction")
+	}
+
+	// defer rollback. If Commit() is called then RollBack is a no-op
+	defer tx.Rollback()
+
+	// prepare the statement
+	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prepare statement: %w", err)
+	}
+
+	defer stmt.Close()
+
+	var lastID int64
+	now := time.Now().UnixNano()
+
+	// loop and insert
+	for _, frame := range frames {
+		encoded, err := proto.Marshal(frame)
+		if err != nil {
+			return 0, fmt.Errorf("failed to marshal frame")
+		}
+
+		// Execute against the *statement* (which is bound to the transaction)
+		res, err := stmt.ExecContext(ctx, now, encoded, DeliveryStatusWritten)
+		if err != nil {
+			return 0, fmt.Errorf("failed to insert frames: %w", err)
+		}
+
+		lastID, _ = res.LastInsertId()
+	}
+
+	// commit
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return lastID, nil
 }
 
 // ReadUndelivered reads up to limit undelivered entries from the log.
