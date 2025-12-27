@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bluenviron/gomavlib/v3"
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/bluenviron/gomavlib/v3"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -117,19 +117,17 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_agent.db")
-	w, err := wal.New(dbPath)
+	w, err := wal.New(dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
 	defer w.Close()
 
-	// Need a valid eventFrameQueue because handleTelemetryFrames reads from it
 	a := &Agent{
-		options:         &AgentOptions{RelayTarget: "test:1234"},
-		backoffInitial:  time.Millisecond,
-		backoffMax:      10 * time.Millisecond,
-		eventFrameQueue: make(chan *agentv1.TelemetryFrame, 10),
-		wal:             w,
+		options:        &AgentOptions{RelayTarget: "test:1234"},
+		backoffInitial: time.Millisecond,
+		backoffMax:     10 * time.Millisecond,
+		wal:            w,
 	}
 
 	dialCount := 0
@@ -157,11 +155,6 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 			// Just return error or hang to avoid spinning
 			return nil, errors.New("simulated dial fail on reconnect")
 		}
-		// Return a dummy connection
-		// We use a dummy target, but in reality we mock the connection object logic in runWithReconnect
-		// runWithReconnect uses the returned conn to create a gateway client.
-		// However, we mock registerFn and openStreamFn so the actual conn is not used much
-		// except for closing.
 		return grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
@@ -234,7 +227,7 @@ func TestHandleTelemetryAck(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_ack.db")
-	w, err := wal.New(dbPath)
+	w, err := wal.New(dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
@@ -347,51 +340,6 @@ func TestStart_ImmediateCancel(t *testing.T) {
 		return nil, context.Canceled
 	}
 
-	// We need to make sure the WAL is closed properly or at least handled.
-	// NewAgent creates the WAL *inside* Start, which is a bit tricky for testing if we want to mock it.
-	// But Start() creates the WAL.
-
-	// The issue in the panic was:
-	// github.com/bluenviron/gomavlib/v3.(*Node).Close(...)
-	// internal/agent/agent.go:150
-	// a.node is initialized in NewAgent but Initialize() is called in runMAVLink.
-	// If Start returns early (due to context cancel), shutdown() is called.
-	// shutdown() calls a.node.Close().
-	// gomavlib Node.Close() might panic if it wasn't initialized?
-	
-	// FIX: We need to initialize the node so Close() works, OR we need to mock runMAVLink to initialize it.
-	// Since runMAVLink runs in a goroutine, it might not have initialized when Start returns.
-	
-	// Actually, just initializing the node here is probably enough.
-	// We need to provide OutVersion for Initialize to succeed.
-	// This is set to common.Dialect in NewAgent, which sets OutVersion in Node.
-	// Wait, common.Dialect is a *dialect.Dialect.
-	
-	// Let's check NewAgent in agent.go
-	/*
-		a := &Agent{
-			node: &gomavlib.Node{
-				Endpoints: []gomavlib.EndpointConf{
-					gomavlib.EndpointSerial{
-						Device: options.SerialPath,
-						Baud:   options.SerialBaud,
-					},
-				},
-				Dialect: common.Dialect,
-			},
-            ...
-    */
-    // gomavlib.Node struct has Dialect *dialect.Dialect and OutVersion byte.
-    // If Dialect is set, OutVersion is usually inferred or defaults?
-    // The error says "OutVersion not provided".
-    
-    // We should set OutVersion manually here to satisfy Initialize.
-    // Common dialect is usually v1 or v2 (3).
-    // Let's check how NewAgent sets it. It doesn't set OutVersion explicitly.
-    // gomavlib documentation says if Dialect is nil, OutVersion must be provided.
-    // Here Dialect IS provided.
-    
-    // Maybe we just need to set OutVersion explicitly for the test case?
 	a.node.OutVersion = gomavlib.V2
 	a.node.OutSystemID = 10
 	a.node.OutComponentID = 1
@@ -401,10 +349,6 @@ func TestStart_ImmediateCancel(t *testing.T) {
 	}
 
 	err = a.Start(ctx, sigCh)
-	// Start checks context at the very beginning.
-	// If context is cancelled, it goes to defer func() -> shutdown().
-	// shutdown() calls a.node.Close().
-
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Expected context.Canceled, got %v", err)
 	}

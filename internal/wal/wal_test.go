@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"google.golang.org/protobuf/proto"
@@ -15,7 +16,7 @@ func TestWAL_Lifecycle(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "wal_lifecycle.db")
 
-	w, err := New(dbPath)
+	w, err := New(dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
@@ -65,6 +66,79 @@ func TestWAL_AppendAndRead(t *testing.T) {
 		if !bytes.Equal(frame.RawMavlink, payloads[i]) {
 			t.Errorf("Entry %d mismatch: got %s, want %s", i, frame.RawMavlink, payloads[i])
 		}
+	}
+}
+
+func TestWAL_AsyncBatching(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_async.db")
+	// Use small batch size and short timeout for testing
+	w, err := New(dbPath, 2, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Failed to open WAL: %v", err)
+	}
+	defer w.Close()
+	ctx := context.Background()
+
+	// 1. AppendAsync 1 frame (should buffer)
+	err = w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("frame1")})
+	if err != nil {
+		t.Fatalf("AppendAsync 1 failed: %v", err)
+	}
+
+	// Read immediately - should be empty (buffered)
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatalf("ReadUndelivered failed: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Expected 0 entries (buffered), got %d", len(entries))
+	}
+
+	// 2. AppendAsync 2nd frame (should trigger batch flush due to size=2)
+	err = w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("frame2")})
+	if err != nil {
+		t.Fatalf("AppendAsync 2 failed: %v", err)
+	}
+
+	// Wait for signal
+	select {
+	case <-w.signalChan:
+		// Got signal
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout waiting for WAL signal")
+	}
+
+	// Read - should have 2 entries
+	entries, err = w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatalf("ReadUndelivered failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("Expected 2 entries, got %d", len(entries))
+	}
+
+	// 3. AppendAsync 3rd frame (should wait for timeout)
+	err = w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("frame3")})
+	if err != nil {
+		t.Fatalf("AppendAsync 3 failed: %v", err)
+	}
+
+	// Wait for signal (triggered by timeout)
+	select {
+	case <-w.signalChan:
+		// Got signal
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout waiting for WAL signal (timeout flush)")
+	}
+
+	// Read - should have 1 new entry (total 3 undelivered if we didn't mark them)
+	entries, err = w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatalf("ReadUndelivered failed: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Errorf("Expected 3 entries total, got %d", len(entries))
 	}
 }
 
@@ -187,7 +261,7 @@ func TestWAL_ReadLimit(t *testing.T) {
 func mustNewWAL(t *testing.T) *WAL {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
-	w, err := New(dbPath)
+	w, err := New(dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}

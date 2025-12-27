@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -23,6 +24,7 @@ type WAL struct {
 	db           *sql.DB
 	doneChan     chan struct{}
 	batchChan    chan *agentv1.TelemetryFrame
+	signalChan   chan struct{}
 	batchSize    int64
 	batchTimeout time.Duration
 }
@@ -45,13 +47,25 @@ func New(path string, batchSize int64, batchTimeout time.Duration) (*WAL, error)
 		return nil, err
 	}
 
+	// Default values if not provided
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	if batchTimeout <= 0 {
+		batchTimeout = 100 * time.Millisecond
+	}
+
 	wal := &WAL{
 		db:           db,
 		doneChan:     make(chan struct{}),
-		batchChan:    make(chan *agentv1.TelemetryFrame),
+		batchChan:    make(chan *agentv1.TelemetryFrame, batchSize*2), // Buffer a bit more than one batch
+		signalChan:   make(chan struct{}, 1),                          // Buffer 1 to prevent blocking
 		batchSize:    batchSize,
 		batchTimeout: batchTimeout,
 	}
+
+	// Start the background writer
+	go wal.runBatchWriter()
 
 	return wal, nil
 }
@@ -99,6 +113,8 @@ func initDB(db *sql.DB) error {
 	return nil
 }
 
+// AppendAsync queues a frame for writing.
+// This is non-blocking unless the buffer is completely full.
 func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) error {
 	select {
 	case w.batchChan <- tFrame:
@@ -106,8 +122,15 @@ func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) e
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		// TODO: Figure out if we should drop or other backpressure methods
-		return nil
+		// If buffer is full, we can choose to drop or block.
+		// For safety, let's block with a short timeout or just block until context.
+		// For now, let's block on the channel send to provide backpressure.
+		select {
+		case w.batchChan <- tFrame:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -121,11 +144,24 @@ func (w *WAL) runBatchWriter() {
 			return
 		}
 
+		// Use background context for writes to ensure they complete even if ingestion context is cancelled
+		// Ideally we would have a shutdown context passed to runBatchWriter
 		if _, err := w.AppendBatch(context.Background(), batch); err != nil {
-			// TODO: prolly should retry, dont panic, but need some sort of retry
-			fmt.Printf("WAL Batch Write Failed: %w", err)
+			// TODO: Retry logic would be good here.
+			// For now, we log and proceed, but this means data loss if DB is down.
+			// In a robust system, we might loop here until success or shutdown.
+			slog.Error("WAL Batch Write Failed", "error", err)
+		} else {
+			// Notify readers that new data is available
+			select {
+			case w.signalChan <- struct{}{}:
+			default:
+				// Signal already pending, no need to block
+			}
 		}
 
+		// Clear the batch (nil it out to let GC reclaim if needed, though reuse is better for allocs)
+		// Re-slicing to 0 length keeps capacity
 		batch = nil
 	}
 
@@ -133,7 +169,7 @@ func (w *WAL) runBatchWriter() {
 		select {
 		case frame := <-w.batchChan:
 			batch = append(batch, frame)
-			if len(batch) >= int(w.batchSize) {
+			if int64(len(batch)) >= w.batchSize {
 				flush()
 				ticker.Reset(w.batchTimeout)
 			}
@@ -147,6 +183,7 @@ func (w *WAL) runBatchWriter() {
 }
 
 // Append appends a raw telemetry frame payload to the log and returns its ID.
+// This is the synchronous version.
 func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64, error) {
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
 	encoded, err := proto.Marshal(tFrame)
@@ -161,6 +198,7 @@ func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64
 	return res.LastInsertId()
 }
 
+// AppendBatch writes multiple frames in a single transaction.
 func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame) (int64, error) {
 	if len(frames) == 0 {
 		return 0, nil
@@ -169,7 +207,7 @@ func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame)
 	// start the transaction
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction")
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	// defer rollback. If Commit() is called then RollBack is a no-op
@@ -191,7 +229,9 @@ func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame)
 	for _, frame := range frames {
 		encoded, err := proto.Marshal(frame)
 		if err != nil {
-			return 0, fmt.Errorf("failed to marshal frame")
+			// Skip malformed frames instead of failing the whole batch
+			slog.Warn("failed to marshal frame, skipping", "error", err)
+			continue
 		}
 
 		// Execute against the *statement* (which is bound to the transaction)
@@ -216,14 +256,15 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("limit must be > 0")
 	}
+	// Only read DeliveryStatusWritten (0). Ignore Pending (1) and Delivered (2).
 	query := `
 	SELECT seq, created_at, payload
 	FROM telemetry_frames
-	WHERE delivery_status < ?
+	WHERE delivery_status = ?
 	ORDER BY seq ASC
 	LIMIT ?
 	`
-	rows, err := w.db.QueryContext(ctx, query, DeliveryStatusDelivered, limit)
+	rows, err := w.db.QueryContext(ctx, query, DeliveryStatusWritten, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query undelivered frames: %w", err)
 	}
@@ -243,6 +284,16 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	}
 
 	return entries, nil
+}
+
+// WaitForData blocks until new data is signaled or the context is cancelled.
+func (w *WAL) WaitForData(ctx context.Context) error {
+	select {
+	case <-w.signalChan:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (w *WAL) updateDeliveryStatus(ctx context.Context, seq uint64, status DeliveryStatus) (int64, error) {
@@ -266,8 +317,69 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
+func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
+	return w.updateDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending)
+}
+
+func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, status DeliveryStatus) (int64, error) {
+	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq=? AND delivery_status != ?`
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, seq := range seqs {
+		if _, err := stmt.ExecContext(ctx, status, seq, status); err != nil {
+			slog.Error("failed to update delivery status", "error", err)
+			continue
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return 0, nil
+}
+
 func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
+}
+
+// ResetPending resets frames that have been in 'Pending' state for longer than ttl.
+// This allows retrying frames that were marked as pending but never acked.
+func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error) {
+	if ttl <= 0 {
+		return 0, nil
+	}
+
+	// created_at is stored as unix nano
+	// We want rows where delivery_status = Pending AND created_at < (now - ttl)
+	// Note: created_at is when it was inserted, not when it was marked pending.
+	// Since we don't track "updated_at", we use "created_at" as a proxy.
+	// If a frame is pending and old enough, we retry it.
+	cutoff := time.Now().Add(-ttl).UnixNano()
+
+	query := `
+	UPDATE telemetry_frames 
+	SET delivery_status = ? 
+	WHERE delivery_status = ? 
+	AND created_at < ?
+	`
+
+	res, err := w.db.ExecContext(ctx, query, DeliveryStatusWritten, DeliveryStatusPending, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to reset pending frames: %w", err)
+	}
+
+	return res.RowsAffected()
 }
 
 // CleanupDelivered deletes delivered frames that are older than the specified retention count.
@@ -301,5 +413,6 @@ func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 
 // Close closes the underlying database connection.
 func (w *WAL) Close() error {
+	close(w.doneChan) // Signal writer to stop
 	return w.db.Close()
 }
