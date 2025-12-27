@@ -69,6 +69,16 @@ var agentCmd = cli.Command{
 			Value: false,
 			Usage: "Enable debug mode. Mainly used for sim testing.",
 		},
+		&cli.Int64Flag{
+			Name:  "wal-batch-size",
+			Value: 1000,
+			Usage: "WAL write batch size",
+		},
+		&cli.DurationFlag{
+			Name:  "wal-flush-timeout",
+			Value: time.Second * 10,
+			Usage: "WAL flush interval if batch queue doesn't fill up",
+		},
 	},
 }
 

@@ -112,7 +112,7 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
 
 	// Initialize WAL
-	w, err := wal.New(a.options.WALPath)
+	w, err := wal.New(a.options.WALPath, a.options.WALBatchSize, a.options.WALFlushTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to initialize WAL: %w", err)
 	}
@@ -269,7 +269,7 @@ func (a *Agent) sendToWAL(ctx context.Context, frame *gomavlib.EventFrame) (*age
 	if err != nil {
 		return nil, fmt.Errorf("wal append failed: %w", err)
 	}
-	//TODO: fix this conversion. Should it be int64 or uint64?
+	// TODO: fix this conversion. Should it be int64 or uint64?
 	tFrame.Seq = uint64(id)
 
 	return tFrame, nil
@@ -376,7 +376,6 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 // runStreamLoop handles the receive side of the telemetry stream. Outbound
 // sends will be wired in a later iteration once the queue is implemented.
 func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
-
 	for {
 		select {
 		case <-ctx.Done():
