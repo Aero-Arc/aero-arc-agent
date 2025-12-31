@@ -106,7 +106,6 @@ The agent is configured entirely via CLI flags.
 
 Example:
 ```bash
-```
 ~/aero-arc-agent$ bin/aero-arc-agent --help
 NAME:
    run - run the agent edge process
@@ -132,7 +131,6 @@ to (default: "localhost")
    --wal-batch-size int          WAL write batch size (default: 1000)
    --wal-flush-timeout duration  WAL flush interval if batch queue doesn't fill up (default: 10s)
    --help, -h                    show help
-```
 ```
 
 ## Project Status & Roadmap
