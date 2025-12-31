@@ -592,7 +592,13 @@ func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error
 		return 0, fmt.Errorf("failed to reset pending frames: %w", err)
 	}
 
-	return res.RowsAffected()
+	rows, err := res.RowsAffected()
+
+	if rows != 0 {
+		w.signalChan <- struct{}{}
+	}
+
+	return rows, err
 }
 
 // CleanupDelivered deletes delivered frames that are older than the specified retention count.
