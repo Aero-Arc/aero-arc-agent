@@ -142,6 +142,48 @@ func TestWAL_AsyncBatching(t *testing.T) {
 	}
 }
 
+func TestWAL_SpoolAndDrain(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_spool.db")
+	w, err := New(dbPath, 2, time.Hour)
+	if err != nil {
+		t.Fatalf("Failed to open WAL: %v", err)
+	}
+	defer w.Close()
+	ctx := context.Background()
+
+	frames := []*agentv1.TelemetryFrame{
+		{RawMavlink: []byte("spool1")},
+		{RawMavlink: []byte("spool2")},
+	}
+
+	spoolPath, err := w.spoolBatch(frames)
+	if err != nil {
+		t.Fatalf("spoolBatch failed: %v", err)
+	}
+	if spoolPath == "" {
+		t.Fatal("expected spool file to be created")
+	}
+	if _, err := os.Stat(spoolPath); err != nil {
+		t.Fatalf("spool file missing: %v", err)
+	}
+
+	if err := w.drainSpool(); err != nil {
+		t.Fatalf("drainSpool failed: %v", err)
+	}
+	if _, err := os.Stat(spoolPath); !os.IsNotExist(err) {
+		t.Fatalf("expected spool file to be removed, got: %v", err)
+	}
+
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatalf("ReadUndelivered failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("Expected 2 entries, got %d", len(entries))
+	}
+}
+
 func TestWAL_MarkDelivered_Idempotency(t *testing.T) {
 	w := mustNewWAL(t)
 	defer w.Close()
