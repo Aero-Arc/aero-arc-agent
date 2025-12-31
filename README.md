@@ -1,6 +1,6 @@
 # Aero Arc Agent
 
-A lightweight edge-side agent that runs on a UAV’s companion computer and provides a reliable, backpressure-aware telemetry pipeline to the Aero Arc Relay.
+A lightweight edge-side agent that runs on a UAV’s companion computer and provides a durable, backpressure-aware telemetry pipeline to the Aero Arc Relay.
 
 The agent identifies the drone, registers with the relay, opens a bi-directional gRPC stream, and pushes telemetry frames with controlled flow — acting as the ingress point for drone data into modern cloud infrastructure.
 
@@ -10,6 +10,7 @@ This is the official client-side component of the Aero Arc open-source telemetry
 
 - Registration handshake (drone identity + hardware metadata)
 - Duplex telemetry stream using gRPC
+- Local write-ahead log (WAL) enabling crash-safe replay and at-least-once delivery
 - Backpressure-aware sending honoring relay limits
 - Automatic reconnection with exponential backoff
 - Lightweight footprint suitable for Jetson, Raspberry Pi, and x86
@@ -96,24 +97,41 @@ The agent performs three key tasks:
      - retries with exponential backoff  
      - re-registers  
      - resumes streaming  
+     - TelemetryFrames are persisted to a durable write ahead log before being sent and replayed on reconnect
    - This ensures continuity even on unstable connections.
 
 ## Configuration
 
-Common CLI flags:
+The agent is configured entirely via CLI flags.
 
-| Flag              | Description                              |
-| ----------------- | ---------------------------------------- |
-| `--relay`         | Relay gRPC endpoint                      |
-| `--agent-id`      | Unique ID for this agent                 |
-| `--drone-id`      | Stable UAV identifier                    |
-| `--model`         | Drone model name                         |
-| `--firmware`      | Flight firmware version                  |
-| `--hardware-uid`  | Override auto-detected hardware UID      |
-| `--platform`      | OS + architecture string                 |
-| `--agent-version` | Agent version override                   |
+Example:
+```bash
+~/aero-arc-agent$ bin/aero-arc-agent --help
+NAME:
+   run - run the agent edge process
 
-A config file format is planned for future releases.
+USAGE:
+   run [global options]
+
+GLOBAL OPTIONS:
+   --serial-path string          The serial path to use for the agent 
+(default: "/dev/ttyUSB0")
+   --serial-baud int             The baud rate to use for the serial c
+onnection (default: 115200)
+   --server-address string       The address of the server to connect 
+to (default: "localhost")
+   --server-port int             The port of the server to connect to 
+(default: 8080)
+   --backoff-initial duration    Initial reconnect backoff duration (default: 1s)
+   --backoff-max duration        Maximum reconnect backoff duration (default: 30s)
+   --event-queue-size int        The size of the event queue (default: 1000)
+   --skip-tls-verification       Skip TLS verification
+   --wal-path string             Path to the Write-Ahead Log (SQLite) file (required) (default: "agent_wal.db")
+   --debug                       Enable debug mode. Mainly used for sim testing.
+   --wal-batch-size int          WAL write batch size (default: 1000)
+   --wal-flush-timeout duration  WAL flush interval if batch queue doesn't fill up (default: 10s)
+   --help, -h                    show help
+```
 
 ## Project Status & Roadmap
 
@@ -124,20 +142,16 @@ The agent is early but functional. The core RPC contract is stable.
 - [x] Registration  
 - [x] Telemetry stream  
 - [x] Backpressure enforcement  
-- [x] Basic CLI + metadata  
 - [x] Automatic reconnection  
+- [x] Local durability (WAL)
+- [x] Crash-safe replay
+- [x] At-least-once delivery
 
 ### v0.2
 
 - [ ] MAVLink ingestion module  
 - [ ] Frame translation pipeline  
 - [ ] Rate control for high-throughput sensors  
-
-### v0.3
-
-- [ ] Local durability (WAL)  
-- [ ] Crash-safe replay  
-- [ ] Delivery guarantees  
 
 ### v1.0
 
