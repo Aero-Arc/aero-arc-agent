@@ -30,6 +30,8 @@ type AgentOptions struct {
 	EventQueueSize      int
 	SkipTLSVerification bool
 	WALPath             string
+	WALBatchSize        int64
+	WALFlushTimeout     time.Duration
 	Debug               bool
 }
 
@@ -50,6 +52,8 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		APIKey:              os.Getenv("AERO_ARC_API_KEY"),
 		EventQueueSize:      c.Int("event-queue-size"),
 		WALPath:             c.String("wal-path"),
+		WALBatchSize:        c.Int64("wal-batch-size"),
+		WALFlushTimeout:     c.Duration("wal-flush-timeout"),
 		SkipTLSVerification: c.Bool("skip-tls-verification"),
 		Debug:               c.Bool("debug"),
 	}, nil
