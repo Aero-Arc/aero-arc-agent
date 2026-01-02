@@ -1,7 +1,7 @@
 bou.ke/monkey v1.0.2 h1:kWcnsrCNUatbxncxR/ThdYqbytgOIArtYWqcQLQzKLI=
 bou.ke/monkey v1.0.2/go.mod h1:OqickVX3tNx6t33n1xvtTtu85YN5s6cKwVug+oHMaIA=
-github.com/aero-arc/aero-arc-protos v0.0.0-20251219015509-09def04964ec h1:dkWRAqd+jCMdQJCHVR7xvUeQuUDt6vzYAK/VEawewQY=
-github.com/aero-arc/aero-arc-protos v0.0.0-20251219015509-09def04964ec/go.mod h1:fILW3Dz6auXllS5ABRFTt0FTnNC4Mtw3ukvGrJa7zLo=
+github.com/aero-arc/aero-arc-protos v0.0.0-20260102021844-71907cb05f5f h1:llOCBIopyYrbJUjk33I7nVSpeTkueabhHZEGa9Uesjg=
+github.com/aero-arc/aero-arc-protos v0.0.0-20260102021844-71907cb05f5f/go.mod h1:fILW3Dz6auXllS5ABRFTt0FTnNC4Mtw3ukvGrJa7zLo=
 github.com/bluenviron/gomavlib/v3 v3.3.0 h1:ul1yiDslfvsqCjLs+by1eSdU8Oud5qwemoO5ZBpX/fs=
 github.com/bluenviron/gomavlib/v3 v3.3.0/go.mod h1:pPrXt2HspzeIKNlvSDCrPzwPSLPDXORfhWJ8vT8zEKk=
 github.com/creack/goselect v0.1.2 h1:2DNy14+JPjRBgPzAd1thbQp4BSIihxcBf0IXhQXDRa0=

@@ -16,4 +16,5 @@ var (
 	ErrFailedRelayGrpcConnection = errors.New("failed to establish relay grpc connection")
 
 	ErrGatewayNotInitialized = errors.New("agent gateway client not initialized")
+	ErrFailedToMarkDelivered = errors.New("failed to mark wal entry as delivered")
 )
