@@ -377,6 +377,8 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 				// TODO: Handle error? Should we retry? Definitely shouldn't just exit.
 				return err
 			}
+
+			slog.LogAttrs(ctx, slog.LevelInfo, "ack_received", slog.Uint64("seq", ack.Seq))
 		}
 	}
 }
@@ -443,6 +445,8 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 			slog.LogAttrs(ctx, slog.LevelError, "wal_mark_pending_batch_error", slog.String("error", err.Error()))
 			continue
 		}
+
+		slog.LogAttrs(ctx, slog.LevelInfo, "mark_batch_succeed", slog.Int("batch_size", entriesLen))
 	}
 }
 
