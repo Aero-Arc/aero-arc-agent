@@ -133,6 +133,21 @@ to (default: "localhost")
    --help, -h                    show help
 ```
 
+## Code Generation
+
+The agent uses `go generate` to precompute a fast MAVLink field mapper for the
+`common` dialect. This avoids runtime reflection in the telemetry hot path by
+emitting a large, type-safe switch that populates `TelemetryFrame.Fields`.
+
+If you update gomavlib or change the mapping rules, regenerate the file with:
+
+```bash
+go generate ./internal/agent
+```
+
+This writes `internal/agent/mav_fields_gen.go` from
+`internal/agent/cmd/genmavfields`.
+
 ## Project Status & Roadmap
 
 The agent is early but functional. The core RPC contract is stable.

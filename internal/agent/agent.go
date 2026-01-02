@@ -238,18 +238,23 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 
 // processFrame marshals the MAVLink frame and queues it for WAL ingestion.
 func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) error {
-	payload, err := json.Marshal(frame.Message())
+	msg := frame.Message()
+	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal frame message: %w", err)
 	}
 
-	msgName := fmt.Sprintf("%T", frame.Message())
+	msgName := fmt.Sprintf("%T", msg)
+	fields, _ := commonFields(msg)
 
 	// Construct the TelemetryFrame to return
 	tFrame := &agentv1.TelemetryFrame{
 		RawMavlink:   payload,
 		SentAtUnixNs: time.Now().UnixNano(),
+		Dialect:      "common",
+		MsgId:        msg.GetID(),
 		MsgName:      msgName,
+		Fields:       fields,
 		AgentId:      identity.Resolve().FinalID,
 	}
 
