@@ -488,6 +488,20 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	return entries, nil
 }
 
+// CountUndelivered returns the total number of undelivered entries.
+func (w *WAL) CountUndelivered(ctx context.Context) (int64, error) {
+	query := `
+	SELECT COUNT(1)
+	FROM telemetry_frames
+	WHERE delivery_status = ?
+	`
+	var count int64
+	if err := w.db.QueryRowContext(ctx, query, DeliveryStatusWritten).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count undelivered frames: %w", err)
+	}
+	return count, nil
+}
+
 // WaitForData blocks until new data is signaled or the context is cancelled.
 func (w *WAL) WaitForData(ctx context.Context) error {
 	select {

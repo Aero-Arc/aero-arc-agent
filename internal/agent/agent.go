@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -41,6 +42,9 @@ type Agent struct {
 	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error)
 	ackLoopFn     func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error
 	sleepWithBack func(ctx context.Context, d time.Duration) bool
+
+	ingestCount atomic.Uint64
+	sendCount   atomic.Uint64
 }
 
 func NewAgent(options *AgentOptions) (*Agent, error) {
@@ -116,6 +120,8 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	}
 	a.wal = w
 	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
+
+	go a.runTelemetryStats(ctx, 10*time.Second)
 
 	// Run WAL cleanup loop
 	go func() {
@@ -262,6 +268,7 @@ func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) er
 	if err := a.wal.AppendAsync(ctx, tFrame); err != nil {
 		return fmt.Errorf("wal append async failed: %w", err)
 	}
+	a.ingestCount.Add(1)
 
 	return nil
 }
@@ -382,8 +389,6 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 				// TODO: Handle error? Should we retry? Definitely shouldn't just exit.
 				return err
 			}
-
-			slog.LogAttrs(ctx, slog.LevelInfo, "ack_received", slog.Uint64("seq", ack.Seq))
 		}
 	}
 }
@@ -442,6 +447,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				slog.LogAttrs(ctx, slog.LevelError, "telemetry_frame_send_error", slog.String("error", err.Error()))
 				break
 			}
+			a.sendCount.Add(1)
 
 			ids = append(ids, tFrame.Seq)
 		}
