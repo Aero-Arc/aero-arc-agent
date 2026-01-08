@@ -14,7 +14,6 @@ import (
 )
 
 var agentCmd = cli.Command{
-	Name:   "run",
 	Usage:  "run the agent edge process",
 	Action: RunAgent,
 

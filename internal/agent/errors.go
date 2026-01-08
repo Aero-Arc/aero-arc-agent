@@ -17,4 +17,6 @@ var (
 
 	ErrGatewayNotInitialized = errors.New("agent gateway client not initialized")
 	ErrFailedToMarkDelivered = errors.New("failed to mark wal entry as delivered")
+
+	ErrGettingHomeDir = errors.New("error getting user home directory")
 )
