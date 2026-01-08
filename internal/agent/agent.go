@@ -17,7 +17,6 @@ import (
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -280,9 +279,20 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 
 	// TODO: Use a proper TLS config with a valid certificate.
 	var creds credentials.TransportCredentials
+	var err error
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		slog.LogAttrs(ctx, slog.LevelError, ErrGettingHomeDir.Error(), slog.String("error", err.Error()))
+		return nil, ErrGettingHomeDir
+	}
 
 	if a.options.Debug {
-		creds = insecure.NewCredentials()
+		certPath := fmt.Sprintf("%s/%s", homeDir, DebugTLSCertPath)
+		creds, err = credentials.NewClientTLSFromFile(certPath, "localhost")
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		creds = credentials.NewTLS(&tls.Config{
 			InsecureSkipVerify: a.options.SkipTLSVerification,
