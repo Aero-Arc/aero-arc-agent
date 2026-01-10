@@ -281,13 +281,14 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 	var creds credentials.TransportCredentials
 	var err error
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		slog.LogAttrs(ctx, slog.LevelError, ErrGettingHomeDir.Error(), slog.String("error", err.Error()))
-		return nil, ErrGettingHomeDir
-	}
-
 	if a.options.Debug {
+
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, ErrGettingHomeDir.Error(), slog.String("error", err.Error()))
+			return nil, ErrGettingHomeDir
+		}
+
 		certPath := fmt.Sprintf("%s/%s", homeDir, DebugTLSCertPath)
 		creds, err = credentials.NewClientTLSFromFile(certPath, "localhost")
 		if err != nil {
