@@ -16,7 +16,7 @@ func TestWAL_Lifecycle(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "wal_lifecycle.db")
 
-	w, err := New(dbPath, 0, 0)
+	w, err := New(context.Background(), dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestWAL_AsyncBatching(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_async.db")
 	// Use small batch size and short timeout for testing
-	w, err := New(dbPath, 2, 50*time.Millisecond)
+	w, err := New(context.Background(), dbPath, 2, 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestWAL_AsyncBatching(t *testing.T) {
 func TestWAL_SpoolAndDrain(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_spool.db")
-	w, err := New(dbPath, 2, time.Hour)
+	w, err := New(context.Background(), dbPath, 2, time.Hour)
 	if err != nil {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestWAL_ReadLimit(t *testing.T) {
 func mustNewWAL(t *testing.T) *WAL {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
-	w, err := New(dbPath, 0, 0)
+	w, err := New(context.Background(), dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}

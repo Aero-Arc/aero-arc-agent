@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -117,7 +116,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_agent.db")
-	w, err := wal.New(dbPath, 0, 0)
+	w, err := wal.New(context.Background(), dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
@@ -227,7 +226,7 @@ func TestHandleTelemetryAck(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_ack.db")
-	w, err := wal.New(dbPath, 0, 0)
+	w, err := wal.New(context.Background(), dbPath, 0, 0)
 	if err != nil {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
@@ -332,9 +331,6 @@ func TestStart_ImmediateCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	// Need to provide a valid signal channel
-	sigCh := make(chan os.Signal, 1)
-
 	// Mock runMAVLink and runWithReconnect to avoid side effects
 	a.dialFn = func(ctx context.Context) (*grpc.ClientConn, error) {
 		return nil, context.Canceled
@@ -343,12 +339,12 @@ func TestStart_ImmediateCancel(t *testing.T) {
 	a.node.OutVersion = gomavlib.V2
 	a.node.OutSystemID = 10
 	a.node.OutComponentID = 1
-	
+
 	if err := a.node.Initialize(); err != nil {
 		t.Fatalf("Failed to initialize node: %v", err)
 	}
 
-	err = a.Start(ctx, sigCh)
+	err = a.Start(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Expected context.Canceled, got %v", err)
 	}

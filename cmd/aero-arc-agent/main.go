@@ -14,7 +14,6 @@ import (
 )
 
 var agentCmd = cli.Command{
-	Name:   "run",
 	Usage:  "run the agent edge process",
 	Action: RunAgent,
 
@@ -93,10 +92,10 @@ func RunAgent(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("failed to construct agent: %v", err)
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sigCtx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
-	return a.Start(ctx, sigCh)
+	return a.Start(sigCtx)
 }
 
 func main() {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,11 +38,12 @@ type WAL struct {
 	batchTimeout time.Duration
 	spoolDir     string
 	spoolSeq     uint64
+	spoolMu      sync.Mutex
 }
 
 // New creates or opens a WAL at the specified path.
 // TODO: Add time.Duration for the WAL cleanup interval.
-func New(path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
+func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open wal db: %w", err)
@@ -81,7 +83,7 @@ func New(path string, batchSize int64, batchTimeout time.Duration) (*WAL, error)
 	}
 
 	// Start the background writer
-	go wal.runBatchWriter()
+	go wal.runBatchWriter(ctx)
 
 	return wal, nil
 }
@@ -152,7 +154,7 @@ func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) e
 	}
 }
 
-func (w *WAL) runBatchWriter() {
+func (w *WAL) runBatchWriter(ctx context.Context) {
 	var batch []*agentv1.TelemetryFrame
 	ticker := time.NewTicker(w.batchTimeout)
 	defer ticker.Stop()
@@ -184,7 +186,7 @@ func (w *WAL) runBatchWriter() {
 				select {
 				case <-time.After(retryDelay):
 					continue
-				case <-w.doneChan:
+				case <-ctx.Done():
 					return
 				}
 			}
@@ -209,7 +211,7 @@ func (w *WAL) runBatchWriter() {
 			} else if err := w.drainSpool(); err != nil {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
-		case <-w.doneChan:
+		case <-ctx.Done():
 			if err := flush(); err != nil {
 				slog.Error("WAL Batch Spool Failed", "error", err)
 			}
@@ -291,6 +293,9 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 }
 
 func (w *WAL) drainSpool() error {
+	w.spoolMu.Lock()
+	defer w.spoolMu.Unlock()
+
 	entries, err := os.ReadDir(w.spoolDir)
 	if err != nil {
 		return fmt.Errorf("failed to read spool dir: %w", err)
