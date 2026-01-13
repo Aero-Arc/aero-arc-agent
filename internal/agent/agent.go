@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,6 +30,9 @@ type Agent struct {
 	gateway agentv1.AgentGatewayClient
 
 	options *AgentOptions
+
+	// goroutine waitgroup
+	wg sync.WaitGroup
 
 	// reconnection/backoff settings – wired from AgentOptions.
 	backoffInitial time.Duration
@@ -95,7 +99,7 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 
 // Start runs the MAVLink ingest loop and the gRPC reconnect/stream lifecycle
 // until the provided context is cancelled or a fatal error occurs.
-func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
+func (a *Agent) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -113,18 +117,25 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
 
 	// Initialize WAL
-	w, err := wal.New(a.options.WALPath, a.options.WALBatchSize, a.options.WALFlushTimeout)
+	w, err := wal.New(ctx, a.options.WALPath, a.options.WALBatchSize, a.options.WALFlushTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to initialize WAL: %w", err)
 	}
 	a.wal = w
 	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
 
-	go a.runTelemetryStats(ctx, 10*time.Second)
+	a.wg.Add(1)
+	go func(ctx context.Context) {
+		defer a.wg.Done()
+		a.runTelemetryStats(ctx, 10*time.Second)
+	}(ctx)
 
 	// Run WAL cleanup loop
-	go func() {
+	a.wg.Add(1)
+	go func(ctx context.Context) {
+		defer a.wg.Done()
 		timer := time.NewTicker(10 * time.Second)
+		defer timer.Stop()
 
 		for {
 			select {
@@ -143,44 +154,81 @@ func (a *Agent) Start(ctx context.Context, sig <-chan os.Signal) error {
 				}
 			}
 		}
-	}()
+	}(ctx)
 
 	// Run MAVLink loop
-	go func() {
+	a.wg.Add(1)
+	go func(ctx context.Context) {
+		defer a.wg.Done()
 		a.runMAVLink(ctx)
-	}()
+	}(ctx)
 
-	go func() {
+	a.wg.Add(1)
+	go func(ctx context.Context) {
+		defer a.wg.Done()
 		a.runWithReconnect(ctx)
-	}()
+	}(ctx)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-sig:
-			slog.LogAttrs(ctx, slog.LevelInfo, "agent received shutdown signal", slog.String("signal", fmt.Sprintf("%v", sig)))
-			cancel() // Signal all loops to stop
-			return nil
-		}
-	}
+	<-ctx.Done()
+
+	slog.LogAttrs(ctx, slog.LevelInfo, "agent received shutdown signal", slog.String("signal", ctx.Err().Error()))
+
+	return ctx.Err()
 }
 
 func (a *Agent) shutdown(ctx context.Context) error {
 	if a.conn != nil {
+		slog.Info("shutting down grpc connection")
 		a.conn.Close()
 	}
 
-	a.node.Close()
+	slog.Info("shutting down mavlink node (best effort)")
+	mavlinkCloseCtx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+
+	a.closeMAVLinkBestEffort(mavlinkCloseCtx)
+
 	if a.wal != nil {
+		slog.Info("shutting down write-ahead log connection")
 		a.wal.Close()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		slog.Warn("shutdown timed out waiting for goroutines to finish")
 	}
 
 	a.gateway = nil
 	a.conn = nil
-	// TODO: Close any other resources that need to be closed.
-	// specifically, the bidirectional telemetry stream.
+
 	return nil
+}
+
+func (a *Agent) closeMAVLinkBestEffort(ctx context.Context) {
+	if a.node == nil {
+		slog.Info("mavlink node already shutdown or closed")
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.node.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		slog.Info("mavlink node closed successfully")
+	case <-ctx.Done():
+		slog.Warn("mavlink node close timed out; continuing shutdown")
+	}
 }
 
 // runMAVLink owns the lifecycle of the gomavlib node.
@@ -192,12 +240,18 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	}
 
 	slog.LogAttrs(ctx, slog.LevelInfo, "mavlink_node_initialized")
+	events := a.node.Events()
 
-	for evt := range a.node.Events() {
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case evt, ok := <-events:
+			if !ok {
+				slog.LogAttrs(ctx, slog.LevelInfo, "mavlink eventstream closed")
+				return nil
+			}
+
 			if frameEvt, ok := evt.(*gomavlib.EventFrame); ok {
 				slog.LogAttrs(
 					ctx, slog.LevelDebug,
@@ -237,8 +291,6 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 			}
 		}
 	}
-
-	return nil
 }
 
 // processFrame marshals the MAVLink frame and queues it for WAL ingestion.
@@ -509,7 +561,6 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		}
 
 		connCtx, cancelConn := context.WithCancel(ctx)
-		defer cancelConn()
 
 		a.conn = conn
 		a.gateway = agentv1.NewAgentGatewayClient(conn)
@@ -579,8 +630,6 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			slog.LogAttrs(ctx, slog.LevelInfo, "stream_ended", slog.String("error", fmt.Sprint(err)))
 		}
 
-		cancelConn()
-
 		slog.LogAttrs(
 			ctx, slog.LevelInfo,
 			"agent_stream_closed",
@@ -589,6 +638,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		)
 
 		// Cleanup and Reconnect
+		cancelConn()
 		_ = stream.CloseSend()
 		_ = conn.Close()
 		a.conn = nil
