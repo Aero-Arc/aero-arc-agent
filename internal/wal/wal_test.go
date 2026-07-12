@@ -222,6 +222,57 @@ func TestWAL_MarkDelivered_Idempotency(t *testing.T) {
 	}
 }
 
+func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "wal.db")
+	w, err := New(ctx, path, 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := OperationContext{FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 3}
+	applied, err := w.SetOperationContext(ctx, "set-1", want)
+	if err != nil || !applied {
+		t.Fatalf("SetOperationContext() = %v, %v", applied, err)
+	}
+	applied, err = w.SetOperationContext(ctx, "set-1", OperationContext{FlightID: "wrong"})
+	if err != nil || applied {
+		t.Fatalf("duplicate SetOperationContext() = %v, %v", applied, err)
+	}
+	got, ok, err := w.LoadOperationContext(ctx)
+	if err != nil || !ok || got != want {
+		t.Fatalf("LoadOperationContext() = %#v, %v, %v; want %#v", got, ok, err, want)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err = New(ctx, path, 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	got, ok, err = w.LoadOperationContext(ctx)
+	if err != nil || !ok || got != want {
+		t.Fatalf("context after reopen = %#v, %v, %v; want %#v", got, ok, err, want)
+	}
+
+	applied, err = w.ClearOperationContext(ctx, "clear-old", "another-flight")
+	if err != nil || !applied {
+		t.Fatalf("conditional clear = %v, %v", applied, err)
+	}
+	if got, ok, err = w.LoadOperationContext(ctx); err != nil || !ok || got != want {
+		t.Fatalf("context after mismatched clear = %#v, %v, %v", got, ok, err)
+	}
+	applied, err = w.ClearOperationContext(ctx, "clear-1", want.FlightID)
+	if err != nil || !applied {
+		t.Fatalf("matching clear = %v, %v", applied, err)
+	}
+	if _, ok, err = w.LoadOperationContext(ctx); err != nil || ok {
+		t.Fatalf("context after clear: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestWAL_CleanupDelivered(t *testing.T) {
 	w := mustNewWAL(t)
 	defer w.Close()

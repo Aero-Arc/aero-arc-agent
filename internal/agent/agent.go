@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -42,9 +43,14 @@ type Agent struct {
 	// the concrete implementations below.
 	dialFn        func(ctx context.Context) (*grpc.ClientConn, error)
 	registerFn    func(ctx context.Context) error
-	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error)
-	ackLoopFn     func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error
+	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
+	ackLoopFn     func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
 	sleepWithBack func(ctx context.Context, d time.Duration) bool
+
+	stateMu          sync.RWMutex
+	sessionID        string
+	operationContext *wal.OperationContext
+	sendMu           sync.Mutex
 
 	ingestCount atomic.Uint64
 	sendCount   atomic.Uint64
@@ -122,6 +128,11 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize WAL: %w", err)
 	}
 	a.wal = w
+	if operationContext, ok, err := w.LoadOperationContext(ctx); err != nil {
+		return err
+	} else if ok {
+		a.operationContext = &operationContext
+	}
 	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
 
 	a.wg.Add(1)
@@ -314,6 +325,7 @@ func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) er
 		Fields:       fields,
 		AgentId:      identity.Resolve().FinalID,
 	}
+	a.stampFrameContext(tFrame)
 
 	// Write to WAL asynchronously
 	if err := a.wal.AppendAsync(ctx, tFrame); err != nil {
@@ -322,6 +334,17 @@ func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) er
 	a.ingestCount.Add(1)
 
 	return nil
+}
+
+func (a *Agent) stampFrameContext(frame *agentv1.TelemetryFrame) {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	frame.SessionId = a.sessionID
+	if active := a.operationContext; active != nil {
+		frame.FlightId = active.FlightID
+		frame.IntentId = active.IntentID
+		frame.IntentVersion = active.IntentVersion
+	}
 }
 
 // dialRelay establishes a gRPC connection to the relay using the configured target.
@@ -391,10 +414,16 @@ func (a *Agent) register(ctx context.Context) error {
 	)
 
 	regCtx := metadata.AppendToOutgoingContext(ctx, "aero-arc-agent-id", agentID)
-	_, err := a.gateway.Register(regCtx, req)
+	response, err := a.gateway.Register(regCtx, req)
 	if err != nil {
 		return err
 	}
+	if response.GetSessionId() == "" {
+		return errors.New("relay registration returned an empty session ID")
+	}
+	a.stateMu.Lock()
+	a.sessionID = response.GetSessionId()
+	a.stateMu.Unlock()
 
 	slog.LogAttrs(
 		ctx, slog.LevelInfo,
@@ -406,7 +435,7 @@ func (a *Agent) register(ctx context.Context) error {
 }
 
 // openTelemetryStream opens the bidi telemetry stream.
-func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error) {
+func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
 	if a.gateway == nil {
 		return nil, ErrGatewayNotInitialized
 	}
@@ -436,24 +465,107 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 
 // runStreamLoop handles the receive side of the telemetry stream. Outbound
 // sends will be wired in a later iteration once the queue is implemented.
-func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			ack, err := stream.Recv()
+			message, err := stream.Recv()
 			if err != nil {
 				return err
 			}
 
-			err = a.handleTelemetryAck(ctx, ack)
+			err = a.handleRelayMessage(ctx, stream, message)
 			if err != nil {
 				// TODO: Handle error? Should we retry? Definitely shouldn't just exit.
 				return err
 			}
 		}
 	}
+}
+
+func (a *Agent) handleRelayMessage(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], message *agentv1.RelayStreamMessage) error {
+	switch payload := message.GetPayload().(type) {
+	case *agentv1.RelayStreamMessage_TelemetryAck:
+		return a.handleTelemetryAck(ctx, payload.TelemetryAck)
+	case *agentv1.RelayStreamMessage_SetOperationContext:
+		return a.handleSetOperationContext(ctx, stream, payload.SetOperationContext)
+	case *agentv1.RelayStreamMessage_ClearOperationContext:
+		return a.handleClearOperationContext(ctx, stream, payload.ClearOperationContext)
+	default:
+		return errors.New("relay stream message has no supported payload")
+	}
+}
+
+func (a *Agent) handleSetOperationContext(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.SetOperationContextCommand) error {
+	if command.GetCommandId() == "" || command.GetContext() == nil || command.GetContext().GetFlightId() == "" {
+		return a.sendOperationContextAck(stream, command.GetCommandId(), agentv1.OperationContextCommandAck_STATUS_REJECTED, "command_id and flight_id are required")
+	}
+	value := wal.OperationContext{FlightID: command.Context.FlightId, IntentID: command.Context.IntentId, IntentVersion: command.Context.IntentVersion}
+	applied, err := a.wal.SetOperationContext(ctx, command.CommandId, value)
+	if err != nil {
+		return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_TEMPORARY_ERROR, err.Error())
+	}
+	status := agentv1.OperationContextCommandAck_STATUS_APPLIED
+	if !applied {
+		status = agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED
+		persisted, ok, loadErr := a.wal.LoadOperationContext(ctx)
+		if loadErr != nil {
+			return loadErr
+		}
+		a.stateMu.Lock()
+		if ok {
+			a.operationContext = &persisted
+		} else {
+			a.operationContext = nil
+		}
+		a.stateMu.Unlock()
+		return a.sendOperationContextAck(stream, command.CommandId, status, "")
+	}
+	a.stateMu.Lock()
+	a.operationContext = &value
+	a.stateMu.Unlock()
+	return a.sendOperationContextAck(stream, command.CommandId, status, "")
+}
+
+func (a *Agent) handleClearOperationContext(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.ClearOperationContextCommand) error {
+	if command.GetCommandId() == "" {
+		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "command_id is required")
+	}
+	applied, err := a.wal.ClearOperationContext(ctx, command.CommandId, command.FlightId)
+	if err != nil {
+		return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_TEMPORARY_ERROR, err.Error())
+	}
+	active, ok, err := a.wal.LoadOperationContext(ctx)
+	if err != nil {
+		return err
+	}
+	a.stateMu.Lock()
+	if ok {
+		a.operationContext = &active
+	} else {
+		a.operationContext = nil
+	}
+	a.stateMu.Unlock()
+	status := agentv1.OperationContextCommandAck_STATUS_APPLIED
+	if !applied {
+		status = agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED
+	}
+	return a.sendOperationContextAck(stream, command.CommandId, status, "")
+}
+
+func (a *Agent) sendOperationContextAck(stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], commandID string, status agentv1.OperationContextCommandAck_Status, errorMessage string) error {
+	a.stateMu.RLock()
+	var active *agentv1.OperationContext
+	if value := a.operationContext; value != nil {
+		active = &agentv1.OperationContext{FlightId: value.FlightID, IntentId: value.IntentID, IntentVersion: value.IntentVersion}
+	}
+	a.stateMu.RUnlock()
+	message := &agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_OperationContextCommandAck{OperationContextCommandAck: &agentv1.OperationContextCommandAck{CommandId: commandID, Status: status, Error: errorMessage, ActiveContext: active}}}
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	return stream.Send(message)
 }
 
 func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAck) error {
@@ -470,7 +582,7 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 	return nil
 }
 
-func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
 	// The new architecture unifies "Replay" and "Live" into a single loop.
 	// 1. We poll the WAL for undelivered frames.
 	// 2. We send them.
@@ -506,7 +618,11 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 			}
 			tFrame.Seq = uint64(entries[i].ID)
 
-			if err := stream.Send(tFrame); err != nil {
+			message := &agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_TelemetryFrame{TelemetryFrame: tFrame}}
+			a.sendMu.Lock()
+			err := stream.Send(message)
+			a.sendMu.Unlock()
+			if err != nil {
 				slog.LogAttrs(ctx, slog.LevelError, "telemetry_frame_send_error", slog.String("error", err.Error()))
 				break
 			}
