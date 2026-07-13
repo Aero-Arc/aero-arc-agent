@@ -332,7 +332,7 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 
 	frame := &agentv1.TelemetryFrame{}
 	a.stampFrameContext(frame)
-	if frame.SessionId != "session-1" || frame.FlightId != "flight-1" || frame.IntentId != "intent-1" || frame.IntentVersion != 2 {
+	if frame.SessionId != "" || frame.FlightId != "flight-1" || frame.IntentId != "intent-1" || frame.IntentVersion != 2 {
 		t.Fatalf("stamped frame = %+v", frame)
 	}
 	walID, err := w.Append(ctx, frame)
@@ -390,6 +390,42 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 	}
 	if stored.FlightId != "flight-1" || stored.IntentId != "intent-1" || stored.IntentVersion != 2 {
 		t.Fatalf("WAL frame context changed after clear: %+v", stored)
+	}
+}
+
+func TestSessionIsStampedAtSendTimeAcrossOfflineCaptureAndReconnect(t *testing.T) {
+	a := &Agent{}
+
+	// A frame captured offline has no session, because sessions describe relay
+	// connections rather than the capture event.
+	offline := &agentv1.TelemetryFrame{}
+	a.stampFrameContext(offline)
+	if offline.SessionId != "" {
+		t.Fatalf("offline frame session = %q", offline.SessionId)
+	}
+
+	// The first successful registration supplies the session used when replaying.
+	a.gateway = &mockGateway{registerFunc: func(context.Context, *agentv1.RegisterRequest, ...grpc.CallOption) (*agentv1.RegisterResponse, error) {
+		return &agentv1.RegisterResponse{SessionId: "session-1"}, nil
+	}}
+	a.options = &AgentOptions{RelayTarget: "relay"}
+	if err := a.register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	a.stampCurrentSession(offline)
+	if offline.SessionId != "session-1" {
+		t.Fatalf("first replay session = %q", offline.SessionId)
+	}
+
+	// A WAL frame containing a prior connection's session is overwritten after
+	// reconnect rather than rejected as stale by the relay.
+	oldWALFrame := &agentv1.TelemetryFrame{SessionId: "session-old"}
+	a.stateMu.Lock()
+	a.sessionID = "session-2"
+	a.stateMu.Unlock()
+	a.stampCurrentSession(oldWALFrame)
+	if oldWALFrame.SessionId != "session-2" {
+		t.Fatalf("reconnected replay session = %q", oldWALFrame.SessionId)
 	}
 }
 

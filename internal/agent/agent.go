@@ -339,12 +339,17 @@ func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) er
 func (a *Agent) stampFrameContext(frame *agentv1.TelemetryFrame) {
 	a.stateMu.RLock()
 	defer a.stateMu.RUnlock()
-	frame.SessionId = a.sessionID
 	if active := a.operationContext; active != nil {
 		frame.FlightId = active.FlightID
 		frame.IntentId = active.IntentID
 		frame.IntentVersion = active.IntentVersion
 	}
+}
+
+func (a *Agent) stampCurrentSession(frame *agentv1.TelemetryFrame) {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	frame.SessionId = a.sessionID
 }
 
 // dialRelay establishes a gRPC connection to the relay using the configured target.
@@ -617,6 +622,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				continue
 			}
 			tFrame.Seq = uint64(entries[i].ID)
+			a.stampCurrentSession(tFrame)
 
 			message := &agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_TelemetryFrame{TelemetryFrame: tFrame}}
 			a.sendMu.Lock()
