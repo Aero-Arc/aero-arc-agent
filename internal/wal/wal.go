@@ -184,14 +184,15 @@ func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value O
 
 // ClearOperationContext atomically clears the active context once.
 func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID string) (bool, error) {
+	if commandID == "" {
+		return false, errors.New("operation command ID is required")
+	}
+	if flightID == "" {
+		return false, errors.New("flight ID is required")
+	}
+
 	return w.applyOperationCommand(ctx, commandID, func(tx *sql.Tx) error {
-		query := `DELETE FROM operation_context WHERE id = 1`
-		args := []any{}
-		if flightID != "" {
-			query += ` AND flight_id = ?`
-			args = append(args, flightID)
-		}
-		_, err := tx.ExecContext(ctx, query, args...)
+		_, err := tx.ExecContext(ctx, `DELETE FROM operation_context WHERE id = 1 AND flight_id = ?`, flightID)
 		return err
 	})
 }

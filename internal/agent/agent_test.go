@@ -350,6 +350,20 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 		t.Fatalf("duplicate ack = %+v", ack)
 	}
 
+	// A malformed clear is rejected, correlated to its command, and leaves the active context intact.
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty"}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetCommandId() != "clear-empty" || ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED {
+		t.Fatalf("empty-flight clear ack = %+v", ack)
+	}
+	frame = &agentv1.TelemetryFrame{}
+	a.stampFrameContext(frame)
+	if frame.FlightId != "flight-1" {
+		t.Fatalf("empty-flight clear changed flight to %q", frame.FlightId)
+	}
+
 	// A stale clear is recorded but cannot clear a newer/different flight.
 	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-old", FlightId: "flight-old"}); err != nil {
 		t.Fatal(err)

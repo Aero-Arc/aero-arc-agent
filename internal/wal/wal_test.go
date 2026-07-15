@@ -257,6 +257,14 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 		t.Fatalf("context after reopen = %#v, %v, %v; want %#v", got, ok, err, want)
 	}
 
+	applied, err = w.ClearOperationContext(ctx, "clear-empty", "")
+	if err == nil || applied {
+		t.Fatalf("empty-flight clear = %v, %v; want false, error", applied, err)
+	}
+	if got, ok, err = w.LoadOperationContext(ctx); err != nil || !ok || got != want {
+		t.Fatalf("context after empty-flight clear = %#v, %v, %v; want %#v", got, ok, err, want)
+	}
+
 	applied, err = w.ClearOperationContext(ctx, "clear-old", "another-flight")
 	if err != nil || !applied {
 		t.Fatalf("conditional clear = %v, %v", applied, err)
