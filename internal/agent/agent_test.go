@@ -464,6 +464,27 @@ func TestHandleRelayMessageDispatchesTelemetryAck(t *testing.T) {
 	}
 }
 
+func TestHandleRelayMessageRejectsUnsupportedPayload(t *testing.T) {
+	var sent *agentv1.AgentStreamMessage
+	stream := &mockStream{sendFunc: func(message *agentv1.AgentStreamMessage) error {
+		sent = message
+		return nil
+	}}
+
+	a := &Agent{}
+	if err := a.handleRelayMessage(context.Background(), stream, &agentv1.RelayStreamMessage{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ack := sent.GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED {
+		t.Fatalf("unsupported payload status = %v, want %v", ack.GetStatus(), agentv1.OperationContextCommandAck_STATUS_REJECTED)
+	}
+	if ack.GetCommandId() != "" || ack.GetError() == "" {
+		t.Fatalf("unsupported payload ack = %+v", ack)
+	}
+}
+
 func TestNewAgent(t *testing.T) {
 	opts := &AgentOptions{
 		RelayTarget: "localhost:9090",

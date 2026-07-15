@@ -499,7 +499,7 @@ func (a *Agent) handleRelayMessage(ctx context.Context, stream grpc.BidiStreamin
 	case *agentv1.RelayStreamMessage_ClearOperationContext:
 		return a.handleClearOperationContext(ctx, stream, payload.ClearOperationContext)
 	default:
-		return errors.New("relay stream message has no supported payload")
+		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "relay stream message has no supported payload")
 	}
 }
 
