@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestNextBackoff(t *testing.T) {
@@ -53,11 +54,11 @@ func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 		t.Fatalf("register should not be called on dial failure")
 		return nil
 	}
-	a.openStreamFn = func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error) {
+	a.openStreamFn = func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
 		t.Fatalf("openStreamFn should not be called on dial failure")
 		return nil, nil
 	}
-	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
 		t.Fatalf("ackLoopFn should not be called on dial failure")
 		return nil
 	}
@@ -83,18 +84,18 @@ func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 // Mock Stream Implementation
 type mockStream struct {
 	grpc.ClientStream
-	recvFunc func() (*agentv1.TelemetryAck, error)
-	sendFunc func(*agentv1.TelemetryFrame) error
+	recvFunc func() (*agentv1.RelayStreamMessage, error)
+	sendFunc func(*agentv1.AgentStreamMessage) error
 }
 
-func (m *mockStream) Recv() (*agentv1.TelemetryAck, error) {
+func (m *mockStream) Recv() (*agentv1.RelayStreamMessage, error) {
 	if m.recvFunc != nil {
 		return m.recvFunc()
 	}
 	return nil, io.EOF
 }
 
-func (m *mockStream) Send(f *agentv1.TelemetryFrame) error {
+func (m *mockStream) Send(f *agentv1.AgentStreamMessage) error {
 	if m.sendFunc != nil {
 		return m.sendFunc(f)
 	}
@@ -162,10 +163,10 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 		return nil
 	}
 
-	a.openStreamFn = func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck], error) {
+	a.openStreamFn = func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
 		streamOpenCount++
 		return &mockStream{
-			recvFunc: func() (*agentv1.TelemetryAck, error) {
+			recvFunc: func() (*agentv1.RelayStreamMessage, error) {
 				// Block slightly then return error to simulate disconnect
 				select {
 				case <-ctx.Done():
@@ -177,7 +178,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 		}, nil
 	}
 
-	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.TelemetryFrame, agentv1.TelemetryAck]) error {
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
 		// Just call Recv until error
 		for {
 			_, err := stream.Recv()
@@ -281,7 +282,7 @@ func TestRegister(t *testing.T) {
 			if in.AgentId == "" {
 				return nil, errors.New("empty agent id")
 			}
-			return &agentv1.RegisterResponse{}, nil
+			return &agentv1.RegisterResponse{SessionId: "session-1"}, nil
 		},
 	}
 
@@ -293,11 +294,194 @@ func TestRegister(t *testing.T) {
 	if err := a.register(ctx); err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
+	if a.sessionID != "session-1" {
+		t.Fatalf("sessionID = %q, want session-1", a.sessionID)
+	}
 
 	// Test failure case
 	a.gateway = nil
 	if err := a.register(ctx); err != ErrGatewayNotInitialized {
 		t.Errorf("expected ErrGatewayNotInitialized, got %v", err)
+	}
+}
+
+func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
+	ctx := context.Background()
+	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "wal.db"), 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	var sent []*agentv1.AgentStreamMessage
+	stream := &mockStream{sendFunc: func(message *agentv1.AgentStreamMessage) error {
+		sent = append(sent, message)
+		return nil
+	}}
+	a := &Agent{wal: w, sessionID: "session-1"}
+	set := &agentv1.SetOperationContextCommand{
+		CommandId: "set-1",
+		Context:   &agentv1.OperationContext{FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2},
+	}
+	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
+		t.Fatal(err)
+	}
+	if got := sent[len(sent)-1].GetOperationContextCommandAck().GetStatus(); got != agentv1.OperationContextCommandAck_STATUS_APPLIED {
+		t.Fatalf("set status = %v", got)
+	}
+
+	frame := &agentv1.TelemetryFrame{}
+	a.stampFrameContext(frame)
+	if frame.SessionId != "" || frame.FlightId != "flight-1" || frame.IntentId != "intent-1" || frame.IntentVersion != 2 {
+		t.Fatalf("stamped frame = %+v", frame)
+	}
+	walID, err := w.Append(ctx, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The same durable command is acknowledged without replacing its original value.
+	set.Context.FlightId = "incorrect-retry-value"
+	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
+		t.Fatal(err)
+	}
+	ack := sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("duplicate ack = %+v", ack)
+	}
+
+	// A malformed clear is rejected, correlated to its command, and leaves the active context intact.
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty"}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetCommandId() != "clear-empty" || ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED {
+		t.Fatalf("empty-flight clear ack = %+v", ack)
+	}
+	frame = &agentv1.TelemetryFrame{}
+	a.stampFrameContext(frame)
+	if frame.FlightId != "flight-1" {
+		t.Fatalf("empty-flight clear changed flight to %q", frame.FlightId)
+	}
+
+	// A stale clear is recorded but cannot clear a newer/different flight.
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-old", FlightId: "flight-old"}); err != nil {
+		t.Fatal(err)
+	}
+	frame = &agentv1.TelemetryFrame{}
+	a.stampFrameContext(frame)
+	if frame.FlightId != "flight-1" {
+		t.Fatalf("stale clear changed flight to %q", frame.FlightId)
+	}
+
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-1", FlightId: "flight-1"}); err != nil {
+		t.Fatal(err)
+	}
+	frame = &agentv1.TelemetryFrame{}
+	a.stampFrameContext(frame)
+	if frame.FlightId != "" || frame.IntentId != "" {
+		t.Fatalf("frame retained cleared context: %+v", frame)
+	}
+	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
+		t.Fatal(err)
+	}
+	frame = &agentv1.TelemetryFrame{}
+	a.stampFrameContext(frame)
+	if frame.FlightId != "" {
+		t.Fatalf("retry of old set resurrected cleared context: %+v", frame)
+	}
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored agentv1.TelemetryFrame
+	for _, entry := range entries {
+		if entry.ID == walID {
+			if err := proto.Unmarshal(entry.Payload, &stored); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if stored.FlightId != "flight-1" || stored.IntentId != "intent-1" || stored.IntentVersion != 2 {
+		t.Fatalf("WAL frame context changed after clear: %+v", stored)
+	}
+}
+
+func TestSessionIsStampedAtSendTimeAcrossOfflineCaptureAndReconnect(t *testing.T) {
+	a := &Agent{}
+
+	// A frame captured offline has no session, because sessions describe relay
+	// connections rather than the capture event.
+	offline := &agentv1.TelemetryFrame{}
+	a.stampFrameContext(offline)
+	if offline.SessionId != "" {
+		t.Fatalf("offline frame session = %q", offline.SessionId)
+	}
+
+	// The first successful registration supplies the session used when replaying.
+	a.gateway = &mockGateway{registerFunc: func(context.Context, *agentv1.RegisterRequest, ...grpc.CallOption) (*agentv1.RegisterResponse, error) {
+		return &agentv1.RegisterResponse{SessionId: "session-1"}, nil
+	}}
+	a.options = &AgentOptions{RelayTarget: "relay"}
+	if err := a.register(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	a.stampCurrentSession(offline)
+	if offline.SessionId != "session-1" {
+		t.Fatalf("first replay session = %q", offline.SessionId)
+	}
+
+	// A WAL frame containing a prior connection's session is overwritten after
+	// reconnect rather than rejected as stale by the relay.
+	oldWALFrame := &agentv1.TelemetryFrame{SessionId: "session-old"}
+	a.stateMu.Lock()
+	a.sessionID = "session-2"
+	a.stateMu.Unlock()
+	a.stampCurrentSession(oldWALFrame)
+	if oldWALFrame.SessionId != "session-2" {
+		t.Fatalf("reconnected replay session = %q", oldWALFrame.SessionId)
+	}
+}
+
+func TestHandleRelayMessageDispatchesTelemetryAck(t *testing.T) {
+	ctx := context.Background()
+	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "wal.db"), 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{wal: w}
+	message := &agentv1.RelayStreamMessage{Payload: &agentv1.RelayStreamMessage_TelemetryAck{TelemetryAck: &agentv1.TelemetryAck{Seq: uint64(id)}}}
+	if err := a.handleRelayMessage(ctx, &mockStream{}, message); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := w.ReadUndelivered(ctx, 10); err != nil || len(entries) != 0 {
+		t.Fatalf("undelivered after ack = %d, %v", len(entries), err)
+	}
+}
+
+func TestHandleRelayMessageRejectsUnsupportedPayload(t *testing.T) {
+	var sent *agentv1.AgentStreamMessage
+	stream := &mockStream{sendFunc: func(message *agentv1.AgentStreamMessage) error {
+		sent = message
+		return nil
+	}}
+
+	a := &Agent{}
+	if err := a.handleRelayMessage(context.Background(), stream, &agentv1.RelayStreamMessage{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ack := sent.GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED {
+		t.Fatalf("unsupported payload status = %v, want %v", ack.GetStatus(), agentv1.OperationContextCommandAck_STATUS_REJECTED)
+	}
+	if ack.GetCommandId() != "" || ack.GetError() == "" {
+		t.Fatalf("unsupported payload ack = %+v", ack)
 	}
 }
 

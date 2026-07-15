@@ -115,6 +115,17 @@ func initDB(db *sql.DB) error {
 		payload BLOB NOT NULL,
 		delivery_status INTEGER NOT NULL DEFAULT 0
 	);
+	CREATE TABLE IF NOT EXISTS operation_context (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		flight_id TEXT NOT NULL,
+		intent_id TEXT NOT NULL,
+		intent_version INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS operation_context_commands (
+		command_id TEXT PRIMARY KEY,
+		processed_at INTEGER NOT NULL
+	);
 	`
 	_, err := db.Exec(query)
 	if err != nil {
@@ -131,6 +142,89 @@ func initDB(db *sql.DB) error {
 	}
 
 	return nil
+}
+
+// OperationContext is the capture-time flight attribution persisted by the agent.
+type OperationContext struct {
+	FlightID      string
+	IntentID      string
+	IntentVersion uint32
+}
+
+// LoadOperationContext returns the currently active context, if one exists.
+func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool, error) {
+	var value OperationContext
+	var version int64
+	err := w.db.QueryRowContext(ctx, `SELECT flight_id, intent_id, intent_version FROM operation_context WHERE id = 1`).
+		Scan(&value.FlightID, &value.IntentID, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OperationContext{}, false, nil
+	}
+	if err != nil {
+		return OperationContext{}, false, fmt.Errorf("load operation context: %w", err)
+	}
+	if version < 0 || version > int64(^uint32(0)) {
+		return OperationContext{}, false, fmt.Errorf("load operation context: invalid intent version %d", version)
+	}
+	value.IntentVersion = uint32(version)
+	return value, true, nil
+}
+
+// SetOperationContext atomically applies a command once. Repeated command IDs
+// are successful no-ops so command acknowledgements can safely be retried.
+func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value OperationContext) (bool, error) {
+	return w.applyOperationCommand(ctx, commandID, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at)
+			VALUES(1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET flight_id=excluded.flight_id,
+			intent_id=excluded.intent_id, intent_version=excluded.intent_version, updated_at=excluded.updated_at`,
+			value.FlightID, value.IntentID, value.IntentVersion, time.Now().UnixNano())
+		return err
+	})
+}
+
+// ClearOperationContext atomically clears the active context once.
+func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID string) (bool, error) {
+	if commandID == "" {
+		return false, errors.New("operation command ID is required")
+	}
+	if flightID == "" {
+		return false, errors.New("flight ID is required")
+	}
+
+	return w.applyOperationCommand(ctx, commandID, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM operation_context WHERE id = 1 AND flight_id = ?`, flightID)
+		return err
+	})
+}
+
+func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply func(*sql.Tx) error) (bool, error) {
+	if commandID == "" {
+		return false, errors.New("operation command ID is required")
+	}
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin operation command: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO operation_context_commands(command_id, processed_at) VALUES(?, ?)`, commandID, time.Now().UnixNano())
+	if err != nil {
+		return false, fmt.Errorf("record operation command: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect operation command: %w", err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if err := apply(tx); err != nil {
+		return false, fmt.Errorf("apply operation command: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit operation command: %w", err)
+	}
+	return true, nil
 }
 
 // AppendAsync queues a frame for writing.
