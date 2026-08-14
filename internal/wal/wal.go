@@ -628,12 +628,12 @@ func (w *WAL) MarkDelivered(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusDelivered)
 }
 
-// MarkPending moves one WAL entry to the pending-delivery state when its state
-// actually differs, preserving idempotent retry accounting.
+// MarkPending marks one already-sent WAL entry as awaiting Relay acknowledgment
+// when its state actually differs, preserving idempotent retry accounting.
 //
 // Parameters:
 //   - ctx: controls cancellation and deadlines for the operation.
-//   - seq: identifies the WAL entry to reserve for delivery.
+//   - seq: identifies the sent WAL entry awaiting acknowledgment.
 //
 // Returns:
 //   - rowsAffected: is one when the state changed and zero for an idempotent call.
@@ -642,13 +642,13 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
-// MarkPendingBatch moves the selected WAL entries to pending in one transaction.
-// Individual update failures are logged so the remaining entries can still be
-// reserved; the returned count is currently always zero.
+// MarkPendingBatch marks already-sent WAL entries as awaiting Relay
+// acknowledgment in one transaction. Individual update failures are logged so
+// remaining entries can still be marked; the returned count is currently zero.
 //
 // Parameters:
 //   - ctx: controls cancellation and deadlines for the operation.
-//   - seqs: identifies the WAL entries to reserve for delivery.
+//   - seqs: identifies the sent WAL entries awaiting acknowledgment.
 //
 // Returns:
 //   - rowsAffected: is currently zero; callers must not use it as a batch count.
