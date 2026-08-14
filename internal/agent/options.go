@@ -35,6 +35,16 @@ type AgentOptions struct {
 	Debug               bool
 }
 
+// GetAgentOptions builds Agent runtime options from CLI flags and the API-key
+// environment variable. Consul discovery flags are rejected because direct
+// Relay addressing is the supported connection model.
+//
+// Parameters:
+//   - c: contains the parsed Agent command and its resolved flags.
+//
+// Returns:
+//   - options: contains serial, Relay, retry, WAL, TLS, and debug settings.
+//   - error: reports use of unsupported Consul discovery options.
 func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 	if c.IsSet("consul-address") || c.IsSet("consul-port") || c.IsSet("consul-token") || c.IsSet("consul-agent-id") {
 		return nil, ErrConsulUnsupported

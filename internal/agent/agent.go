@@ -56,6 +56,16 @@ type Agent struct {
 	sendCount   atomic.Uint64
 }
 
+// NewAgent constructs an Agent and its MAVLink endpoint from runtime options.
+// It also installs the default Relay connection and stream lifecycle hooks;
+// durable WAL resources are opened later by Start.
+//
+// Parameters:
+//   - options: provides the configuration values used to initialize or execute the operation.
+//
+// Returns:
+//   - agent: is ready to start but does not yet own network or WAL resources.
+//   - error: is reserved for constructor validation or endpoint setup failures.
 func NewAgent(options *AgentOptions) (*Agent, error) {
 	if options.BackoffInitial <= 0 {
 		options.BackoffInitial = time.Second

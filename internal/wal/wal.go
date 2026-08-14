@@ -628,10 +628,31 @@ func (w *WAL) MarkDelivered(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusDelivered)
 }
 
+// MarkPending moves one WAL entry to the pending-delivery state when its state
+// actually differs, preserving idempotent retry accounting.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - seq: identifies the WAL entry to reserve for delivery.
+//
+// Returns:
+//   - rowsAffected: is one when the state changed and zero for an idempotent call.
+//   - error: reports a SQLite update or context failure.
 func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
+// MarkPendingBatch moves the selected WAL entries to pending in one transaction.
+// Individual update failures are logged so the remaining entries can still be
+// reserved; the returned count is currently always zero.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - seqs: identifies the WAL entries to reserve for delivery.
+//
+// Returns:
+//   - rowsAffected: is currently zero; callers must not use it as a batch count.
+//   - error: reports transaction setup or commit failure.
 func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
 	return w.updateDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending)
 }
@@ -675,6 +696,15 @@ func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, stat
 	return 0, nil
 }
 
+// MarkWritten moves one WAL entry to the written state when its state differs.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - seq: identifies the WAL entry whose persistence state is changing.
+//
+// Returns:
+//   - rowsAffected: is one when the state changed and zero for an idempotent call.
+//   - error: reports a SQLite update or context failure.
 func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
 }
