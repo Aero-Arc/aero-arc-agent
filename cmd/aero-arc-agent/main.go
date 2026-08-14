@@ -81,6 +81,14 @@ var agentCmd = cli.Command{
 	},
 }
 
+// RunAgent runs the Agent process with the supplied arguments and returns its terminal startup or runtime error.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - cmd: contains the resolved Agent command-line flags.
+//
+// Returns:
+//   - error: reports invalid options, startup failures, or a terminal Agent error.
 func RunAgent(ctx context.Context, cmd *cli.Command) error {
 	options, err := agent.GetAgentOptions(cmd)
 	if err != nil {

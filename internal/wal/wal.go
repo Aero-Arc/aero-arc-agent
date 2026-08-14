@@ -628,10 +628,32 @@ func (w *WAL) MarkDelivered(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusDelivered)
 }
 
+// MarkPending marks one already-sent WAL entry as awaiting Relay acknowledgment
+// when its state actually differs, preserving idempotent retry accounting.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - seq: identifies the sent WAL entry awaiting acknowledgment.
+//
+// Returns:
+//   - rowsAffected: is one when the state changed and zero for an idempotent call.
+//   - error: reports a SQLite update or context failure.
 func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
+// MarkPendingBatch marks already-sent WAL entries as awaiting Relay
+// acknowledgment in one transaction. Individual update failures are logged so
+// remaining entries can still be marked; the returned count is currently zero.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal. Without a
+//     deadline, the detached transaction receives an independent two-second timeout.
+//   - seqs: identifies the sent WAL entries awaiting acknowledgment.
+//
+// Returns:
+//   - rowsAffected: is currently zero; callers must not use it as a batch count.
+//   - error: reports transaction setup or commit failure.
 func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
 	return w.updateDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending)
 }
@@ -675,6 +697,15 @@ func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, stat
 	return 0, nil
 }
 
+// MarkWritten moves one WAL entry to the written state when its state differs.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the operation.
+//   - seq: identifies the WAL entry whose persistence state is changing.
+//
+// Returns:
+//   - rowsAffected: is one when the state changed and zero for an idempotent call.
+//   - error: reports a SQLite update or context failure.
 func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
 }
