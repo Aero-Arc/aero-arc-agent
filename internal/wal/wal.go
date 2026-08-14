@@ -647,7 +647,8 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 // remaining entries can still be marked; the returned count is currently zero.
 //
 // Parameters:
-//   - ctx: controls cancellation and deadlines for the operation.
+//   - ctx: contributes its deadline but not its cancellation signal. Without a
+//     deadline, the detached transaction receives an independent two-second timeout.
 //   - seqs: identifies the sent WAL entries awaiting acknowledgment.
 //
 // Returns:
