@@ -78,6 +78,12 @@ var agentCmd = cli.Command{
 			Value: time.Second * 10,
 			Usage: "WAL flush interval if batch queue doesn't fill up",
 		},
+		&cli.DurationFlag{
+			Name:    "aircraft-command-timeout",
+			Value:   4 * time.Second,
+			Usage:   "Maximum time to wait for an autopilot command acknowledgement",
+			Sources: cli.EnvVars("AERO_ARC_AIRCRAFT_COMMAND_TIMEOUT"),
+		},
 	},
 }
 

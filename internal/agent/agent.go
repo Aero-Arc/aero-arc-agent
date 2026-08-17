@@ -52,6 +52,13 @@ type Agent struct {
 	operationContext *wal.OperationContext
 	sendMu           sync.Mutex
 
+	mavlinkMu             sync.Mutex
+	mavlinkTarget         *mavlinkTarget
+	pendingMAVLinkCommand *pendingMAVLinkCommand
+	aircraftCommandMu     sync.Mutex
+	aircraftCommandActive bool
+	writeMAVLinkCommand   func(*gomavlib.Channel, *common.MessageCommandLong) error
+
 	ingestCount atomic.Uint64
 	sendCount   atomic.Uint64
 }
@@ -83,11 +90,17 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 					Baud:   options.SerialBaud,
 				},
 			},
-			Dialect: common.Dialect,
+			OutVersion:     gomavlib.V2,
+			OutSystemID:    255,
+			OutComponentID: uint8(common.MAV_COMP_ID_MISSIONPLANNER),
+			Dialect:        common.Dialect,
 		},
 		options:        options,
 		backoffInitial: options.BackoffInitial,
 		backoffMax:     options.BackoffMax,
+	}
+	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, command *common.MessageCommandLong) error {
+		return a.node.WriteMessageTo(channel, command)
 	}
 
 	if options.Debug {
@@ -98,9 +111,10 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 					Address: "0.0.0.0:14550",
 				},
 			},
-			OutVersion:  gomavlib.V2,
-			OutSystemID: 1,
-			Dialect:     common.Dialect,
+			OutVersion:     gomavlib.V2,
+			OutSystemID:    255,
+			OutComponentID: uint8(common.MAV_COMP_ID_MISSIONPLANNER),
+			Dialect:        common.Dialect,
 		}
 	}
 
@@ -275,6 +289,7 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 			}
 
 			if frameEvt, ok := evt.(*gomavlib.EventFrame); ok {
+				a.observeMAVLinkFrame(frameEvt)
 				slog.LogAttrs(
 					ctx, slog.LevelDebug,
 					"mavlink_frame_received",
@@ -302,7 +317,8 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 				continue
 			}
 
-			if _, ok := evt.(*gomavlib.EventChannelClose); ok {
+			if closeEvent, ok := evt.(*gomavlib.EventChannelClose); ok {
+				a.clearMAVLinkTarget(closeEvent.Channel)
 				slog.LogAttrs(
 					ctx, slog.LevelInfo,
 					"mavlink_channel_close",
@@ -464,6 +480,10 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 
 	agentID := identity.Resolve().FinalID
 	streamCtx := metadata.AppendToOutgoingContext(ctx, "aero-arc-agent-id", agentID)
+	a.stateMu.RLock()
+	sessionID := a.sessionID
+	a.stateMu.RUnlock()
+	streamCtx = metadata.AppendToOutgoingContext(streamCtx, "aero-arc-session-id", sessionID)
 
 	stream, err := a.gateway.TelemetryStream(streamCtx)
 	if err != nil {
@@ -509,6 +529,8 @@ func (a *Agent) handleRelayMessage(ctx context.Context, stream grpc.BidiStreamin
 		return a.handleSetOperationContext(ctx, stream, payload.SetOperationContext)
 	case *agentv1.RelayStreamMessage_ClearOperationContext:
 		return a.handleClearOperationContext(ctx, stream, payload.ClearOperationContext)
+	case *agentv1.RelayStreamMessage_AircraftCommand:
+		return a.handleAircraftCommand(ctx, stream, payload.AircraftCommand)
 	default:
 		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "relay stream message has no supported payload")
 	}
