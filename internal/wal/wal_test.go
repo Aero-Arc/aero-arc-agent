@@ -9,8 +9,57 @@ import (
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestWALGenerationIdentityPersistsAndStampsFrames(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "generation.db")
+	w, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID := w.GenerationID()
+	if _, err := uuid.Parse(firstID); err != nil {
+		t.Fatalf("generation ID %q is not a UUID: %v", firstID, err)
+	}
+	if _, err := w.Append(ctx, &agentv1.TelemetryFrame{WalId: "caller-supplied"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := w.ReadUndelivered(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored agentv1.TelemetryFrame
+	if err := proto.Unmarshal(entries[0].Payload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetWalId() != firstID {
+		t.Fatalf("stored WAL ID = %q, want %q", stored.GetWalId(), firstID)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.GenerationID() != firstID {
+		t.Fatalf("reopened generation ID = %q, want %q", reopened.GenerationID(), firstID)
+	}
+
+	other, err := New(ctx, filepath.Join(t.TempDir(), "new-generation.db"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if other.GenerationID() == firstID {
+		t.Fatalf("new WAL reused generation ID %q", firstID)
+	}
+}
 
 func TestWAL_Lifecycle(t *testing.T) {
 	tmpDir := t.TempDir()

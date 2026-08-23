@@ -5,7 +5,8 @@ go 1.24.0
 toolchain go1.24.9
 
 require (
-	github.com/aero-arc/aero-arc-protos v0.0.0-20260713020927-fc6acd6bed87
+	github.com/aero-arc/aero-arc-protos v0.0.0-20260823010059-9c3641b684b5
+	github.com/google/uuid v1.6.0
 	google.golang.org/grpc v1.77.0
 	modernc.org/sqlite v1.40.1
 )
@@ -13,7 +14,6 @@ require (
 require (
 	github.com/creack/goselect v0.1.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/pion/logging v0.2.2 // indirect

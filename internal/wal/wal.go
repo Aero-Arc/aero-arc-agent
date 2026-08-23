@@ -17,6 +17,7 @@ import (
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 )
@@ -31,6 +32,7 @@ type Entry struct {
 // WAL implements a Write-Ahead Log using SQLite.
 type WAL struct {
 	db           *sql.DB
+	generationID string
 	doneChan     chan struct{}
 	batchChan    chan *agentv1.TelemetryFrame
 	signalChan   chan struct{}
@@ -41,7 +43,24 @@ type WAL struct {
 	spoolMu      sync.Mutex
 }
 
-// New creates or opens a WAL at the specified path.
+// New creates or opens a WAL and restores its durable generation identity.
+// Frames appended through the returned WAL are stamped with that identity
+// before persistence, so retries retain the same `(generation, sequence)`
+// cursor across process restarts.
+//
+// Parameters:
+//   - ctx: bounds schema initialization and generation identity restoration.
+//   - path: identifies the SQLite database and its adjacent spill directory.
+//   - batchSize: controls asynchronous transaction size; non-positive values
+//     select the default.
+//   - batchTimeout: controls asynchronous flush latency; non-positive values
+//     select the default.
+//
+// Returns:
+//   - wal: owns the database, spill directory, and background writer.
+//   - error: reports database configuration, schema, generation identity, or
+//     spill-directory initialization failures.
+//
 // TODO: Add time.Duration for the WAL cleanup interval.
 func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
@@ -58,6 +77,11 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		db.Close()
 		return nil, err
 	}
+	generationID, err := loadOrCreateGenerationID(ctx, db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	// Default values if not provided
 	if batchSize <= 0 {
@@ -69,6 +93,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 
 	wal := &WAL{
 		db:           db,
+		generationID: generationID,
 		doneChan:     make(chan struct{}),
 		batchChan:    make(chan *agentv1.TelemetryFrame, batchSize*2), // Buffer a bit more than one batch
 		signalChan:   make(chan struct{}, 1),                          // Buffer 1 to prevent blocking
@@ -126,6 +151,10 @@ func initDB(db *sql.DB) error {
 		command_id TEXT PRIMARY KEY,
 		processed_at INTEGER NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS wal_metadata (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		generation_id TEXT NOT NULL
+	);
 	`
 	_, err := db.Exec(query)
 	if err != nil {
@@ -142,6 +171,28 @@ func initDB(db *sql.DB) error {
 	}
 
 	return nil
+}
+
+func loadOrCreateGenerationID(ctx context.Context, db *sql.DB) (string, error) {
+	candidate := uuid.NewString()
+	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO wal_metadata(id, generation_id) VALUES(1, ?)`, candidate); err != nil {
+		return "", fmt.Errorf("initialize WAL generation identity: %w", err)
+	}
+	var generationID string
+	if err := db.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&generationID); err != nil {
+		return "", fmt.Errorf("load WAL generation identity: %w", err)
+	}
+	if _, err := uuid.Parse(generationID); err != nil {
+		return "", fmt.Errorf("load WAL generation identity: invalid UUID %q: %w", generationID, err)
+	}
+	return generationID, nil
+}
+
+// GenerationID returns the durable identity shared by every sequence in this
+// WAL database. It remains stable across process restarts and changes when a
+// new WAL database is created.
+func (w *WAL) GenerationID() string {
+	return w.generationID
 }
 
 // OperationContext is the capture-time flight attribution persisted by the agent.
@@ -487,6 +538,7 @@ func readSpoolFile(path string) ([]*agentv1.TelemetryFrame, error) {
 // This is the synchronous version.
 func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64, error) {
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
+	w.stampGeneration(tFrame)
 	encoded, err := proto.Marshal(tFrame)
 	if err != nil {
 		return 0, fmt.Errorf("failed to marshal telemetry frame: %w", err)
@@ -528,6 +580,7 @@ func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame)
 
 	// loop and insert
 	for _, frame := range frames {
+		w.stampGeneration(frame)
 		encoded, err := proto.Marshal(frame)
 		if err != nil {
 			// Skip malformed frames instead of failing the whole batch
@@ -550,6 +603,12 @@ func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame)
 	}
 
 	return lastID, nil
+}
+
+func (w *WAL) stampGeneration(frame *agentv1.TelemetryFrame) {
+	if frame != nil {
+		frame.WalId = w.generationID
+	}
 }
 
 // ReadUndelivered reads up to limit undelivered entries from the log.

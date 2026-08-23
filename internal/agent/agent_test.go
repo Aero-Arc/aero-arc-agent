@@ -403,7 +403,7 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 		}
 	}
 	if stored.FlightId != "flight-1" || stored.IntentId != "intent-1" || stored.IntentVersion != 2 {
-		t.Fatalf("WAL frame context changed after clear: %+v", stored)
+		t.Fatalf("WAL frame context changed after clear: %+v", &stored)
 	}
 }
 
@@ -440,6 +440,27 @@ func TestSessionIsStampedAtSendTimeAcrossOfflineCaptureAndReconnect(t *testing.T
 	a.stampCurrentSession(oldWALFrame)
 	if oldWALFrame.SessionId != "session-2" {
 		t.Fatalf("reconnected replay session = %q", oldWALFrame.SessionId)
+	}
+}
+
+func TestWALGenerationIsStableForLegacyReplay(t *testing.T) {
+	ctx := context.Background()
+	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "wal.db"), 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	a := &Agent{wal: w}
+
+	legacy := &agentv1.TelemetryFrame{}
+	a.stampWALGeneration(legacy)
+	if legacy.GetWalId() != w.GenerationID() {
+		t.Fatalf("legacy WAL ID = %q, want %q", legacy.GetWalId(), w.GenerationID())
+	}
+	original := &agentv1.TelemetryFrame{WalId: "original-generation"}
+	a.stampWALGeneration(original)
+	if original.GetWalId() != "original-generation" {
+		t.Fatalf("persisted WAL ID changed to %q", original.GetWalId())
 	}
 }
 

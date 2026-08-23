@@ -636,6 +636,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				continue
 			}
 			tFrame.Seq = uint64(entries[i].ID)
+			a.stampWALGeneration(tFrame)
 			a.stampCurrentSession(tFrame)
 
 			message := &agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_TelemetryFrame{TelemetryFrame: tFrame}}
@@ -657,6 +658,12 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		}
 
 		slog.LogAttrs(ctx, slog.LevelInfo, "mark_batch_succeed", slog.Int("batch_size", entriesLen))
+	}
+}
+
+func (a *Agent) stampWALGeneration(frame *agentv1.TelemetryFrame) {
+	if frame.WalId == "" {
+		frame.WalId = a.wal.GenerationID()
 	}
 }
 
@@ -714,6 +721,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 				slog.Int64("backoff_ms", backoff.Milliseconds()),
 			)
 
+			cancelConn()
 			_ = conn.Close()
 			a.conn = nil
 			a.gateway = nil
@@ -736,6 +744,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 				slog.Int64("backoff_ms", backoff.Milliseconds()),
 			)
 
+			cancelConn()
 			_ = conn.Close()
 			a.conn = nil
 			a.gateway = nil
