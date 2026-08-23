@@ -368,27 +368,12 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// TODO: Use a proper TLS config with a valid certificate.
-	var creds credentials.TransportCredentials
-	var err error
-
-	if a.options.Debug {
-
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
+	creds, err := relayTransportCredentials(a.options)
+	if err != nil {
+		if errors.Is(err, ErrGettingHomeDir) {
 			slog.LogAttrs(ctx, slog.LevelError, ErrGettingHomeDir.Error(), slog.String("error", err.Error()))
-			return nil, ErrGettingHomeDir
 		}
-
-		certPath := fmt.Sprintf("%s/%s", homeDir, DebugTLSCertPath)
-		creds, err = credentials.NewClientTLSFromFile(certPath, "localhost")
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		creds = credentials.NewTLS(&tls.Config{
-			InsecureSkipVerify: a.options.SkipTLSVerification,
-		})
+		return nil, err
 	}
 
 	slog.LogAttrs(
@@ -410,6 +395,25 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 	}
 
 	return conn, nil
+}
+
+func relayTransportCredentials(options *AgentOptions) (credentials.TransportCredentials, error) {
+	if options.SkipTLSVerification {
+		return credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}), nil //nolint:gosec // Explicit development-only CLI option.
+	}
+	if options.Debug {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrGettingHomeDir, err)
+		}
+		certPath := fmt.Sprintf("%s/%s", homeDir, DebugTLSCertPath)
+		creds, err := credentials.NewClientTLSFromFile(certPath, "localhost")
+		if err != nil {
+			return nil, err
+		}
+		return creds, nil
+	}
+	return credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}), nil
 }
 
 // register performs the Register RPC with the relay.

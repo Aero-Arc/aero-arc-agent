@@ -443,6 +443,16 @@ func TestSessionIsStampedAtSendTimeAcrossOfflineCaptureAndReconnect(t *testing.T
 	}
 }
 
+func TestDebugTransportCanExplicitlySkipCertificateVerification(t *testing.T) {
+	creds, err := relayTransportCredentials(&AgentOptions{Debug: true, SkipTLSVerification: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := creds.Info().SecurityProtocol; got != "tls" {
+		t.Fatalf("security protocol = %q, want TLS", got)
+	}
+}
+
 func TestWALGenerationIsStableForLegacyReplay(t *testing.T) {
 	ctx := context.Background()
 	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "wal.db"), 10, time.Millisecond)
