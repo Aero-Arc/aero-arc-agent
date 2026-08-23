@@ -133,6 +133,8 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 	dialCount := 0
 	registerCount := 0
 	streamOpenCount := 0
+	sleepCount := 0
+	sleepCountAtReconnect := 0
 
 	// We want to simulate:
 	// 1. Successful connection
@@ -147,6 +149,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 	a.dialFn = func(ctx context.Context) (*grpc.ClientConn, error) {
 		dialCount++
 		if dialCount > 1 {
+			sleepCountAtReconnect = sleepCount
 			// Signal that we attempted a reconnect
 			select {
 			case reconnected <- struct{}{}:
@@ -190,6 +193,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 
 	a.sleepWithBack = func(c context.Context, d time.Duration) bool {
 		// Don't actually sleep in test, just check context
+		sleepCount++
 		return c.Err() == nil
 	}
 
@@ -220,6 +224,9 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 
 	if dialCount < 2 {
 		t.Errorf("expected at least 2 dial attempts (initial + reconnect), got %d", dialCount)
+	}
+	if sleepCountAtReconnect == 0 {
+		t.Error("stream failure reconnected without backoff")
 	}
 }
 
@@ -266,6 +273,14 @@ func TestHandleTelemetryAck(t *testing.T) {
 type mockGateway struct {
 	agentv1.AgentGatewayClient
 	registerFunc func(ctx context.Context, in *agentv1.RegisterRequest, opts ...grpc.CallOption) (*agentv1.RegisterResponse, error)
+	streamFunc   func(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
+}
+
+func (m *mockGateway) TelemetryStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
+	if m.streamFunc != nil {
+		return m.streamFunc(ctx, opts...)
+	}
+	return nil, errors.New("unexpected telemetry stream")
 }
 
 func (m *mockGateway) Register(ctx context.Context, in *agentv1.RegisterRequest, opts ...grpc.CallOption) (*agentv1.RegisterResponse, error) {
@@ -450,6 +465,31 @@ func TestDebugTransportCanExplicitlySkipCertificateVerification(t *testing.T) {
 	}
 	if got := creds.Info().SecurityProtocol; got != "tls" {
 		t.Fatalf("security protocol = %q, want TLS", got)
+	}
+}
+
+func TestOpenTelemetryStreamRequiresRegisteredSession(t *testing.T) {
+	a := &Agent{gateway: &mockGateway{}, sessionID: "", options: &AgentOptions{RelayTarget: "relay"}}
+	if _, err := a.openTelemetryStream(context.Background()); err == nil {
+		t.Fatal("openTelemetryStream() accepted an empty Relay session ID")
+	}
+}
+
+func TestOpenTelemetryStreamBindsRegisteredSessionMetadata(t *testing.T) {
+	var outgoing metadata.MD
+	gateway := &mockGateway{streamFunc: func(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
+		outgoing, _ = metadata.FromOutgoingContext(ctx)
+		return &mockStream{}, nil
+	}}
+	a := &Agent{gateway: gateway, sessionID: "session-1", options: &AgentOptions{RelayTarget: "relay"}}
+	if _, err := a.openTelemetryStream(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := outgoing.Get("aero-arc-session-id"); len(got) != 1 || got[0] != "session-1" {
+		t.Fatalf("session metadata = %#v", got)
+	}
+	if got := outgoing.Get("aero-arc-agent-id"); len(got) != 1 || got[0] == "" {
+		t.Fatalf("agent metadata = %#v", got)
 	}
 }
 

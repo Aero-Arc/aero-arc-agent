@@ -467,7 +467,16 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 	)
 
 	agentID := identity.Resolve().FinalID
-	streamCtx := metadata.AppendToOutgoingContext(ctx, "aero-arc-agent-id", agentID)
+	a.stateMu.RLock()
+	sessionID := a.sessionID
+	a.stateMu.RUnlock()
+	if sessionID == "" {
+		return nil, errors.New("relay session ID is unavailable")
+	}
+	streamCtx := metadata.AppendToOutgoingContext(ctx,
+		"aero-arc-agent-id", agentID,
+		"aero-arc-session-id", sessionID,
+	)
 
 	stream, err := a.gateway.TelemetryStream(streamCtx)
 	if err != nil {
@@ -775,7 +784,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			err = ctx.Err()
-		case err := <-errChan:
+		case err = <-errChan:
 			slog.LogAttrs(ctx, slog.LevelInfo, "stream_ended", slog.String("error", fmt.Sprint(err)))
 		}
 
