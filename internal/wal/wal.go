@@ -272,7 +272,10 @@ type legacyMigrationState struct {
 }
 
 // loadOrCreateLegacyMigration durably selects the one generation used for all
-// pre-wal_id rows before any payload batches are rewritten.
+// unstamped rows before any payload batches are rewritten. A completed cursor
+// remains a high-water mark: if an older Agent binary later appends rows
+// without wal_id, the next upgrade reopens migration only for that new tail
+// and assigns it the generation that remained persisted during the rollback.
 func loadOrCreateLegacyMigration(ctx context.Context, db *sql.DB) (legacyMigrationState, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -296,6 +299,30 @@ func loadOrCreateLegacyMigration(ctx context.Context, db *sql.DB) (legacyMigrati
 		}
 		if !state.completed && currentGenerationID != state.generationID {
 			return legacyMigrationState{}, fmt.Errorf("incomplete WAL identity migration generation %q does not match current generation %q", state.generationID, currentGenerationID)
+		}
+		if state.completed {
+			var maxSeq int64
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM telemetry_frames`).Scan(&maxSeq); err != nil {
+				return legacyMigrationState{}, fmt.Errorf("inspect WAL identity migration high-water mark: %w", err)
+			}
+			if maxSeq > state.lastSeq {
+				result, err := tx.ExecContext(ctx, `UPDATE wal_identity_migration
+					SET legacy_generation_id = ?, completed = 0
+					WHERE id = 1`, currentGenerationID)
+				if err != nil {
+					return legacyMigrationState{}, fmt.Errorf("reopen WAL identity migration after legacy append: %w", err)
+				}
+				if rows, err := result.RowsAffected(); err != nil {
+					return legacyMigrationState{}, fmt.Errorf("inspect reopened WAL identity migration: %w", err)
+				} else if rows != 1 {
+					return legacyMigrationState{}, fmt.Errorf("reopen WAL identity migration: updated %d rows, want 1", rows)
+				}
+				if err := tx.Commit(); err != nil {
+					return legacyMigrationState{}, fmt.Errorf("commit reopened WAL identity migration: %w", err)
+				}
+				state.generationID = currentGenerationID
+				state.completed = false
+			}
 		}
 		return state, nil
 	}

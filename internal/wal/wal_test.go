@@ -681,7 +681,7 @@ func TestWALCleanupQuarantinedRetainsNewestAcrossBoundedBatches(t *testing.T) {
 	}
 }
 
-func TestWALGenerationMigrationCompletionSkipsPayloadRescan(t *testing.T) {
+func TestWALGenerationMigrationReopensForRowsBeyondCompletedCursor(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "completed-migration.db")
 	w, err := New(ctx, dbPath, 0, 0)
@@ -701,7 +701,7 @@ func TestWALGenerationMigrationCompletionSkipsPayloadRescan(t *testing.T) {
 
 	reopened, err := New(ctx, dbPath, 0, 0)
 	if err != nil {
-		t.Fatalf("completed migration rescanned payloads: %v", err)
+		t.Fatalf("reopen migration for new corrupt tail: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := reopened.Close(); err != nil {
@@ -710,6 +710,108 @@ func TestWALGenerationMigrationCompletionSkipsPayloadRescan(t *testing.T) {
 	})
 	if reopened.GenerationID() == previousGeneration {
 		t.Fatalf("reopened WAL reused generation ID %q", previousGeneration)
+	}
+	var status, quarantineCount int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT delivery_status FROM telemetry_frames WHERE seq = 1`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frame_quarantine WHERE seq = 1`).Scan(&quarantineCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != int(DeliveryStatusQuarantined) || quarantineCount != 1 {
+		t.Fatalf("new corrupt tail status=%d quarantine rows=%d, want %d,1",
+			status, quarantineCount, DeliveryStatusQuarantined)
+	}
+}
+
+func TestWALGenerationMigrationStampsRollbackTailWithPersistedGeneration(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "rollback-tail.db")
+	w, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollbackGeneration := w.GenerationID()
+	if _, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("native-before-rollback")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configureDB(db); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	legacyPayload, err := proto.Marshal(&agentv1.TelemetryFrame{RawMavlink: []byte("written-by-rollback")})
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO telemetry_frames(created_at, payload, delivery_status)
+		VALUES(?, ?, ?)`, time.Now().UnixNano(), legacyPayload, DeliveryStatusWritten); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.GenerationID() == rollbackGeneration {
+		t.Fatalf("post-rollback WAL reused generation ID %q", rollbackGeneration)
+	}
+	var storedPayload []byte
+	if err := reopened.db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = 2`).Scan(&storedPayload); err != nil {
+		t.Fatal(err)
+	}
+	var stored agentv1.TelemetryFrame
+	if err := proto.Unmarshal(storedPayload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetWalId() != rollbackGeneration {
+		t.Fatalf("rollback tail WAL ID = %q, want persisted generation %q", stored.GetWalId(), rollbackGeneration)
+	}
+	var migrationGeneration string
+	var lastSeq int64
+	var completed int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT legacy_generation_id, last_seq, completed
+		FROM wal_identity_migration WHERE id = 1`).Scan(&migrationGeneration, &lastSeq, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if migrationGeneration != rollbackGeneration || lastSeq != 2 || completed != 1 {
+		t.Fatalf("rollback migration state = (%q,%d,%d), want (%q,2,1)",
+			migrationGeneration, lastSeq, completed, rollbackGeneration)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := again.Close(); err != nil {
+			t.Errorf("close second reopened WAL: %v", err)
+		}
+	})
+	if err := again.db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = 2`).Scan(&storedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(storedPayload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetWalId() != rollbackGeneration {
+		t.Fatalf("rollback tail WAL ID after ACK-boundary restart = %q, want %q",
+			stored.GetWalId(), rollbackGeneration)
 	}
 }
 
