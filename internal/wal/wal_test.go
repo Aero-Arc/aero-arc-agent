@@ -176,8 +176,9 @@ func TestInitDBAddsOperationCommandFingerprintsToExistingSchema(t *testing.T) {
 		t.Fatalf("legacy fingerprint = (%q, %q), want empty", kind, fingerprint)
 	}
 
-	// A retry whose already-persisted result matches a legacy command may adopt
-	// the new fingerprint once. A different payload remains a conflict.
+	// Payload history cannot be reconstructed for an old command row. Retries
+	// remain no-ops even after later context changes, and the row stays explicitly
+	// unknown rather than adopting whichever payload happens to arrive first.
 	w := &WAL{db: db}
 	want := OperationContext{FlightID: "flight-legacy", IntentID: "intent-legacy", IntentVersion: 4}
 	if _, err := db.Exec(`INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at) VALUES(1, ?, ?, ?, 1)`, want.FlightID, want.IntentID, want.IntentVersion); err != nil {
@@ -190,11 +191,26 @@ func TestInitDBAddsOperationCommandFingerprintsToExistingSchema(t *testing.T) {
 	if err := db.QueryRow(`SELECT command_kind, payload_fingerprint FROM operation_context_commands WHERE command_id = 'legacy'`).Scan(&kind, &fingerprint); err != nil {
 		t.Fatal(err)
 	}
-	if kind != "set" || fingerprint == "" {
-		t.Fatalf("adopted legacy fingerprint = (%q, %q)", kind, fingerprint)
+	if kind != "" || fingerprint != "" {
+		t.Fatalf("legacy fingerprint = (%q, %q), want payload-unknown", kind, fingerprint)
 	}
-	if applied, err = w.SetOperationContext(context.Background(), "legacy", OperationContext{FlightID: "different"}); !errors.Is(err, ErrOperationCommandConflict) || applied {
-		t.Fatalf("conflicting adopted legacy retry = %v, %v", applied, err)
+	if applied, err = w.SetOperationContext(context.Background(), "legacy", OperationContext{FlightID: "different"}); err != nil || applied {
+		t.Fatalf("payload-unknown legacy retry = %v, %v", applied, err)
+	}
+	current, ok, err := w.LoadOperationContext(context.Background())
+	if err != nil || !ok || current != want {
+		t.Fatalf("legacy retry changed current context = %+v, %v, %v", current, ok, err)
+	}
+	newer := OperationContext{FlightID: "flight-new", IntentID: "intent-new", IntentVersion: 5}
+	if applied, err = w.SetOperationContext(context.Background(), "newer", newer); err != nil || !applied {
+		t.Fatalf("later context update = %v, %v", applied, err)
+	}
+	if applied, err = w.SetOperationContext(context.Background(), "legacy", want); err != nil || applied {
+		t.Fatalf("older exact retry after context change = %v, %v", applied, err)
+	}
+	current, ok, err = w.LoadOperationContext(context.Background())
+	if err != nil || !ok || current != newer {
+		t.Fatalf("older retry rewound current context = %+v, %v, %v", current, ok, err)
 	}
 
 	if _, err := db.Exec(`INSERT INTO operation_context_commands(command_id, processed_at, command_kind, payload_fingerprint) VALUES('legacy-clear', 2, '', '')`); err != nil {

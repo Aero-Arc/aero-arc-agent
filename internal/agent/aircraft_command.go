@@ -69,8 +69,12 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	}
 	pending := a.pendingMAVLinkCommand
 	var stateChanges chan bool
-	if pending != nil && pending.sent && pending.systemID == systemID && pending.componentID == componentID && sequence > pending.heartbeatAtSend {
-		stateChanges = pending.armedStateChange
+	if pending != nil && pending.systemID == systemID && pending.componentID == componentID {
+		if !pending.sent {
+			pending.armedAtSend = armed
+		} else if sequence > pending.heartbeatAtSend {
+			stateChanges = pending.armedStateChange
+		}
 	}
 	a.mavlinkMu.Unlock()
 	if stateChanges == nil {
@@ -236,6 +240,10 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	a.mavlinkMu.Lock()
 	if a.pendingMAVLinkCommand == pending {
 		pending.heartbeatAtSend = a.mavlinkHeartbeatSeq
+		if current := a.mavlinkTarget; current != nil && current.channel == target.channel &&
+			current.systemID == pending.systemID && current.componentID == pending.componentID {
+			pending.armedAtSend = current.armed
+		}
 		pending.sent = true
 	}
 	a.mavlinkMu.Unlock()

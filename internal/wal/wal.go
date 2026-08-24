@@ -594,16 +594,14 @@ func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool,
 	return value, true, nil
 }
 
-// SetOperationContext atomically applies a command once. Repeating the same ID
-// and payload is a successful no-op; reusing an ID with a different command or
-// payload returns ErrOperationCommandConflict.
+// SetOperationContext atomically applies a command once. For fingerprinted
+// rows, repeating the same ID and payload is a successful no-op while reuse with
+// another command or payload returns ErrOperationCommandConflict. Rows created
+// before fingerprinting remain irrevocable no-ops because their payload cannot
+// be reconstructed safely.
 func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value OperationContext) (bool, error) {
 	fingerprint := operationCommandFingerprint("set", value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
-	return w.applyOperationCommand(ctx, commandID, "set", fingerprint, func(tx *sql.Tx) (bool, error) {
-		var current OperationContext
-		err := tx.QueryRowContext(ctx, `SELECT flight_id, intent_id, intent_version FROM operation_context WHERE id = 1`).Scan(&current.FlightID, &current.IntentID, &current.IntentVersion)
-		return current == value, err
-	}, func(tx *sql.Tx) error {
+	return w.applyOperationCommand(ctx, commandID, "set", fingerprint, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at)
 			VALUES(1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET flight_id=excluded.flight_id,
 			intent_id=excluded.intent_id, intent_version=excluded.intent_version, updated_at=excluded.updated_at`,
@@ -613,8 +611,9 @@ func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value O
 }
 
 // ClearOperationContext atomically clears the active context once. Exact
-// retries are successful no-ops, while conflicting ID reuse returns
-// ErrOperationCommandConflict.
+// fingerprinted retries are successful no-ops, while conflicting ID reuse
+// returns ErrOperationCommandConflict. Pre-fingerprint command IDs remain
+// irrevocable no-ops because their original payload is unavailable.
 func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID string) (bool, error) {
 	if commandID == "" {
 		return false, errors.New("operation command ID is required")
@@ -624,20 +623,13 @@ func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID str
 	}
 
 	fingerprint := operationCommandFingerprint("clear", flightID)
-	return w.applyOperationCommand(ctx, commandID, "clear", fingerprint, func(tx *sql.Tx) (bool, error) {
-		var currentFlightID string
-		err := tx.QueryRowContext(ctx, `SELECT flight_id FROM operation_context WHERE id = 1`).Scan(&currentFlightID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return true, nil
-		}
-		return currentFlightID != flightID, err
-	}, func(tx *sql.Tx) error {
+	return w.applyOperationCommand(ctx, commandID, "clear", fingerprint, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `DELETE FROM operation_context WHERE id = 1 AND flight_id = ?`, flightID)
 		return err
 	})
 }
 
-func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, fingerprint string, legacyCompatible func(*sql.Tx) (bool, error), apply func(*sql.Tx) error) (bool, error) {
+func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, fingerprint string, apply func(*sql.Tx) error) (bool, error) {
 	if commandID == "" {
 		return false, errors.New("operation command ID is required")
 	}
@@ -661,23 +653,11 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, finger
 			return false, fmt.Errorf("load existing operation command: %w", err)
 		}
 		if storedKind == "" && storedFingerprint == "" {
-			compatible, err := legacyCompatible(tx)
-			if errors.Is(err, sql.ErrNoRows) {
-				compatible = false
-				err = nil
-			}
-			if err != nil {
-				return false, fmt.Errorf("verify legacy operation command: %w", err)
-			}
-			if compatible {
-				if _, err := tx.ExecContext(ctx, `UPDATE operation_context_commands SET command_kind = ?, payload_fingerprint = ? WHERE command_id = ? AND command_kind = '' AND payload_fingerprint = ''`, kind, fingerprint, commandID); err != nil {
-					return false, fmt.Errorf("adopt legacy operation command fingerprint: %w", err)
-				}
-				if err := tx.Commit(); err != nil {
-					return false, fmt.Errorf("commit legacy operation command fingerprint: %w", err)
-				}
-				return false, nil
-			}
+			// The old schema recorded only the command ID, so neither an exact
+			// retry nor conflicting reuse can be reconstructed after later context
+			// changes. Keep the row payload-unknown and preserve its at-most-once
+			// effect: every retry is a no-op. New rows remain fully fingerprinted.
+			return false, nil
 		}
 		if storedKind != kind || storedFingerprint != fingerprint {
 			return false, ErrOperationCommandConflict
