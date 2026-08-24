@@ -2107,7 +2107,7 @@ func TestWAL_ReadLimit(t *testing.T) {
 	}
 }
 
-func TestWALCloseContextDeadlineWhileDrainBlocked(t *testing.T) {
+func TestWALCloseContextInterruptsBlockedStartupDrain(t *testing.T) {
 	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "blocked-drain.db"))
 	w.writerDone = make(chan struct{})
 	w.batchTimeout = time.Hour
@@ -2116,23 +2116,109 @@ func TestWALCloseContextDeadlineWhileDrainBlocked(t *testing.T) {
 	w.spoolMu.Lock()
 	go w.runBatchWriter(context.Background())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	started := time.Now()
 	err := w.CloseContext(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("CloseContext() error = %v, want deadline exceeded", err)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if time.Since(started) > time.Second {
-		t.Fatalf("CloseContext() ignored deadline for %v", time.Since(started))
+		t.Fatalf("CloseContext() did not interrupt blocked drain for %v", time.Since(started))
 	}
-	if err := w.db.PingContext(context.Background()); err != nil {
-		t.Fatalf("database closed under blocked writer: %v", err)
+	if err := w.db.PingContext(context.Background()); err == nil {
+		t.Fatal("database remained open after interrupted drain shutdown")
 	}
 
 	w.spoolMu.Unlock()
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWALCloseInterruptsActiveFlushAndRetriesWithCloseContext(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "interrupt-active-flush.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	w.writerDone = make(chan struct{})
+	w.batchTimeout = time.Hour
+	w.batchSize = 2
+	w.batchChan = make(chan *agentv1.TelemetryFrame, 4)
+
+	marshalStarted := make(chan struct{})
+	releaseMarshal := make(chan struct{})
+	var marshalCalls atomic.Int32
+	w.marshalSpoolFrame = func(frame *agentv1.TelemetryFrame) ([]byte, error) {
+		if marshalCalls.Add(1) == 1 {
+			close(marshalStarted)
+			<-releaseMarshal
+		}
+		return proto.Marshal(frame)
+	}
+	go w.runBatchWriter(ctx)
+
+	for _, payload := range []string{"before-cancel", "after-cancel"} {
+		if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte(payload)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-marshalStarted:
+	case <-time.After(time.Second):
+		t.Fatal("normal WAL flush did not start")
+	}
+
+	closeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- w.CloseContext(closeCtx)
+	}()
+	closingDeadline := time.After(time.Second)
+	for !w.closing.Load() {
+		select {
+		case <-closingDeadline:
+			t.Fatal("close request did not reach WAL writer")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	close(releaseMarshal)
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("close did not retry the interrupted batch")
+	}
+	if calls := marshalCalls.Load(); calls != 3 {
+		t.Fatalf("spool marshal calls = %d, want 3 (one interrupted plus two close retries)", calls)
+	}
+
+	reopened := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if err := reopened.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := reopened.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("durable frames after interrupted flush = %d, want 2", len(entries))
+	}
+	for i, want := range []string{"before-cancel", "after-cancel"} {
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(entries[i].Payload, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if string(frame.GetRawMavlink()) != want {
+			t.Fatalf("durable frame %d = %q, want %q", i, frame.GetRawMavlink(), want)
+		}
 	}
 }
 
@@ -2437,7 +2523,10 @@ func mustOpenWALWithoutWriter(t *testing.T, dbPath string) *WAL {
 		removeFile:         os.Remove,
 		renameFile:         os.Rename,
 		syncDir:            syncDirectory,
-		closeDB:            db.Close,
+		marshalSpoolFrame: func(frame *agentv1.TelemetryFrame) ([]byte, error) {
+			return proto.Marshal(frame)
+		},
+		closeDB: db.Close,
 	}
 }
 

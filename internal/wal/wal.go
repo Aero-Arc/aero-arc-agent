@@ -67,7 +67,10 @@ type WAL struct {
 	removeFile         func(string) error
 	renameFile         func(string, string) error
 	syncDir            func(string) error
+	marshalSpoolFrame  func(*agentv1.TelemetryFrame) ([]byte, error)
 	closeDB            func() error
+	writerWorkMu       sync.Mutex
+	cancelWriterWork   context.CancelFunc
 	closeRequestMu     sync.Mutex
 	closeContexts      []context.Context
 	finalizeOnce       sync.Once
@@ -139,7 +142,10 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		removeFile:   os.Remove,
 		renameFile:   os.Rename,
 		syncDir:      syncDirectory,
-		closeDB:      db.Close,
+		marshalSpoolFrame: func(frame *agentv1.TelemetryFrame) ([]byte, error) {
+			return proto.Marshal(frame)
+		},
+		closeDB: db.Close,
 	}
 	wal.spoolQuarantineDir = filepath.Join(wal.spoolDir, "quarantine")
 
@@ -668,7 +674,15 @@ func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) e
 }
 
 func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
+	writerCtx, cancelWriterWork := context.WithCancel(lifecycleCtx)
+	w.writerWorkMu.Lock()
+	w.cancelWriterWork = cancelWriterWork
+	if w.closing.Load() {
+		cancelWriterWork()
+	}
+	w.writerWorkMu.Unlock()
 	defer func() {
+		cancelWriterWork()
 		close(w.writerDone)
 		w.finalizeClose()
 	}()
@@ -678,7 +692,7 @@ func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
 	ticker := time.NewTicker(w.batchTimeout)
 	defer ticker.Stop()
 
-	if err := w.drainSpool(); err != nil {
+	if err := w.drainSpoolContext(writerCtx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("WAL spool drain failed", "error", err)
 	}
 
@@ -688,6 +702,9 @@ func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
 		}
 
 		if pendingSpoolPath != "" {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := w.syncDir(w.spoolDir); err != nil {
 				return fmt.Errorf("sync finalized spool file %s: %w", pendingSpoolPath, err)
 			}
@@ -748,8 +765,10 @@ func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
 			continue
 		}
 		if flushPending {
-			if err := flush(context.Background()); err != nil {
-				slog.Error("WAL Batch Spool Failed", "error", err)
+			if err := flush(writerCtx); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Error("WAL Batch Spool Failed", "error", err)
+				}
 				select {
 				case <-time.After(retryDelay):
 					continue
@@ -770,7 +789,7 @@ func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
 				}
 			}
 
-			if err := w.drainSpool(); err != nil {
+			if err := w.drainSpoolContext(writerCtx); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
 
@@ -787,7 +806,7 @@ func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
 		case <-ticker.C:
 			if len(batch) > 0 {
 				flushPending = true
-			} else if err := w.drainSpool(); err != nil {
+			} else if err := w.drainSpoolContext(writerCtx); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
 		case <-w.closeWake:
@@ -811,6 +830,11 @@ func (w *WAL) requestClose(ctx context.Context) {
 	w.appendMu.Lock()
 	w.closing.Store(true)
 	w.appendMu.Unlock()
+	w.writerWorkMu.Lock()
+	if w.cancelWriterWork != nil {
+		w.cancelWriterWork()
+	}
+	w.writerWorkMu.Unlock()
 	w.closeRequestMu.Lock()
 	w.closeContexts = append(w.closeContexts, ctx)
 	w.closeRequestMu.Unlock()
@@ -853,7 +877,7 @@ func (w *WAL) spoolBatchFrames(ctx context.Context, frames []*agentv1.TelemetryF
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		encoded, err := proto.Marshal(frame)
+		encoded, err := w.marshalSpoolFrame(frame)
 		if err != nil {
 			return "", fmt.Errorf("failed to marshal frame for spool: %w", err)
 		}
@@ -910,8 +934,14 @@ func (w *WAL) spoolBatchFrames(ctx context.Context, frames []*agentv1.TelemetryF
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := writer.Flush(); err != nil {
 		return "", fmt.Errorf("failed to flush spool file: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	if err := file.Sync(); err != nil {
 		return "", fmt.Errorf("failed to sync spool file: %w", err)
@@ -919,10 +949,16 @@ func (w *WAL) spoolBatchFrames(ctx context.Context, frames []*agentv1.TelemetryF
 	if err := file.Close(); err != nil {
 		return "", fmt.Errorf("failed to close spool file: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := w.renameFile(tmpPath, path); err != nil {
 		return "", fmt.Errorf("failed to finalize spool file: %w", err)
 	}
 	cleanup = false
+	if err := ctx.Err(); err != nil {
+		return path, err
+	}
 	if err := w.syncDir(w.spoolDir); err != nil {
 		// The final path may already be visible even though its directory entry
 		// is not durable. Return that path so the writer can retry the directory
