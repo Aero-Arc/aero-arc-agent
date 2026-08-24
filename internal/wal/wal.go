@@ -79,7 +79,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 	}
 	generationID, err := loadOrCreateGenerationID(ctx, db)
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 

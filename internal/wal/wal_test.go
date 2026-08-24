@@ -46,7 +46,11 @@ func TestWALGenerationIdentityPersistsAndStampsFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
 	if reopened.GenerationID() != firstID {
 		t.Fatalf("reopened generation ID = %q, want %q", reopened.GenerationID(), firstID)
 	}
@@ -55,7 +59,11 @@ func TestWALGenerationIdentityPersistsAndStampsFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer other.Close()
+	t.Cleanup(func() {
+		if err := other.Close(); err != nil {
+			t.Errorf("close other WAL: %v", err)
+		}
+	})
 	if other.GenerationID() == firstID {
 		t.Fatalf("new WAL reused generation ID %q", firstID)
 	}

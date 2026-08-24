@@ -499,7 +499,11 @@ func TestWALGenerationIsStableForLegacyReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
 	a := &Agent{wal: w}
 
 	legacy := &agentv1.TelemetryFrame{}
