@@ -921,6 +921,150 @@ func TestWAL_AsyncBatching(t *testing.T) {
 	}
 }
 
+func TestWALAppendAsyncRejectsPoisonFrameWithoutBlockingValidBatches(t *testing.T) {
+	ctx := context.Background()
+	w, err := New(ctx, filepath.Join(t.TempDir(), "async-poison.db"), 2, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+
+	first := &agentv1.TelemetryFrame{
+		RawMavlink: []byte("before"),
+		Fields:     map[string]string{"source": "original"},
+	}
+	if err := w.AppendAsync(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	// Mutation after acceptance must not alter or poison the queued copy.
+	first.RawMavlink = []byte("mutated")
+	first.Fields["source"] = string([]byte{0xff})
+
+	poison := &agentv1.TelemetryFrame{Fields: map[string]string{"invalid": string([]byte{0xff})}}
+	if err := w.AppendAsync(ctx, poison); err == nil {
+		t.Fatal("AppendAsync accepted a frame containing invalid UTF-8")
+	}
+	if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("after")}); err != nil {
+		t.Fatalf("append after rejected poison frame: %v", err)
+	}
+	select {
+	case <-w.signalChan:
+	case <-time.After(time.Second):
+		t.Fatal("valid batch behind poison frame did not flush")
+	}
+
+	// A second batch proves the writer did not enter a retry loop or stop
+	// consuming queue capacity after rejecting the poison frame.
+	for _, payload := range []string{"later-1", "later-2"} {
+		if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte(payload)}); err != nil {
+			t.Fatalf("append %q after rejected poison frame: %v", payload, err)
+		}
+	}
+	select {
+	case <-w.signalChan:
+	case <-time.After(time.Second):
+		t.Fatal("second valid batch did not flush")
+	}
+
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("valid entries after poison rejection = %d, want 4", len(entries))
+	}
+	want := []string{"before", "after", "later-1", "later-2"}
+	for i, entry := range entries {
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(entry.Payload, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(frame.GetRawMavlink()); got != want[i] {
+			t.Fatalf("entry %d payload = %q, want %q", i, got, want[i])
+		}
+		if frame.GetWalId() != w.GenerationID() {
+			t.Fatalf("entry %d WAL ID = %q, want %q", i, frame.GetWalId(), w.GenerationID())
+		}
+	}
+}
+
+func TestWALClosePathsPreserveValidFramesAroundRejectedPoison(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		close func(*WAL) error
+	}{
+		{name: "Close", close: func(w *WAL) error { return w.Close() }},
+		{name: "CloseContext", close: func(w *WAL) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			return w.CloseContext(ctx)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "close-poison.db")
+			w, err := New(ctx, dbPath, 100, time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := w.Close(); err != nil {
+					t.Errorf("close original WAL: %v", err)
+				}
+			})
+
+			if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("before-close")}); err != nil {
+				t.Fatal(err)
+			}
+			poison := &agentv1.TelemetryFrame{Fields: map[string]string{"invalid": string([]byte{0xff})}}
+			if err := w.AppendAsync(ctx, poison); err == nil {
+				t.Fatal("AppendAsync accepted a frame containing invalid UTF-8")
+			}
+			if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("after-close")}); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.close(w); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := New(ctx, dbPath, 100, time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := reopened.Close(); err != nil {
+					t.Errorf("close reopened WAL: %v", err)
+				}
+			})
+			select {
+			case <-reopened.signalChan:
+			case <-time.After(time.Second):
+				t.Fatal("reopened WAL did not drain close-path spool")
+			}
+			entries, err := reopened.ReadUndelivered(ctx, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 2 {
+				t.Fatalf("valid close-path entries = %d, want 2", len(entries))
+			}
+			for i, want := range []string{"before-close", "after-close"} {
+				var frame agentv1.TelemetryFrame
+				if err := proto.Unmarshal(entries[i].Payload, &frame); err != nil {
+					t.Fatal(err)
+				}
+				if got := string(frame.GetRawMavlink()); got != want {
+					t.Fatalf("entry %d payload = %q, want %q", i, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestWAL_SpoolAndDrain(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_spool.db")

@@ -591,9 +591,34 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply
 	return true, nil
 }
 
-// AppendAsync queues a frame for writing.
-// This is non-blocking unless the buffer is completely full.
+// AppendAsync validates and queues a private copy of a frame for durable
+// writing. Once this method returns, the caller may safely reuse or mutate its
+// frame without changing the accepted telemetry. Frames that cannot be
+// serialized, including protobuf strings with invalid UTF-8, are rejected
+// before entering the writer queue so they cannot block later telemetry.
+//
+// Parameters:
+//   - ctx: bounds waiting for capacity when the asynchronous queue is full.
+//   - tFrame: is copied and stamped with this WAL's append generation.
+//
+// Returns:
+//   - error: reports a nil, invalid, oversized, cancelled, or closing append;
+//     nil means the immutable private copy was accepted by the writer.
 func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) error {
+	if tFrame == nil {
+		return errors.New("cannot append a nil telemetry frame")
+	}
+	queuedFrame := proto.Clone(tFrame).(*agentv1.TelemetryFrame)
+	w.stampGeneration(queuedFrame)
+	encoded, err := proto.Marshal(queuedFrame)
+	if err != nil {
+		return fmt.Errorf("validate telemetry frame for asynchronous append: %w", err)
+	}
+	if len(encoded) > maxSpoolFramePayloadSize {
+		return fmt.Errorf("telemetry frame for asynchronous append exceeds %d-byte safety limit: %d",
+			maxSpoolFramePayloadSize, len(encoded))
+	}
+
 	for {
 		w.appendMu.RLock()
 		if w.closing.Load() {
@@ -601,7 +626,7 @@ func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) e
 			return errors.New("WAL is closing")
 		}
 		select {
-		case w.batchChan <- tFrame:
+		case w.batchChan <- queuedFrame:
 			w.appendMu.RUnlock()
 			return nil
 		default:
