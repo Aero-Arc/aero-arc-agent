@@ -43,13 +43,14 @@ type WAL struct {
 	spoolMu      sync.Mutex
 }
 
-// New creates or opens a WAL and restores its durable generation identity.
-// Frames appended through the returned WAL are stamped with that identity
-// before persistence, so retries retain the same `(generation, sequence)`
-// cursor across process restarts.
+// New creates or opens a WAL and starts a new durable append generation.
+// Frames appended through the returned WAL are stamped before persistence, so
+// retries retain their original `(generation, sequence)` cursor across process
+// restarts. Starting a new generation on every open prevents a restored or
+// cloned database from reusing cursors allocated after its snapshot.
 //
 // Parameters:
-//   - ctx: bounds schema initialization and generation identity restoration.
+//   - ctx: bounds schema initialization and generation rotation.
 //   - path: identifies the SQLite database and its adjacent spill directory.
 //   - batchSize: controls asynchronous transaction size; non-positive values
 //     select the default.
@@ -77,7 +78,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		db.Close()
 		return nil, err
 	}
-	generationID, err := loadOrCreateGenerationID(ctx, db)
+	generationID, err := startGenerationID(ctx, db)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -173,24 +174,101 @@ func initDB(db *sql.DB) error {
 	return nil
 }
 
-func loadOrCreateGenerationID(ctx context.Context, db *sql.DB) (string, error) {
-	candidate := uuid.NewString()
-	if _, err := db.ExecContext(ctx, `INSERT OR IGNORE INTO wal_metadata(id, generation_id) VALUES(1, ?)`, candidate); err != nil {
-		return "", fmt.Errorf("initialize WAL generation identity: %w", err)
+func startGenerationID(ctx context.Context, db *sql.DB) (string, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin WAL generation rotation: %w", err)
 	}
-	var generationID string
-	if err := db.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&generationID); err != nil {
-		return "", fmt.Errorf("load WAL generation identity: %w", err)
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var previousID string
+	err = tx.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&previousID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("load previous WAL generation identity: %w", err)
 	}
-	if _, err := uuid.Parse(generationID); err != nil {
-		return "", fmt.Errorf("load WAL generation identity: invalid UUID %q: %w", generationID, err)
+	if err == nil {
+		if _, parseErr := uuid.Parse(previousID); parseErr != nil {
+			return "", fmt.Errorf("load previous WAL generation identity: invalid UUID %q: %w", previousID, parseErr)
+		}
 	}
-	return generationID, nil
+
+	nextID := uuid.NewString()
+	legacyID := nextID
+	if previousID != "" {
+		legacyID = previousID
+	}
+	if err := stampLegacyFrames(ctx, tx, legacyID); err != nil {
+		return "", err
+	}
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO wal_metadata(id, generation_id) VALUES(1, ?)
+		ON CONFLICT(id) DO UPDATE SET generation_id = excluded.generation_id`, nextID); err != nil {
+		return "", fmt.Errorf("rotate WAL generation identity: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit WAL generation rotation: %w", err)
+	}
+	return nextID, nil
 }
 
-// GenerationID returns the durable identity shared by every sequence in this
-// WAL database. It remains stable across process restarts and changes when a
-// new WAL database is created.
+func stampLegacyFrames(ctx context.Context, tx *sql.Tx, generationID string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT seq, payload FROM telemetry_frames`)
+	if err != nil {
+		return fmt.Errorf("query legacy WAL frames: %w", err)
+	}
+
+	type update struct {
+		seq     int64
+		payload []byte
+	}
+	var updates []update
+	for rows.Next() {
+		var seq int64
+		var payload []byte
+		if err := rows.Scan(&seq, &payload); err != nil {
+			return closeLegacyRows(rows, fmt.Errorf("scan legacy WAL frame: %w", err))
+		}
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(payload, &frame); err != nil {
+			return closeLegacyRows(rows, fmt.Errorf("unmarshal legacy WAL frame %d: %w", seq, err))
+		}
+		if frame.GetWalId() != "" {
+			continue
+		}
+		frame.WalId = generationID
+		encoded, err := proto.Marshal(&frame)
+		if err != nil {
+			return closeLegacyRows(rows, fmt.Errorf("marshal legacy WAL frame %d: %w", seq, err))
+		}
+		updates = append(updates, update{seq: seq, payload: encoded})
+	}
+	if err := rows.Err(); err != nil {
+		return closeLegacyRows(rows, fmt.Errorf("iterate legacy WAL frames: %w", err))
+	}
+	if err := closeLegacyRows(rows, nil); err != nil {
+		return err
+	}
+
+	for _, item := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, item.payload, item.seq); err != nil {
+			return fmt.Errorf("stamp legacy WAL frame %d: %w", item.seq, err)
+		}
+	}
+	return nil
+}
+
+func closeLegacyRows(rows *sql.Rows, cause error) error {
+	if err := rows.Close(); err != nil {
+		return errors.Join(cause, fmt.Errorf("close legacy WAL frame rows: %w", err))
+	}
+	return cause
+}
+
+// GenerationID returns the append generation assigned to frames newly
+// persisted by this WAL instance. A new value is created on every open while
+// generation IDs already stored in queued frames remain unchanged.
 func (w *WAL) GenerationID() string {
 	return w.generationID
 }

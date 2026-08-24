@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestWALGenerationIdentityPersistsAndStampsFrames(t *testing.T) {
+func TestWALGenerationRotatesAndPersistedFramesRetainIdentity(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "generation.db")
 	w, err := New(ctx, dbPath, 0, 0)
@@ -51,8 +51,32 @@ func TestWALGenerationIdentityPersistsAndStampsFrames(t *testing.T) {
 			t.Errorf("close reopened WAL: %v", err)
 		}
 	})
-	if reopened.GenerationID() != firstID {
-		t.Fatalf("reopened generation ID = %q, want %q", reopened.GenerationID(), firstID)
+	secondID := reopened.GenerationID()
+	if secondID == firstID {
+		t.Fatalf("reopened WAL reused generation ID %q", firstID)
+	}
+	entries, err = reopened.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(entries[0].Payload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetWalId() != firstID {
+		t.Fatalf("reopened stored WAL ID = %q, want %q", stored.GetWalId(), firstID)
+	}
+	if _, err := reopened.Append(ctx, &agentv1.TelemetryFrame{}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = reopened.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(entries[1].Payload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetWalId() != secondID {
+		t.Fatalf("new stored WAL ID = %q, want %q", stored.GetWalId(), secondID)
 	}
 
 	other, err := New(ctx, filepath.Join(t.TempDir(), "new-generation.db"), 0, 0)
@@ -66,6 +90,138 @@ func TestWALGenerationIdentityPersistsAndStampsFrames(t *testing.T) {
 	})
 	if other.GenerationID() == firstID {
 		t.Fatalf("new WAL reused generation ID %q", firstID)
+	}
+}
+
+func TestWALGenerationRotationPreventsRestoredSequenceReuse(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "wal.db")
+	snapshotPath := filepath.Join(dir, "wal.snapshot.db")
+
+	original, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstGeneration := original.GenerationID()
+	if id, err := original.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("before-snapshot")}); err != nil || id != 1 {
+		t.Fatalf("first append = %d, %v; want seq 1", id, err)
+	}
+	if err := original.Close(); err != nil {
+		t.Fatal(err)
+	}
+	copyFile(t, dbPath, snapshotPath)
+
+	continued, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	continuedGeneration := continued.GenerationID()
+	if continuedGeneration == firstGeneration {
+		t.Fatalf("continued WAL reused generation ID %q", firstGeneration)
+	}
+	if id, err := continued.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("after-snapshot")}); err != nil || id != 2 {
+		t.Fatalf("continued append = %d, %v; want seq 2", id, err)
+	}
+	if err := continued.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	copyFile(t, snapshotPath, dbPath)
+	restored, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := restored.Close(); err != nil {
+			t.Errorf("close restored WAL: %v", err)
+		}
+	})
+	restoredGeneration := restored.GenerationID()
+	if restoredGeneration == firstGeneration || restoredGeneration == continuedGeneration {
+		t.Fatalf("restored generation ID %q reused a prior generation", restoredGeneration)
+	}
+	if id, err := restored.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("after-restore")}); err != nil || id != 2 {
+		t.Fatalf("restored append = %d, %v; want reused SQLite seq 2", id, err)
+	}
+
+	entries, err := restored.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("restored entries = %d, want 2", len(entries))
+	}
+	var restoredFrame agentv1.TelemetryFrame
+	if err := proto.Unmarshal(entries[1].Payload, &restoredFrame); err != nil {
+		t.Fatal(err)
+	}
+	if restoredFrame.GetWalId() != restoredGeneration {
+		t.Fatalf("restored seq 2 WAL ID = %q, want %q", restoredFrame.GetWalId(), restoredGeneration)
+	}
+	if restoredFrame.GetWalId() == continuedGeneration {
+		t.Fatalf("restored seq 2 reused cursor (%q, 2)", continuedGeneration)
+	}
+}
+
+func TestWALGenerationRotationStampsLegacyFramesBeforeChangingGeneration(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	w, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousGeneration := w.GenerationID()
+	if _, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("legacy")}); err != nil {
+		t.Fatal(err)
+	}
+	legacyPayload, err := proto.Marshal(&agentv1.TelemetryFrame{RawMavlink: []byte("legacy")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = 1`, legacyPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if reopened.GenerationID() == previousGeneration {
+		t.Fatalf("reopened WAL reused generation ID %q", previousGeneration)
+	}
+	entries, err := reopened.ReadUndelivered(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("drained entries = %d, want 1", len(entries))
+	}
+	var stored agentv1.TelemetryFrame
+	if err := proto.Unmarshal(entries[0].Payload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetWalId() != previousGeneration {
+		t.Fatalf("legacy frame WAL ID = %q, want previous generation %q", stored.GetWalId(), previousGeneration)
+	}
+}
+
+func copyFile(t *testing.T, source, destination string) {
+	t.Helper()
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, data, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -238,6 +394,54 @@ func TestWAL_SpoolAndDrain(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Errorf("Expected 2 entries, got %d", len(entries))
+	}
+}
+
+func TestWALSpoolUsesGenerationThatAssignsSequence(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "spool-generation.db")
+	w, err := New(ctx, dbPath, 2, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstGeneration := w.GenerationID()
+	if _, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("spooled")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(ctx, dbPath, 2, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if reopened.GenerationID() == firstGeneration {
+		t.Fatalf("reopened WAL reused generation ID %q", firstGeneration)
+	}
+	select {
+	case <-reopened.signalChan:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for reopened WAL to drain spool")
+	}
+	entries, err := reopened.ReadUndelivered(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("drained entries = %d, want 1", len(entries))
+	}
+	var stored agentv1.TelemetryFrame
+	if err := proto.Unmarshal(entries[0].Payload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.GetWalId() != reopened.GenerationID() {
+		t.Fatalf("spooled frame WAL ID = %q, want assigning generation %q", stored.GetWalId(), reopened.GenerationID())
 	}
 }
 
