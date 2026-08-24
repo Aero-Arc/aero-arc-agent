@@ -351,6 +351,10 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		pending.enqueueComplete = true
 	}
 	a.mavlinkMu.Unlock()
+	// ARM and DISARM share one MAV_CMD and carry no request nonce. Once this
+	// command is handed to gomavlib, any duplicate or delayed terminal ACK can
+	// collide with the next command, so every outcome starts a fresh quiet epoch.
+	defer a.rearmAircraftACKFence()
 
 	timeout := a.aircraftCommandTimeout()
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -421,6 +425,13 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 			return result
 		}
 	}
+}
+
+func (a *Agent) rearmAircraftACKFence() {
+	a.mavlinkMu.Lock()
+	a.aircraftAckAmbiguous = true
+	a.aircraftAckAmbiguousSince = time.Now()
+	a.mavlinkMu.Unlock()
 }
 
 func (a *Agent) aircraftCommandTimeout() time.Duration {

@@ -38,6 +38,58 @@ func TestMAVLinkTargetChangeRearmsAircraftACKFence(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandTerminalACKRearmsAmbiguityFence(t *testing.T) {
+	for _, mavlinkResult := range []common.MAV_RESULT{common.MAV_RESULT_ACCEPTED, common.MAV_RESULT_DENIED} {
+		t.Run(mavlinkResult.String(), func(t *testing.T) {
+			agent := commandTestAgent(t, mavlinkResult)
+			result := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+				CommandId: "terminal-ack", AircraftId: "aircraft-1",
+				Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+			})
+			if result.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED &&
+				result.GetStatus() != agentv1.AircraftCommandResult_STATUS_REJECTED {
+				t.Fatalf("terminal result = %+v", result)
+			}
+			if !agent.aircraftAckAmbiguous || agent.aircraftAckAmbiguousSince.IsZero() {
+				t.Fatal("terminal ACK did not start a new ambiguity epoch")
+			}
+		})
+	}
+}
+
+func TestDelayedDuplicateTerminalACKCannotCompleteNextCommand(t *testing.T) {
+	channel := &gomavlib.Channel{}
+	agent := &Agent{
+		options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond},
+		mavlinkTarget: &mavlinkTarget{
+			channel: channel, systemID: 1, componentID: 1,
+		},
+	}
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		// The second delivery represents a delayed duplicate of the first
+		// terminal ACK; MAVLink carries no command nonce to distinguish it.
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:  common.MAV_RESULT_ACCEPTED,
+		})
+		return nil
+	}
+	first := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+		CommandId: "arm-first", AircraftId: "aircraft-1",
+		Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+	})
+	if first.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+		t.Fatalf("first result = %+v", first)
+	}
+	second := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+		CommandId: "disarm-second", AircraftId: "aircraft-1",
+		Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+	})
+	if second.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
+		t.Fatalf("duplicate ACK completed second command: %+v", second)
+	}
+}
+
 func TestRunAckLoopRejectsConcurrentAircraftCommandWithoutDelayingReceive(t *testing.T) {
 	channel := &gomavlib.Channel{}
 	commandStarted := make(chan struct{})
@@ -408,7 +460,7 @@ func TestAircraftCommandFenceIgnoresLateDenialForPreviousCommand(t *testing.T) {
 	}
 }
 
-func TestAircraftCommandLeavesAmbiguityAfterQuietEpoch(t *testing.T) {
+func TestAircraftCommandRearmsAmbiguityAfterTerminalACKFollowingQuietEpoch(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		armed      bool
@@ -443,10 +495,10 @@ func TestAircraftCommandLeavesAmbiguityAfterQuietEpoch(t *testing.T) {
 				t.Fatalf("post-quiescence result = %+v, want %s", got, test.wantStatus)
 			}
 			agent.mavlinkMu.Lock()
-			stillAmbiguous := agent.aircraftAckAmbiguous
+			rearmed := agent.aircraftAckAmbiguous && !agent.aircraftAckAmbiguousSince.IsZero()
 			agent.mavlinkMu.Unlock()
-			if stillAmbiguous {
-				t.Fatal("quiet ACK epoch did not leave ambiguity mode")
+			if !rearmed {
+				t.Fatal("terminal ACK after a quiet epoch did not re-arm ambiguity")
 			}
 		})
 	}

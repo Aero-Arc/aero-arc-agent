@@ -23,6 +23,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	defaultTelemetryPersistenceDrainTimeout = 5 * time.Second
+	walShutdownReserve                      = 10 * time.Second
+	agentShutdownTimeout                    = defaultTelemetryPersistenceDrainTimeout + walShutdownReserve
+)
+
 type Agent struct {
 	node *gomavlib.Node
 	wal  *wal.WAL
@@ -155,8 +161,9 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 
 	// Ensure resources are cleaned up on exit.
 	defer func() {
-		// Use a fresh context for shutdown since 'ctx' might be cancelled.
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		// Use a fresh phase budget since 'ctx' is cancelled. The bounded pre-WAL
+		// drain cannot consume the time reserved for WAL spooling and closure.
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), agentShutdownTimeout)
 		defer cancelShutdown()
 		if err := a.shutdown(shutdownCtx); err != nil {
 			startErr = errors.Join(startErr, fmt.Errorf("agent shutdown: %w", err))
@@ -366,7 +373,7 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 	}()
 	defer func() {
 		close(telemetryQueue)
-		drainTimeout := 5 * time.Second
+		drainTimeout := defaultTelemetryPersistenceDrainTimeout
 		if a.telemetryDrainTimeout > 0 {
 			drainTimeout = a.telemetryDrainTimeout
 		}
