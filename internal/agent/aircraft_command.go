@@ -126,11 +126,25 @@ func (a *Agent) observeMAVLinkCommandAck(channel *gomavlib.Channel, systemID, co
 		return
 	}
 	result := mavlinkCommandAck{systemID: systemID, componentID: componentID, result: ack.Result}
-	a.mavlinkMu.Unlock()
+	if ack.Result == common.MAV_RESULT_IN_PROGRESS {
+		a.mavlinkMu.Unlock()
+		return
+	}
+	// Progress ACKs do not complete a command and are never queued. Retain only
+	// the latest terminal evidence so a burst cannot hide the one-shot final ACK.
 	select {
 	case pending.acks <- result:
 	default:
+		select {
+		case <-pending.acks:
+		default:
+		}
+		select {
+		case pending.acks <- result:
+		default:
+		}
 	}
+	a.mavlinkMu.Unlock()
 }
 
 func (a *Agent) clearMAVLinkTarget(channel *gomavlib.Channel) {
@@ -289,7 +303,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		desiredArmed:       desiredArmed,
 		armedAtEnqueue:     target.armed,
 		heartbeatAtEnqueue: target.heartbeatSequence,
-		acks:               make(chan mavlinkCommandAck, 4),
+		acks:               make(chan mavlinkCommandAck, 1),
 		armedStateChange:   make(chan bool, 4),
 	}
 	// Process startup and any uncertain write or timeout fence COMMAND_ACK for

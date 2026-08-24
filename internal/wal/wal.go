@@ -112,6 +112,21 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 // writer under lifecycleCtx. Most callers should use New. The Agent uses the
 // split lifecycle so run cancellation can stop MAVLink ingest and drain its
 // pre-WAL queue before explicitly closing the still-writable WAL.
+//
+// Parameters:
+//   - initCtx: bounds generation creation and other context-aware startup work.
+//   - lifecycleCtx: requests asynchronous durable-writer shutdown when
+//     cancelled; it may intentionally outlive initCtx.
+//   - path: identifies the SQLite database and adjacent spool directory.
+//   - batchSize: controls asynchronous transaction size; non-positive values
+//     select the default.
+//   - batchTimeout: controls asynchronous flush latency; non-positive values
+//     select the default.
+//
+// Returns:
+//   - wal: owns the configured database, spool directories, and writer.
+//   - error: reports database open/configuration/schema failures, cancelled or
+//     failed generation creation, and spool-directory initialization failures.
 func NewWithLifecycle(initCtx, lifecycleCtx context.Context, path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {

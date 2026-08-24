@@ -57,6 +57,34 @@ func TestAircraftCommandTerminalACKRearmsAmbiguityFence(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandProgressBurstPreservesTerminalACK(t *testing.T) {
+	channel := &gomavlib.Channel{}
+	agent := &Agent{
+		options:       &AgentOptions{AircraftCommandTimeout: time.Second},
+		mavlinkTarget: &mavlinkTarget{channel: channel, systemID: 1, componentID: 1},
+	}
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		for range 8 {
+			agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+				Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+				Result:  common.MAV_RESULT_IN_PROGRESS,
+			})
+		}
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:  common.MAV_RESULT_ACCEPTED,
+		})
+		return nil
+	}
+	result := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+		CommandId: "progress-then-accepted", AircraftId: "aircraft-1",
+		Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+	})
+	if result.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+		t.Fatalf("progress burst hid terminal ACK: %+v", result)
+	}
+}
+
 func TestDelayedDuplicateTerminalACKCannotCompleteNextCommand(t *testing.T) {
 	channel := &gomavlib.Channel{}
 	agent := &Agent{
