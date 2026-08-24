@@ -67,14 +67,20 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 	if frame == nil {
 		return
 	}
-	a.observeMAVLinkEventProgress(frame.Channel)
 	switch message := frame.Message().(type) {
 	case *common.MessageHeartbeat:
 		if frame.ComponentID() == uint8(common.MAV_COMP_ID_AUTOPILOT1) && message.Type != common.MAV_TYPE_GCS {
 			a.observeMAVLinkHeartbeat(frame.Channel, frame.SystemID(), frame.ComponentID(), message.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0)
+		} else {
+			a.observeMAVLinkEventProgress(frame.Channel)
 		}
 	case *common.MessageCommandAck:
+		// ACK classification and its fence reset share one critical section.
+		// Generic progress must not expose a quiet epoch before this same event
+		// is consumed as potentially stale command evidence.
 		a.observeMAVLinkCommandAck(frame.Channel, frame.SystemID(), frame.ComponentID(), message)
+	default:
+		a.observeMAVLinkEventProgress(frame.Channel)
 	}
 }
 
