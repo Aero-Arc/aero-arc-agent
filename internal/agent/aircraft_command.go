@@ -67,6 +67,7 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 	if frame == nil {
 		return
 	}
+	a.observeMAVLinkEventProgress(frame.Channel)
 	switch message := frame.Message().(type) {
 	case *common.MessageHeartbeat:
 		if frame.ComponentID() == uint8(common.MAV_COMP_ID_AUTOPILOT1) && message.Type != common.MAV_TYPE_GCS {
@@ -77,6 +78,39 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 	}
 }
 
+func (a *Agent) observeMAVLinkEventProgress(channel *gomavlib.Channel) {
+	a.mavlinkMu.Lock()
+	defer a.mavlinkMu.Unlock()
+	if a.mavlinkTarget == nil || a.mavlinkTarget.channel != channel || !a.aircraftAckAmbiguous {
+		return
+	}
+	a.advanceAircraftACKQuiescenceLocked(time.Now())
+}
+
+func (a *Agent) advanceAircraftACKQuiescenceLocked(now time.Time) {
+	if !a.aircraftAckAmbiguous {
+		return
+	}
+	timeout := a.aircraftCommandTimeout()
+	maxProgressGap := timeout / 2
+	if a.aircraftAckAmbiguousSince.IsZero() || a.aircraftAckLastProgressAt.IsZero() ||
+		now.Sub(a.aircraftAckLastProgressAt) > maxProgressGap {
+		a.aircraftAckAmbiguousSince = now
+	}
+	a.aircraftAckLastProgressAt = now
+	if now.Sub(a.aircraftAckAmbiguousSince) >= timeout {
+		a.aircraftAckAmbiguous = false
+		a.aircraftAckAmbiguousSince = time.Time{}
+		a.aircraftAckLastProgressAt = time.Time{}
+	}
+}
+
+func (a *Agent) rearmAircraftACKFenceLocked() {
+	a.aircraftAckAmbiguous = true
+	a.aircraftAckAmbiguousSince = time.Time{}
+	a.aircraftAckLastProgressAt = time.Time{}
+}
+
 func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, componentID uint8, armed bool) {
 	a.mavlinkMu.Lock()
 	previous := a.mavlinkTarget
@@ -85,10 +119,10 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 		// A different transport target starts a new ACK-correlation domain. Even
 		// if the old target completed a quiet epoch, delayed ARM/DISARM evidence
 		// from before this selection cannot be correlated directly.
-		a.aircraftAckAmbiguous = true
-		a.aircraftAckAmbiguousSince = time.Now()
-	} else if a.aircraftAckAmbiguous && a.aircraftAckAmbiguousSince.IsZero() {
-		a.aircraftAckAmbiguousSince = time.Now()
+		a.rearmAircraftACKFenceLocked()
+	}
+	if a.aircraftAckAmbiguous {
+		a.advanceAircraftACKQuiescenceLocked(time.Now())
 	}
 	a.mavlinkHeartbeatSeq++
 	sequence := a.mavlinkHeartbeatSeq
@@ -147,18 +181,19 @@ func (a *Agent) observeMAVLinkCommandAck(channel *gomavlib.Channel, systemID, co
 		// command's gomavlib handoff boundary. It cannot be correlated to this
 		// attempt. Discard it and require state verification for any later ACK;
 		// its presence proves the shared ARM/DISARM ACK domain was not quiescent.
-		a.aircraftAckAmbiguous = true
-		a.aircraftAckAmbiguousSince = time.Now()
+		a.rearmAircraftACKFenceLocked()
+		a.advanceAircraftACKQuiescenceLocked(time.Now())
 		pending.stateVerificationRequired = true
 		a.mavlinkMu.Unlock()
 		return
 	}
-	if ack.Command == common.MAV_CMD_COMPONENT_ARM_DISARM && a.aircraftAckAmbiguous &&
+	if ack.Command == common.MAV_CMD_COMPONENT_ARM_DISARM &&
 		a.mavlinkTarget != nil && a.mavlinkTarget.channel == channel &&
 		a.mavlinkTarget.systemID == systemID && a.mavlinkTarget.componentID == componentID &&
 		(ack.TargetSystem == 0 || ack.TargetSystem == mavlinkSourceSystemID) &&
 		(ack.TargetComponent == 0 || ack.TargetComponent == mavlinkSourceComponentID) {
-		a.aircraftAckAmbiguousSince = time.Now()
+		a.rearmAircraftACKFenceLocked()
+		a.advanceAircraftACKQuiescenceLocked(time.Now())
 	}
 	if !matchesPending {
 		a.mavlinkMu.Unlock()
@@ -351,11 +386,6 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 	// positive completion requires both an accepted acknowledgement and a fresh
 	// armed-state transition, while an ambiguous negative acknowledgement cannot
 	// terminate the current command.
-	if a.aircraftAckAmbiguous && !a.aircraftAckAmbiguousSince.IsZero() &&
-		time.Since(a.aircraftAckAmbiguousSince) >= a.aircraftCommandTimeout() {
-		a.aircraftAckAmbiguous = false
-		a.aircraftAckAmbiguousSince = time.Time{}
-	}
 	pending.stateVerificationRequired = a.aircraftAckAmbiguous
 	a.pendingMAVLinkCommand = pending
 	a.mavlinkMu.Unlock()
@@ -385,8 +415,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 	}
 	if err := a.writeMAVLinkCommand(target.channel, mavlinkCommand); err != nil {
 		a.mavlinkMu.Lock()
-		a.aircraftAckAmbiguous = true
-		a.aircraftAckAmbiguousSince = time.Now()
+		a.rearmAircraftACKFenceLocked()
 		a.mavlinkMu.Unlock()
 		result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
 		result.Message = "send MAVLink command: " + err.Error()
@@ -469,8 +498,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 			}
 		case <-waitCtx.Done():
 			a.mavlinkMu.Lock()
-			a.aircraftAckAmbiguous = true
-			a.aircraftAckAmbiguousSince = time.Now()
+			a.rearmAircraftACKFenceLocked()
 			a.mavlinkMu.Unlock()
 			result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
 			if stateVerificationRequired {
@@ -485,8 +513,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 
 func (a *Agent) rearmAircraftACKFence() {
 	a.mavlinkMu.Lock()
-	a.aircraftAckAmbiguous = true
-	a.aircraftAckAmbiguousSince = time.Now()
+	a.rearmAircraftACKFenceLocked()
 	a.mavlinkMu.Unlock()
 }
 

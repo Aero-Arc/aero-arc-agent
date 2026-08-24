@@ -50,8 +50,8 @@ func TestAircraftCommandTerminalACKRearmsAmbiguityFence(t *testing.T) {
 				result.GetStatus() != agentv1.AircraftCommandResult_STATUS_REJECTED {
 				t.Fatalf("terminal result = %+v", result)
 			}
-			if !agent.aircraftAckAmbiguous || agent.aircraftAckAmbiguousSince.IsZero() {
-				t.Fatal("terminal ACK did not start a new ambiguity epoch")
+			if !agent.aircraftAckAmbiguous || !agent.aircraftAckAmbiguousSince.IsZero() || !agent.aircraftAckLastProgressAt.IsZero() {
+				t.Fatal("terminal command did not require a fresh event-progress epoch")
 			}
 		})
 	}
@@ -596,7 +596,9 @@ func TestAircraftCommandRearmsAmbiguityAfterTerminalACKFollowingQuietEpoch(t *te
 			agent.observeMAVLinkHeartbeat(channel, 1, 1, test.armed)
 			agent.mavlinkMu.Lock()
 			agent.aircraftAckAmbiguousSince = time.Now().Add(-agent.aircraftCommandTimeout())
+			agent.aircraftAckLastProgressAt = time.Now()
 			agent.mavlinkMu.Unlock()
+			agent.observeMAVLinkHeartbeat(channel, 1, 1, test.armed)
 			agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
 				afterAircraftCommandEnqueue(agent, func() {
 					agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
@@ -613,7 +615,7 @@ func TestAircraftCommandRearmsAmbiguityAfterTerminalACKFollowingQuietEpoch(t *te
 				t.Fatalf("post-quiescence result = %+v, want %s", got, test.wantStatus)
 			}
 			agent.mavlinkMu.Lock()
-			rearmed := agent.aircraftAckAmbiguous && !agent.aircraftAckAmbiguousSince.IsZero()
+			rearmed := agent.aircraftAckAmbiguous && agent.aircraftAckAmbiguousSince.IsZero() && agent.aircraftAckLastProgressAt.IsZero()
 			agent.mavlinkMu.Unlock()
 			if !rearmed {
 				t.Fatal("terminal ACK after a quiet epoch did not re-arm ambiguity")
@@ -631,6 +633,7 @@ func TestAircraftCommandAckActivityRestartsQuietEpoch(t *testing.T) {
 	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
 	agent.mavlinkMu.Lock()
 	agent.aircraftAckAmbiguousSince = time.Now().Add(-agent.aircraftCommandTimeout())
+	agent.aircraftAckLastProgressAt = time.Now()
 	agent.mavlinkMu.Unlock()
 	// An ACK observed before the next send proves the transport is not yet
 	// quiescent and restarts the epoch even when no command is pending.
@@ -650,6 +653,31 @@ func TestAircraftCommandAckActivityRestartsQuietEpoch(t *testing.T) {
 	})
 	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
 		t.Fatalf("result after pre-send ACK activity = %+v, want fenced timeout", got)
+	}
+}
+
+func TestAircraftCommandPausedReaderDoesNotExpireQuietEpoch(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 40 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	agent.mavlinkMu.Lock()
+	agent.aircraftAckAmbiguousSince = time.Now().Add(-agent.aircraftCommandTimeout())
+	agent.aircraftAckLastProgressAt = time.Now().Add(-agent.aircraftCommandTimeout())
+	agent.mavlinkMu.Unlock()
+
+	// The first event after a reader pause starts a new progress epoch. Wall
+	// time spent suspended cannot make an ACK already queued behind it safe.
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	agent.mavlinkMu.Lock()
+	ambiguous := agent.aircraftAckAmbiguous
+	quietSince := agent.aircraftAckAmbiguousSince
+	lastProgress := agent.aircraftAckLastProgressAt
+	agent.mavlinkMu.Unlock()
+	if !ambiguous || quietSince.IsZero() || lastProgress.IsZero() || lastProgress.Sub(quietSince) >= agent.aircraftCommandTimeout() {
+		t.Fatalf("paused reader expired fence: ambiguous=%t since=%v progress=%v", ambiguous, quietSince, lastProgress)
 	}
 }
 

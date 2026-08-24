@@ -68,10 +68,12 @@ type Agent struct {
 	pendingMAVLinkCommand *pendingMAVLinkCommand
 	aircraftAckAmbiguous  bool
 	// aircraftAckAmbiguousSince starts a transport-quiescence epoch at the
-	// first target heartbeat and after matching ACK activity or an uncertain
-	// command outcome. A full command-timeout interval without such activity
-	// safely returns later commands to direct ACK correlation.
+	// first continuously processed target-channel event after matching ACK
+	// activity or an uncertain command outcome. A full command-timeout interval
+	// of event-reader progress safely returns later commands to direct ACK
+	// correlation; elapsed wall time while the reader is paused does not count.
 	aircraftAckAmbiguousSince time.Time
+	aircraftAckLastProgressAt time.Time
 	aircraftCommandMu         sync.Mutex
 	aircraftCommandActive     bool
 	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
