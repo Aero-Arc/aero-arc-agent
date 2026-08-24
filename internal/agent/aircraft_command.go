@@ -272,6 +272,12 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 				continue
 			}
 			if ack.result != common.MAV_RESULT_ACCEPTED {
+				if stateVerificationRequired {
+					// The protocol does not echo a per-command nonce. Behind the
+					// ambiguity fence, this may be a delayed rejection for an older
+					// ARM/DISARM and cannot terminate the current command safely.
+					continue
+				}
 				result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
 				result.Message = "autopilot rejected command: " + ack.result.String()
 				return result

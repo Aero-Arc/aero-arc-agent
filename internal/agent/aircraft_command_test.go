@@ -218,7 +218,7 @@ func TestFirstAircraftCommandAfterStartDoesNotCorrelateBufferedAck(t *testing.T)
 	}
 }
 
-func TestAircraftCommandFenceDoesNotPromoteRejectedCommandFromMatchingState(t *testing.T) {
+func TestAircraftCommandFenceDoesNotLetAmbiguousRejectionTerminateCommand(t *testing.T) {
 	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
@@ -245,8 +245,49 @@ func TestAircraftCommandFenceDoesNotPromoteRejectedCommandFromMatchingState(t *t
 	})
 	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
 	got := <-result
-	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_REJECTED || !strings.Contains(got.GetMessage(), common.MAV_RESULT_DENIED.String()) {
-		t.Fatalf("denied state-matching command result = %+v", got)
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
+		t.Fatalf("ambiguous denial result = %+v, want timeout", got)
+	}
+}
+
+func TestAircraftCommandFenceIgnoresLateDenialForPreviousCommand(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.mavlinkTarget = &mavlinkTarget{channel: channel, systemID: 1, componentID: 1, armed: true}
+	written := make(chan struct{})
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		close(written)
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "disarm-after-denied-arm", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+		})
+	}()
+	<-written
+	// This could be the delayed denial of an ARM sent before this DISARM.
+	agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+		Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Result: common.MAV_RESULT_DENIED,
+	})
+	select {
+	case got := <-result:
+		t.Fatalf("ambiguous late denial terminated DISARM: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+		Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Result: common.MAV_RESULT_ACCEPTED,
+	})
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	got := <-result
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+		t.Fatalf("current DISARM evidence result = %+v, want accepted", got)
 	}
 }
 
