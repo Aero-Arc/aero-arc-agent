@@ -24,6 +24,7 @@ type mavlinkTarget struct {
 	systemID          uint8
 	componentID       uint8
 	heartbeatSequence uint64
+	armed             bool
 }
 
 type mavlinkCommandAck struct {
@@ -37,6 +38,7 @@ type pendingMAVLinkCommand struct {
 	componentID      uint8
 	command          common.MAV_CMD
 	desiredArmed     bool
+	armedAtSend      bool
 	heartbeatAtSend  uint64
 	sent             bool
 	acks             chan mavlinkCommandAck
@@ -63,7 +65,7 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	sequence := a.mavlinkHeartbeatSeq
 	a.mavlinkTarget = &mavlinkTarget{
 		channel: channel, systemID: systemID, componentID: componentID,
-		heartbeatSequence: sequence,
+		heartbeatSequence: sequence, armed: armed,
 	}
 	pending := a.pendingMAVLinkCommand
 	var stateChanges chan bool
@@ -186,6 +188,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 		systemID: target.systemID, componentID: target.componentID,
 		command:          common.MAV_CMD_COMPONENT_ARM_DISARM,
 		desiredArmed:     desiredArmed,
+		armedAtSend:      target.armed,
 		heartbeatAtSend:  target.heartbeatSequence,
 		acks:             make(chan mavlinkCommandAck, 4),
 		armedStateChange: make(chan bool, 4),
@@ -193,7 +196,8 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	// Process startup and any uncertain write or timeout fence COMMAND_ACK for
 	// this MAV_CMD: an ACK buffered across either boundary cannot be identified
 	// as stale. Keep this Agent lifecycle in heartbeat-verification mode so only
-	// a fresh observation of the requested armed state completes later commands.
+	// a fresh observation of the requested armed state positively completes later
+	// commands; an explicit negative acknowledgement still fails closed.
 	stateVerificationRequired := a.aircraftAckAmbiguous
 	a.pendingMAVLinkCommand = pending
 	a.mavlinkMu.Unlock()
@@ -242,6 +246,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	oppositeStateObserved := pending.armedAtSend != pending.desiredArmed
 	for {
 		select {
 		case ack := <-pending.acks:
@@ -250,19 +255,28 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 				slog.String("aircraft_id", command.GetAircraftId()),
 				slog.String("mavlink_result", ack.result.String()),
 			)
-			if ack.result == common.MAV_RESULT_IN_PROGRESS || stateVerificationRequired {
+			if ack.result == common.MAV_RESULT_IN_PROGRESS {
 				continue
 			}
-			if ack.result == common.MAV_RESULT_ACCEPTED {
+			if ack.result != common.MAV_RESULT_ACCEPTED {
+				result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
+				result.Message = "autopilot rejected command: " + ack.result.String()
+				return result
+			}
+			if !stateVerificationRequired {
 				result.Status = agentv1.AircraftCommandResult_STATUS_ACCEPTED
 				result.Message = "autopilot acknowledged command"
 				return result
 			}
-			result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
-			result.Message = "autopilot rejected command: " + ack.result.String()
-			return result
 		case armed := <-pending.armedStateChange:
-			if stateVerificationRequired && armed == pending.desiredArmed {
+			if !stateVerificationRequired {
+				continue
+			}
+			if armed != pending.desiredArmed {
+				oppositeStateObserved = true
+				continue
+			}
+			if oppositeStateObserved {
 				result.Status = agentv1.AircraftCommandResult_STATUS_ACCEPTED
 				result.Message = "aircraft state confirmed by a fresh heartbeat across an ambiguous acknowledgement boundary"
 				return result

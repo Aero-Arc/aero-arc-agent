@@ -144,6 +144,7 @@ func TestAircraftCommandDoesNotCorrelateLateAckAfterTimeout(t *testing.T) {
 	if first.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
 		t.Fatalf("first result = %+v, want timeout", first)
 	}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
 
 	agent.options.AircraftCommandTimeout = 200 * time.Millisecond
 	result := make(chan *agentv1.AircraftCommandResult, 1)
@@ -181,7 +182,7 @@ func TestFirstAircraftCommandAfterStartDoesNotCorrelateBufferedAck(t *testing.T)
 	channel := &gomavlib.Channel{}
 	agent.mavlinkHeartbeatSeq = 1
 	agent.mavlinkTarget = &mavlinkTarget{
-		channel: channel, systemID: 1, componentID: 1, heartbeatSequence: 1,
+		channel: channel, systemID: 1, componentID: 1, heartbeatSequence: 1, armed: true,
 	}
 	written := make(chan struct{})
 	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
@@ -213,6 +214,68 @@ func TestFirstAircraftCommandAfterStartDoesNotCorrelateBufferedAck(t *testing.T)
 	got := <-result
 	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED || !strings.Contains(got.GetMessage(), "fresh heartbeat") {
 		t.Fatalf("state-confirmed post-restart DISARM result = %+v", got)
+	}
+}
+
+func TestAircraftCommandFenceDoesNotPromoteRejectedCommandFromMatchingState(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.mavlinkTarget = &mavlinkTarget{channel: channel, systemID: 1, componentID: 1}
+	written := make(chan struct{})
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		close(written)
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "denied-disarm-after-restart", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+		})
+	}()
+	<-written
+	agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+		Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+		Result:  common.MAV_RESULT_DENIED,
+	})
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	got := <-result
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_REJECTED || !strings.Contains(got.GetMessage(), common.MAV_RESULT_DENIED.String()) {
+		t.Fatalf("denied state-matching command result = %+v", got)
+	}
+}
+
+func TestAircraftCommandFenceRequiresObservedTransitionFromMatchingState(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 60 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.mavlinkTarget = &mavlinkTarget{channel: channel, systemID: 1, componentID: 1, armed: false}
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:  common.MAV_RESULT_ACCEPTED,
+		})
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "already-disarmed-after-restart", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+		})
+	}()
+	time.Sleep(10 * time.Millisecond)
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	got := <-result
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
+		t.Fatalf("state-matching command without an observed transition = %+v, want timeout", got)
 	}
 }
 
