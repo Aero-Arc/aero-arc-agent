@@ -183,6 +183,9 @@ func TestWALGenerationRotationStampsLegacyFramesBeforeChangingGeneration(t *test
 	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = 1`, legacyPayload); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_identity_migration`); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +218,7 @@ func TestWALGenerationRotationStampsLegacyFramesBeforeChangingGeneration(t *test
 	}
 }
 
-func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
+func TestWALGenerationMigrationCommitsBatchesAndResumesAfterFailure(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "legacy-backlog.db")
 	w, err := New(ctx, dbPath, 0, 0)
@@ -223,7 +226,7 @@ func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousGeneration := w.GenerationID()
-	frameCount := legacyFrameMigrationBatchSize + 1
+	frameCount := legacyFrameMigrationBatchSize + 2
 	for i := 0; i < frameCount; i++ {
 		if _, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte{byte(i)}}); err != nil {
 			t.Fatal(err)
@@ -234,6 +237,9 @@ func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ?`, legacyPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_identity_migration`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, []byte{0xff}, frameCount); err != nil {
@@ -258,6 +264,16 @@ func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
 	if generationAfterFailure != previousGeneration {
 		t.Fatalf("generation after rollback = %q, want %q", generationAfterFailure, previousGeneration)
 	}
+	var migrationGeneration string
+	var lastSeq, completed int64
+	if err := db.QueryRowContext(ctx, `SELECT legacy_generation_id, last_seq, completed
+		FROM wal_identity_migration WHERE id = 1`).Scan(&migrationGeneration, &lastSeq, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if migrationGeneration != previousGeneration || lastSeq != legacyFrameMigrationBatchSize || completed != 0 {
+		t.Fatalf("migration state after interruption = (%q, %d, %d), want (%q, %d, 0)",
+			migrationGeneration, lastSeq, completed, previousGeneration, legacyFrameMigrationBatchSize)
+	}
 	var firstPayload []byte
 	if err := db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = 1`).Scan(&firstPayload); err != nil {
 		t.Fatal(err)
@@ -266,8 +282,19 @@ func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
 	if err := proto.Unmarshal(firstPayload, &firstFrame); err != nil {
 		t.Fatal(err)
 	}
-	if firstFrame.GetWalId() != "" {
-		t.Fatalf("first batch committed before later failure; WAL ID = %q", firstFrame.GetWalId())
+	if firstFrame.GetWalId() != previousGeneration {
+		t.Fatalf("committed first-batch WAL ID = %q, want %q", firstFrame.GetWalId(), previousGeneration)
+	}
+	var rolledBackPayload []byte
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = ?`, legacyFrameMigrationBatchSize+1).Scan(&rolledBackPayload); err != nil {
+		t.Fatal(err)
+	}
+	var rolledBackFrame agentv1.TelemetryFrame
+	if err := proto.Unmarshal(rolledBackPayload, &rolledBackFrame); err != nil {
+		t.Fatal(err)
+	}
+	if rolledBackFrame.GetWalId() != "" {
+		t.Fatalf("failed second batch retained WAL ID %q, want rollback", rolledBackFrame.GetWalId())
 	}
 	if _, err := db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, legacyPayload, frameCount); err != nil {
 		t.Fatal(err)
@@ -292,6 +319,14 @@ func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
 	if len(entries) != frameCount {
 		t.Fatalf("migrated entries = %d, want %d", len(entries), frameCount)
 	}
+	if err := migrated.db.QueryRowContext(ctx, `SELECT legacy_generation_id, last_seq, completed
+		FROM wal_identity_migration WHERE id = 1`).Scan(&migrationGeneration, &lastSeq, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if migrationGeneration != previousGeneration || lastSeq != int64(frameCount) || completed != 1 {
+		t.Fatalf("completed migration state = (%q, %d, %d), want (%q, %d, 1)",
+			migrationGeneration, lastSeq, completed, previousGeneration, frameCount)
+	}
 	for _, entry := range entries {
 		var frame agentv1.TelemetryFrame
 		if err := proto.Unmarshal(entry.Payload, &frame); err != nil {
@@ -300,6 +335,93 @@ func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
 		if frame.GetWalId() != previousGeneration {
 			t.Fatalf("frame %d WAL ID = %q, want %q", entry.ID, frame.GetWalId(), previousGeneration)
 		}
+	}
+}
+
+func TestWALGenerationMigrationCompletionSkipsPayloadRescan(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "completed-migration.db")
+	w, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousGeneration := w.GenerationID()
+	if _, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("will-corrupt")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = 1`, []byte{0xff}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatalf("completed migration rescanned payloads: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if reopened.GenerationID() == previousGeneration {
+		t.Fatalf("reopened WAL reused generation ID %q", previousGeneration)
+	}
+}
+
+func TestWALGenerationMigrationInitializesLegacyDatabaseWithoutMetadata(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "pre-metadata.db")
+	w, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("legacy")}); err != nil {
+		t.Fatal(err)
+	}
+	legacyPayload, err := proto.Marshal(&agentv1.TelemetryFrame{RawMavlink: []byte("legacy")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ?`, legacyPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_identity_migration`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_metadata`); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := migrated.Close(); err != nil {
+			t.Errorf("close migrated WAL: %v", err)
+		}
+	})
+	entries, err := migrated.ReadUndelivered(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("migrated entries = %d, want 1", len(entries))
+	}
+	var frame agentv1.TelemetryFrame
+	if err := proto.Unmarshal(entries[0].Payload, &frame); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uuid.Parse(frame.GetWalId()); err != nil {
+		t.Fatalf("legacy frame WAL ID %q is not a UUID: %v", frame.GetWalId(), err)
+	}
+	if frame.GetWalId() == migrated.GenerationID() {
+		t.Fatalf("legacy migration generation %q reused current append generation", frame.GetWalId())
 	}
 }
 

@@ -159,6 +159,12 @@ func initDB(db *sql.DB) error {
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		generation_id TEXT NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS wal_identity_migration (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		legacy_generation_id TEXT NOT NULL,
+		last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+		completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
+	);
 	`
 	_, err := db.Exec(query)
 	if err != nil {
@@ -178,6 +184,195 @@ func initDB(db *sql.DB) error {
 }
 
 func startGenerationID(ctx context.Context, db *sql.DB) (string, error) {
+	state, err := loadOrCreateLegacyMigration(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	for !state.completed {
+		state, err = migrateLegacyFrameBatch(ctx, db, state.generationID)
+		if err != nil {
+			return "", err
+		}
+	}
+	return rotateGenerationID(ctx, db)
+}
+
+type legacyMigrationState struct {
+	generationID string
+	lastSeq      int64
+	completed    bool
+}
+
+// loadOrCreateLegacyMigration durably selects the one generation used for all
+// pre-wal_id rows before any payload batches are rewritten.
+func loadOrCreateLegacyMigration(ctx context.Context, db *sql.DB) (legacyMigrationState, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("begin WAL identity migration setup: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	state, found, err := loadLegacyMigrationState(ctx, tx)
+	if err != nil {
+		return legacyMigrationState{}, err
+	}
+	if found {
+		var currentGenerationID string
+		if err := tx.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&currentGenerationID); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("load current WAL generation identity: %w", err)
+		}
+		if _, err := uuid.Parse(currentGenerationID); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("load current WAL generation identity: invalid UUID %q: %w", currentGenerationID, err)
+		}
+		if !state.completed && currentGenerationID != state.generationID {
+			return legacyMigrationState{}, fmt.Errorf("incomplete WAL identity migration generation %q does not match current generation %q", state.generationID, currentGenerationID)
+		}
+		return state, nil
+	}
+
+	var generationID string
+	err = tx.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&generationID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return legacyMigrationState{}, fmt.Errorf("load WAL generation for identity migration: %w", err)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		generationID = uuid.NewString()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO wal_metadata(id, generation_id) VALUES(1, ?)`, generationID); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("initialize WAL generation for identity migration: %w", err)
+		}
+	} else if _, err := uuid.Parse(generationID); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("load WAL generation for identity migration: invalid UUID %q: %w", generationID, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO wal_identity_migration(
+		id, legacy_generation_id, last_seq, completed) VALUES(1, ?, 0, 0)`, generationID); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("initialize WAL identity migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("commit WAL identity migration setup: %w", err)
+	}
+	return legacyMigrationState{generationID: generationID}, nil
+}
+
+func loadLegacyMigrationState(ctx context.Context, tx *sql.Tx) (legacyMigrationState, bool, error) {
+	var state legacyMigrationState
+	var completed int
+	err := tx.QueryRowContext(ctx, `SELECT legacy_generation_id, last_seq, completed
+		FROM wal_identity_migration WHERE id = 1`).Scan(&state.generationID, &state.lastSeq, &completed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return legacyMigrationState{}, false, nil
+	}
+	if err != nil {
+		return legacyMigrationState{}, false, fmt.Errorf("load WAL identity migration: %w", err)
+	}
+	if _, err := uuid.Parse(state.generationID); err != nil {
+		return legacyMigrationState{}, false, fmt.Errorf("load WAL identity migration: invalid UUID %q: %w", state.generationID, err)
+	}
+	if state.lastSeq < 0 || (completed != 0 && completed != 1) {
+		return legacyMigrationState{}, false, fmt.Errorf("load WAL identity migration: invalid progress last_seq=%d completed=%d", state.lastSeq, completed)
+	}
+	state.completed = completed == 1
+	return state, true, nil
+}
+
+// migrateLegacyFrameBatch commits at most one bounded payload batch together
+// with its cursor, allowing a later startup to resume without repeating it.
+func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID string) (legacyMigrationState, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("begin WAL identity migration batch: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	state, found, err := loadLegacyMigrationState(ctx, tx)
+	if err != nil {
+		return legacyMigrationState{}, err
+	}
+	if !found {
+		return legacyMigrationState{}, errors.New("WAL identity migration state is missing")
+	}
+	if state.generationID != generationID {
+		return legacyMigrationState{}, fmt.Errorf("WAL identity migration generation changed from %q to %q", generationID, state.generationID)
+	}
+	if state.completed {
+		return state, nil
+	}
+
+	type update struct {
+		seq     int64
+		payload []byte
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT seq, payload
+		FROM telemetry_frames
+		WHERE seq > ?
+		ORDER BY seq
+		LIMIT ?`, state.lastSeq, legacyFrameMigrationBatchSize)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("query legacy WAL frames after sequence %d: %w", state.lastSeq, err)
+	}
+
+	updates := make([]update, 0, legacyFrameMigrationBatchSize)
+	scanned := 0
+	for rows.Next() {
+		var seq int64
+		var payload []byte
+		if err := rows.Scan(&seq, &payload); err != nil {
+			return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("scan legacy WAL frame: %w", err))
+		}
+		scanned++
+		state.lastSeq = seq
+
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(payload, &frame); err != nil {
+			return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("unmarshal legacy WAL frame %d: %w", seq, err))
+		}
+		if frame.GetWalId() != "" {
+			continue
+		}
+		frame.WalId = generationID
+		encoded, err := proto.Marshal(&frame)
+		if err != nil {
+			return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("marshal legacy WAL frame %d: %w", seq, err))
+		}
+		updates = append(updates, update{seq: seq, payload: encoded})
+	}
+	if err := rows.Err(); err != nil {
+		return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("iterate legacy WAL frames: %w", err))
+	}
+	if err := closeLegacyRows(rows, nil); err != nil {
+		return legacyMigrationState{}, err
+	}
+
+	for _, item := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, item.payload, item.seq); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("stamp legacy WAL frame %d: %w", item.seq, err)
+		}
+	}
+	state.completed = scanned < legacyFrameMigrationBatchSize
+	result, err := tx.ExecContext(ctx, `UPDATE wal_identity_migration
+		SET last_seq = ?, completed = ? WHERE id = 1`, state.lastSeq, state.completed)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("persist WAL identity migration progress: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("inspect WAL identity migration progress: %w", err)
+	} else if rows != 1 {
+		return legacyMigrationState{}, fmt.Errorf("persist WAL identity migration progress: updated %d rows, want 1", rows)
+	}
+	if err := tx.Commit(); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("commit WAL identity migration batch: %w", err)
+	}
+	return state, nil
+}
+
+// rotateGenerationID advances the append epoch only after legacy migration is
+// durably complete, so an interrupted migration continues using one identity.
+func rotateGenerationID(ctx context.Context, db *sql.DB) (string, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("begin WAL generation rotation: %w", err)
@@ -186,94 +381,27 @@ func startGenerationID(ctx context.Context, db *sql.DB) (string, error) {
 		_ = tx.Rollback()
 	}()
 
-	var previousID string
-	err = tx.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&previousID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("load previous WAL generation identity: %w", err)
-	}
-	if err == nil {
-		if _, parseErr := uuid.Parse(previousID); parseErr != nil {
-			return "", fmt.Errorf("load previous WAL generation identity: invalid UUID %q: %w", previousID, parseErr)
-		}
-	}
-
-	nextID := uuid.NewString()
-	legacyID := nextID
-	if previousID != "" {
-		legacyID = previousID
-	}
-	if err := stampLegacyFrames(ctx, tx, legacyID); err != nil {
+	state, found, err := loadLegacyMigrationState(ctx, tx)
+	if err != nil {
 		return "", err
 	}
-
-	if _, err := tx.ExecContext(ctx, `INSERT INTO wal_metadata(id, generation_id) VALUES(1, ?)
-		ON CONFLICT(id) DO UPDATE SET generation_id = excluded.generation_id`, nextID); err != nil {
+	if !found || !state.completed {
+		return "", errors.New("cannot rotate WAL generation before identity migration completes")
+	}
+	nextID := uuid.NewString()
+	result, err := tx.ExecContext(ctx, `UPDATE wal_metadata SET generation_id = ? WHERE id = 1`, nextID)
+	if err != nil {
 		return "", fmt.Errorf("rotate WAL generation identity: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return "", fmt.Errorf("inspect WAL generation rotation: %w", err)
+	} else if rows != 1 {
+		return "", fmt.Errorf("rotate WAL generation identity: updated %d rows, want 1", rows)
 	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("commit WAL generation rotation: %w", err)
 	}
 	return nextID, nil
-}
-
-func stampLegacyFrames(ctx context.Context, tx *sql.Tx, generationID string) error {
-	type update struct {
-		seq     int64
-		payload []byte
-	}
-
-	var cursor int64
-	for {
-		rows, err := tx.QueryContext(ctx, `SELECT seq, payload
-			FROM telemetry_frames
-			WHERE seq > ?
-			ORDER BY seq
-			LIMIT ?`, cursor, legacyFrameMigrationBatchSize)
-		if err != nil {
-			return fmt.Errorf("query legacy WAL frames after sequence %d: %w", cursor, err)
-		}
-
-		updates := make([]update, 0, legacyFrameMigrationBatchSize)
-		scanned := 0
-		for rows.Next() {
-			var seq int64
-			var payload []byte
-			if err := rows.Scan(&seq, &payload); err != nil {
-				return closeLegacyRows(rows, fmt.Errorf("scan legacy WAL frame: %w", err))
-			}
-			scanned++
-			cursor = seq
-
-			var frame agentv1.TelemetryFrame
-			if err := proto.Unmarshal(payload, &frame); err != nil {
-				return closeLegacyRows(rows, fmt.Errorf("unmarshal legacy WAL frame %d: %w", seq, err))
-			}
-			if frame.GetWalId() != "" {
-				continue
-			}
-			frame.WalId = generationID
-			encoded, err := proto.Marshal(&frame)
-			if err != nil {
-				return closeLegacyRows(rows, fmt.Errorf("marshal legacy WAL frame %d: %w", seq, err))
-			}
-			updates = append(updates, update{seq: seq, payload: encoded})
-		}
-		if err := rows.Err(); err != nil {
-			return closeLegacyRows(rows, fmt.Errorf("iterate legacy WAL frames: %w", err))
-		}
-		if err := closeLegacyRows(rows, nil); err != nil {
-			return err
-		}
-
-		for _, item := range updates {
-			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, item.payload, item.seq); err != nil {
-				return fmt.Errorf("stamp legacy WAL frame %d: %w", item.seq, err)
-			}
-		}
-		if scanned < legacyFrameMigrationBatchSize {
-			return nil
-		}
-	}
 }
 
 func closeLegacyRows(rows *sql.Rows, cause error) error {
