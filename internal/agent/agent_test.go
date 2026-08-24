@@ -25,8 +25,9 @@ func TestMAVLinkControlEvidenceBypassesBlockedTelemetryPersistence(t *testing.T)
 	channel := &gomavlib.Channel{}
 	pending := &pendingMAVLinkCommand{
 		channel: channel, systemID: 1, componentID: 1,
-		command: common.MAV_CMD_COMPONENT_ARM_DISARM,
-		acks:    make(chan mavlinkCommandAck, 1),
+		command:         common.MAV_CMD_COMPONENT_ARM_DISARM,
+		enqueueComplete: true,
+		acks:            make(chan mavlinkCommandAck, 1),
 	}
 	persistStarted := make(chan struct{})
 	persistRelease := make(chan struct{})

@@ -43,8 +43,11 @@ type pendingMAVLinkCommand struct {
 	armedAtEnqueue     bool
 	heartbeatAtEnqueue uint64
 	enqueueComplete    bool
-	acks               chan mavlinkCommandAck
-	armedStateChange   chan bool
+	// stateVerificationRequired can be raised by stale ACK activity observed
+	// before the gomavlib handoff boundary.
+	stateVerificationRequired bool
+	acks                      chan mavlinkCommandAck
+	armedStateChange          chan bool
 }
 
 type preparedAircraftCommand struct {
@@ -112,6 +115,21 @@ func (a *Agent) observeMAVLinkCommandAck(channel *gomavlib.Channel, systemID, co
 	}
 	a.mavlinkMu.Lock()
 	pending := a.pendingMAVLinkCommand
+	matchesPending := pending != nil && pending.channel == channel && pending.command == ack.Command &&
+		pending.systemID == systemID && pending.componentID == componentID &&
+		(ack.TargetSystem == 0 || ack.TargetSystem == mavlinkSourceSystemID) &&
+		(ack.TargetComponent == 0 || ack.TargetComponent == mavlinkSourceComponentID)
+	if matchesPending && !pending.enqueueComplete {
+		// A COMMAND_ACK observed before WriteMessageTo returns predates the
+		// command's gomavlib handoff boundary. It cannot be correlated to this
+		// attempt. Discard it and require state verification for any later ACK;
+		// its presence proves the shared ARM/DISARM ACK domain was not quiescent.
+		a.aircraftAckAmbiguous = true
+		a.aircraftAckAmbiguousSince = time.Now()
+		pending.stateVerificationRequired = true
+		a.mavlinkMu.Unlock()
+		return
+	}
 	if ack.Command == common.MAV_CMD_COMPONENT_ARM_DISARM && a.aircraftAckAmbiguous &&
 		a.mavlinkTarget != nil && a.mavlinkTarget.channel == channel &&
 		a.mavlinkTarget.systemID == systemID && a.mavlinkTarget.componentID == componentID &&
@@ -119,9 +137,7 @@ func (a *Agent) observeMAVLinkCommandAck(channel *gomavlib.Channel, systemID, co
 		(ack.TargetComponent == 0 || ack.TargetComponent == mavlinkSourceComponentID) {
 		a.aircraftAckAmbiguousSince = time.Now()
 	}
-	if pending == nil || pending.channel != channel || pending.command != ack.Command || pending.systemID != systemID || pending.componentID != componentID ||
-		(ack.TargetSystem != 0 && ack.TargetSystem != mavlinkSourceSystemID) ||
-		(ack.TargetComponent != 0 && ack.TargetComponent != mavlinkSourceComponentID) {
+	if !matchesPending {
 		a.mavlinkMu.Unlock()
 		return
 	}
@@ -317,7 +333,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		a.aircraftAckAmbiguous = false
 		a.aircraftAckAmbiguousSince = time.Time{}
 	}
-	stateVerificationRequired := a.aircraftAckAmbiguous
+	pending.stateVerificationRequired = a.aircraftAckAmbiguous
 	a.pendingMAVLinkCommand = pending
 	a.mavlinkMu.Unlock()
 	defer func() {
@@ -364,6 +380,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		// physical channel I/O. COMMAND_ACK remains the transmission evidence.
 		pending.enqueueComplete = true
 	}
+	stateVerificationRequired := pending.stateVerificationRequired
 	a.mavlinkMu.Unlock()
 	// ARM and DISARM share one MAV_CMD and carry no request nonce. Once this
 	// command is handed to gomavlib, any duplicate or delayed terminal ACK can
