@@ -34,6 +34,11 @@ type mavlinkCommandAck struct {
 	result      common.MAV_RESULT
 }
 
+type mavlinkArmedStateEvidence struct {
+	armed            bool
+	oppositeObserved bool
+}
+
 type pendingMAVLinkCommand struct {
 	channel            *gomavlib.Channel
 	systemID           uint8
@@ -46,8 +51,9 @@ type pendingMAVLinkCommand struct {
 	// stateVerificationRequired can be raised by stale ACK activity observed
 	// before the gomavlib handoff boundary.
 	stateVerificationRequired bool
+	oppositeStateObserved     bool
 	acks                      chan mavlinkCommandAck
-	armedStateChange          chan bool
+	armedStateChange          chan mavlinkArmedStateEvidence
 }
 
 type preparedAircraftCommand struct {
@@ -91,12 +97,19 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 		heartbeatSequence: sequence, armed: armed,
 	}
 	pending := a.pendingMAVLinkCommand
-	var stateChanges chan bool
+	var stateChanges chan mavlinkArmedStateEvidence
+	var stateEvidence mavlinkArmedStateEvidence
 	if pending != nil && pending.channel == channel && pending.systemID == systemID && pending.componentID == componentID {
 		if !pending.enqueueComplete {
 			pending.armedAtEnqueue = armed
 		} else if sequence > pending.heartbeatAtEnqueue {
+			if armed != pending.desiredArmed {
+				pending.oppositeStateObserved = true
+			}
 			stateChanges = pending.armedStateChange
+			stateEvidence = mavlinkArmedStateEvidence{
+				armed: armed, oppositeObserved: pending.oppositeStateObserved,
+			}
 		}
 	}
 	a.mavlinkMu.Unlock()
@@ -104,8 +117,18 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 		return
 	}
 	select {
-	case stateChanges <- armed:
+	case stateChanges <- stateEvidence:
 	default:
+		// Coalesce to the latest vehicle state without losing the fact that an
+		// opposite state occurred earlier in this command epoch.
+		select {
+		case <-stateChanges:
+		default:
+		}
+		select {
+		case stateChanges <- stateEvidence:
+		default:
+		}
 	}
 }
 
@@ -320,7 +343,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		armedAtEnqueue:     target.armed,
 		heartbeatAtEnqueue: target.heartbeatSequence,
 		acks:               make(chan mavlinkCommandAck, 1),
-		armedStateChange:   make(chan bool, 4),
+		armedStateChange:   make(chan mavlinkArmedStateEvidence, 1),
 	}
 	// Process startup and any uncertain write or timeout fence COMMAND_ACK for
 	// this MAV_CMD: an ACK buffered across either boundary cannot be identified
@@ -426,12 +449,14 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 				result.Message = "accepted acknowledgement and fresh aircraft state transition confirmed command"
 				return result
 			}
-		case armed := <-pending.armedStateChange:
+		case state := <-pending.armedStateChange:
 			if !stateVerificationRequired {
 				continue
 			}
-			if armed != pending.desiredArmed {
+			if state.oppositeObserved {
 				oppositeStateObserved = true
+			}
+			if state.armed != pending.desiredArmed {
 				continue
 			}
 			if oppositeStateObserved {

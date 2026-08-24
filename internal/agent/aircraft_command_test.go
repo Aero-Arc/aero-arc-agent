@@ -87,6 +87,33 @@ func TestAircraftCommandProgressBurstPreservesTerminalACK(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandStateEvidenceCoalescesLatestTransition(t *testing.T) {
+	channel := &gomavlib.Channel{}
+	pending := &pendingMAVLinkCommand{
+		channel: channel, systemID: 1, componentID: 1,
+		desiredArmed:     true,
+		enqueueComplete:  true,
+		armedStateChange: make(chan mavlinkArmedStateEvidence, 1),
+	}
+	agent := &Agent{
+		mavlinkTarget:         &mavlinkTarget{channel: channel, systemID: 1, componentID: 1},
+		pendingMAVLinkCommand: pending,
+	}
+	for range 4 {
+		agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+
+	select {
+	case state := <-pending.armedStateChange:
+		if !state.armed || !state.oppositeObserved {
+			t.Fatalf("coalesced state = %+v, want latest armed state with prior opposite evidence", state)
+		}
+	default:
+		t.Fatal("state coalescing lost the decisive transition")
+	}
+}
+
 func TestAircraftCommandRejectsACKBeforeEnqueueBoundary(t *testing.T) {
 	channel := &gomavlib.Channel{}
 	agent := &Agent{
