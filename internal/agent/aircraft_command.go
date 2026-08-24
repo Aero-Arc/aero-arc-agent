@@ -34,6 +34,7 @@ type mavlinkCommandAck struct {
 }
 
 type pendingMAVLinkCommand struct {
+	channel            *gomavlib.Channel
 	systemID           uint8
 	componentID        uint8
 	command            common.MAV_CMD
@@ -55,7 +56,7 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 			a.observeMAVLinkHeartbeat(frame.Channel, frame.SystemID(), frame.ComponentID(), message.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0)
 		}
 	case *common.MessageCommandAck:
-		a.observeMAVLinkCommandAck(frame.SystemID(), frame.ComponentID(), message)
+		a.observeMAVLinkCommandAck(frame.Channel, frame.SystemID(), frame.ComponentID(), message)
 	}
 }
 
@@ -69,7 +70,7 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	}
 	pending := a.pendingMAVLinkCommand
 	var stateChanges chan bool
-	if pending != nil && pending.systemID == systemID && pending.componentID == componentID {
+	if pending != nil && pending.channel == channel && pending.systemID == systemID && pending.componentID == componentID {
 		if !pending.enqueueComplete {
 			pending.armedAtEnqueue = armed
 		} else if sequence > pending.heartbeatAtEnqueue {
@@ -86,13 +87,13 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	}
 }
 
-func (a *Agent) observeMAVLinkCommandAck(systemID, componentID uint8, ack *common.MessageCommandAck) {
+func (a *Agent) observeMAVLinkCommandAck(channel *gomavlib.Channel, systemID, componentID uint8, ack *common.MessageCommandAck) {
 	if ack == nil {
 		return
 	}
 	a.mavlinkMu.Lock()
 	pending := a.pendingMAVLinkCommand
-	if pending == nil || pending.command != ack.Command || pending.systemID != systemID || pending.componentID != componentID ||
+	if pending == nil || pending.channel != channel || pending.command != ack.Command || pending.systemID != systemID || pending.componentID != componentID ||
 		(ack.TargetSystem != 0 && ack.TargetSystem != mavlinkSourceSystemID) ||
 		(ack.TargetComponent != 0 && ack.TargetComponent != mavlinkSourceComponentID) {
 		a.mavlinkMu.Unlock()
@@ -189,7 +190,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 		return result
 	}
 	pending := &pendingMAVLinkCommand{
-		systemID: target.systemID, componentID: target.componentID,
+		channel: target.channel, systemID: target.systemID, componentID: target.componentID,
 		command:            common.MAV_CMD_COMPONENT_ARM_DISARM,
 		desiredArmed:       desiredArmed,
 		armedAtEnqueue:     target.armed,

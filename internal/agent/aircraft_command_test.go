@@ -34,7 +34,7 @@ func TestAircraftCommandTranslatesArmAndDisarmToMAVLink(t *testing.T) {
 				if command.Command != common.MAV_CMD_COMPONENT_ARM_DISARM || command.TargetSystem != 42 || command.TargetComponent != 1 || command.Param1 != test.wantParam1 {
 					t.Fatalf("MAVLink command = %+v", command)
 				}
-				agent.observeMAVLinkCommandAck(42, 1, &common.MessageCommandAck{
+				agent.observeMAVLinkCommandAck(channel, 42, 1, &common.MessageCommandAck{
 					Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
 					Result:  common.MAV_RESULT_ACCEPTED,
 				})
@@ -66,18 +66,19 @@ func TestAircraftCommandMapsMAVLinkRejection(t *testing.T) {
 }
 
 func TestAircraftCommandIgnoresAckAddressedToAnotherMAVLinkNode(t *testing.T) {
+	channel := &gomavlib.Channel{}
 	agent := &Agent{
 		options:       &AgentOptions{AircraftCommandTimeout: 100 * time.Millisecond},
-		mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1},
+		mavlinkTarget: &mavlinkTarget{channel: channel, systemID: 1, componentID: 1},
 	}
 	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
-		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 			Command:         common.MAV_CMD_COMPONENT_ARM_DISARM,
 			Result:          common.MAV_RESULT_ACCEPTED,
 			TargetSystem:    mavlinkSourceSystemID,
 			TargetComponent: uint8(common.MAV_COMP_ID_MISSIONPLANNER),
 		})
-		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 			Command:         common.MAV_CMD_COMPONENT_ARM_DISARM,
 			Result:          common.MAV_RESULT_DENIED,
 			TargetSystem:    mavlinkSourceSystemID,
@@ -127,7 +128,7 @@ func TestAircraftCommandDoesNotCorrelateLateAckAfterTimeout(t *testing.T) {
 		if writes == 2 {
 			// This ACK belongs to the timed-out ARM, but the wire protocol cannot
 			// distinguish it from the DISARM now in progress.
-			agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+			agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 				Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
 				Result:  common.MAV_RESULT_ACCEPTED,
 			})
@@ -188,7 +189,7 @@ func TestFirstAircraftCommandAfterStartDoesNotCorrelateBufferedAck(t *testing.T)
 	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
 		// Model an accepted ARM ACK left in the transport buffer by the Agent
 		// process that ran before this one. It cannot satisfy the new DISARM.
-		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
 			Result:  common.MAV_RESULT_ACCEPTED,
 		})
@@ -238,7 +239,7 @@ func TestAircraftCommandFenceDoesNotPromoteRejectedCommandFromMatchingState(t *t
 		})
 	}()
 	<-written
-	agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+	agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 		Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
 		Result:  common.MAV_RESULT_DENIED,
 	})
@@ -257,7 +258,7 @@ func TestAircraftCommandFenceRequiresObservedTransitionFromMatchingState(t *test
 	channel := &gomavlib.Channel{}
 	agent.mavlinkTarget = &mavlinkTarget{channel: channel, systemID: 1, componentID: 1, armed: false}
 	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
-		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
 			Result:  common.MAV_RESULT_ACCEPTED,
 		})
@@ -291,7 +292,7 @@ func TestAircraftCommandFenceRefreshesArmedStateAtEnqueueBoundary(t *testing.T) 
 		// progress. That is now the enqueue-boundary baseline, not evidence that
 		// can complete the command.
 		agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
-		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
 			Result:  common.MAV_RESULT_ACCEPTED,
 		})
@@ -341,6 +342,70 @@ func TestAircraftCommandFenceDoesNotAcceptStateTransitionWithoutAck(t *testing.T
 	}
 }
 
+func TestAircraftCommandEvidenceMustMatchSelectedMAVLinkChannel(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		ackOnOther   bool
+		stateOnOther bool
+	}{
+		{name: "acknowledgement", ackOnOther: true},
+		{name: "heartbeat", stateOnOther: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 200 * time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := &gomavlib.Channel{}
+			other := &gomavlib.Channel{}
+			agent.mavlinkTarget = &mavlinkTarget{channel: selected, systemID: 1, componentID: 1, armed: false}
+			written := make(chan struct{})
+			agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+				close(written)
+				return nil
+			}
+
+			result := make(chan *agentv1.AircraftCommandResult, 1)
+			go func() {
+				result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+					CommandId: "arm-channel-bound", AircraftId: "aircraft-1",
+					Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+				})
+			}()
+			<-written
+			ackChannel := selected
+			if test.ackOnOther {
+				ackChannel = other
+			}
+			stateChannel := selected
+			if test.stateOnOther {
+				stateChannel = other
+			}
+			agent.observeMAVLinkCommandAck(ackChannel, 1, 1, &common.MessageCommandAck{
+				Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Result: common.MAV_RESULT_ACCEPTED,
+			})
+			agent.observeMAVLinkHeartbeat(stateChannel, 1, 1, true)
+			select {
+			case got := <-result:
+				t.Fatalf("foreign-channel %s completed command: %+v", test.name, got)
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			if test.ackOnOther {
+				agent.observeMAVLinkCommandAck(selected, 1, 1, &common.MessageCommandAck{
+					Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Result: common.MAV_RESULT_ACCEPTED,
+				})
+			} else {
+				agent.observeMAVLinkHeartbeat(selected, 1, 1, true)
+			}
+			got := <-result
+			if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+				t.Fatalf("selected MAVLink channel result = %+v, want accepted", got)
+			}
+		})
+	}
+}
+
 func TestAircraftCommandFailsWhenMAVLinkUnavailable(t *testing.T) {
 	agent := &Agent{}
 	result := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
@@ -377,12 +442,13 @@ func TestHandleRelayMessageReturnsCorrelatedAircraftCommandResult(t *testing.T) 
 
 func commandTestAgent(t *testing.T, mavlinkResult common.MAV_RESULT) *Agent {
 	t.Helper()
+	channel := &gomavlib.Channel{}
 	agent := &Agent{
 		options:       &AgentOptions{AircraftCommandTimeout: time.Second},
-		mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1},
+		mavlinkTarget: &mavlinkTarget{channel: channel, systemID: 1, componentID: 1},
 	}
 	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
-		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
 			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
 			Result:  mavlinkResult,
 		})
