@@ -357,38 +357,82 @@ func aircraftCommandBusyResult(result *agentv1.AircraftCommandResult) *agentv1.A
 	return result
 }
 
+func (a *Agent) waitForAircraftACKQuiescenceOrTransition(ctx context.Context, desiredArmed bool) bool {
+	pollInterval := a.aircraftCommandTimeout() / 20
+	if pollInterval < time.Millisecond {
+		pollInterval = time.Millisecond
+	} else if pollInterval > 50*time.Millisecond {
+		pollInterval = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		a.mavlinkMu.Lock()
+		target := a.mavlinkTarget
+		ready := target == nil || !a.aircraftAckAmbiguous || target.armed != desiredArmed
+		a.mavlinkMu.Unlock()
+		if ready {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
 func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *preparedAircraftCommand) *agentv1.AircraftCommandResult {
 	command := prepared.command
 	result := prepared.result
 	param1 := prepared.param1
 	desiredArmed := prepared.desiredArmed
+	timeout := a.aircraftCommandTimeout()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	a.mavlinkMu.Lock()
-	target := a.mavlinkTarget
-	if target == nil || target.channel == nil {
+	var target *mavlinkTarget
+	var pending *pendingMAVLinkCommand
+	for {
+		a.mavlinkMu.Lock()
+		target = a.mavlinkTarget
+		if target == nil || target.channel == nil {
+			a.mavlinkMu.Unlock()
+			result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
+			result.Message = "autopilot MAVLink channel is unavailable"
+			return result
+		}
+		if a.aircraftAckAmbiguous && target.armed == desiredArmed {
+			a.mavlinkMu.Unlock()
+			if !a.waitForAircraftACKQuiescenceOrTransition(waitCtx, desiredArmed) {
+				result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
+				result.Message = "timed out waiting for ACK quiescence before an already-satisfied aircraft state command"
+				return result
+			}
+			// Recheck under the same lock used to install the pending matcher. ACK
+			// activity may have re-armed the fence after the waiter woke.
+			continue
+		}
+		pending = &pendingMAVLinkCommand{
+			channel: target.channel, systemID: target.systemID, componentID: target.componentID,
+			command:            common.MAV_CMD_COMPONENT_ARM_DISARM,
+			desiredArmed:       desiredArmed,
+			armedAtEnqueue:     target.armed,
+			heartbeatAtEnqueue: target.heartbeatSequence,
+			acks:               make(chan mavlinkCommandAck, 1),
+			armedStateChange:   make(chan mavlinkArmedStateEvidence, 1),
+		}
+		// Process startup and any uncertain write or timeout fence COMMAND_ACK for
+		// this MAV_CMD: an ACK buffered across either boundary cannot be identified
+		// as stale. Keep this Agent lifecycle in combined ACK/state-verification mode:
+		// positive completion requires both an accepted acknowledgement and a fresh
+		// armed-state transition, while an ambiguous negative acknowledgement cannot
+		// terminate the current command.
+		pending.stateVerificationRequired = a.aircraftAckAmbiguous
+		a.pendingMAVLinkCommand = pending
 		a.mavlinkMu.Unlock()
-		result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
-		result.Message = "autopilot MAVLink channel is unavailable"
-		return result
+		break
 	}
-	pending := &pendingMAVLinkCommand{
-		channel: target.channel, systemID: target.systemID, componentID: target.componentID,
-		command:            common.MAV_CMD_COMPONENT_ARM_DISARM,
-		desiredArmed:       desiredArmed,
-		armedAtEnqueue:     target.armed,
-		heartbeatAtEnqueue: target.heartbeatSequence,
-		acks:               make(chan mavlinkCommandAck, 1),
-		armedStateChange:   make(chan mavlinkArmedStateEvidence, 1),
-	}
-	// Process startup and any uncertain write or timeout fence COMMAND_ACK for
-	// this MAV_CMD: an ACK buffered across either boundary cannot be identified
-	// as stale. Keep this Agent lifecycle in combined ACK/state-verification mode:
-	// positive completion requires both an accepted acknowledgement and a fresh
-	// armed-state transition, while an ambiguous negative acknowledgement cannot
-	// terminate the current command.
-	pending.stateVerificationRequired = a.aircraftAckAmbiguous
-	a.pendingMAVLinkCommand = pending
-	a.mavlinkMu.Unlock()
 	defer func() {
 		a.mavlinkMu.Lock()
 		if a.pendingMAVLinkCommand == pending {
@@ -439,9 +483,6 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 	// collide with the next command, so every outcome starts a fresh quiet epoch.
 	defer a.rearmAircraftACKFence()
 
-	timeout := a.aircraftCommandTimeout()
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	oppositeStateObserved := pending.armedAtEnqueue != pending.desiredArmed
 	acceptedAckObserved := false
 	stateTransitionObserved := false

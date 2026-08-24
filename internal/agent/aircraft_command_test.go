@@ -517,8 +517,8 @@ func TestAircraftCommandFenceDoesNotLetAmbiguousRejectionTerminateCommand(t *tes
 	result := make(chan *agentv1.AircraftCommandResult, 1)
 	go func() {
 		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
-			CommandId: "denied-disarm-after-restart", AircraftId: "aircraft-1",
-			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+			CommandId: "denied-arm-after-restart", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
 		})
 	}()
 	<-written
@@ -710,6 +710,56 @@ func TestAircraftCommandFenceRequiresObservedTransitionFromMatchingState(t *test
 	got := <-result
 	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
 		t.Fatalf("state-matching command without an observed transition = %+v, want timeout", got)
+	}
+}
+
+func TestAircraftCommandAlreadySatisfiedWaitsForEventQuiescence(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+	written := make(chan struct{})
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		close(written)
+		afterAircraftCommandEnqueue(agent, func() {
+			agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+				Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+				Result:  common.MAV_RESULT_ACCEPTED,
+			})
+		})
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "already-armed-after-restart", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+		})
+	}()
+	select {
+	case <-written:
+		t.Fatal("already-satisfied command was sent before ACK quiescence")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Simulate a full continuously processed quiet epoch, then deliver its next
+	// target heartbeat to let command admission observe the cleared fence.
+	agent.mavlinkMu.Lock()
+	agent.aircraftAckAmbiguousSince = time.Now().Add(-agent.aircraftCommandTimeout())
+	agent.aircraftAckLastProgressAt = time.Now()
+	agent.mavlinkMu.Unlock()
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("already-satisfied command did not send after event-backed quiescence")
+	}
+	got := <-result
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+		t.Fatalf("post-quiescence no-op result = %+v, want accepted", got)
 	}
 }
 
