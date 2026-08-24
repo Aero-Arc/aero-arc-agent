@@ -119,6 +119,9 @@ The agent performs three key tasks:
   not accepted into the WAL: the Agent increments `dropped_total` and emits
   exponentially rate-limited `telemetry_persistence_queue_full` errors. This
   explicit overload policy keeps memory bounded and command handling live.
+  Graceful shutdown closes and drains this pre-WAL queue before WAL shutdown;
+  frames that still cannot be accepted by the bounded drain deadline are also
+  included in `dropped_total` and logged.
 - Malformed legacy rows and spool files are quarantined so their bytes and
   diagnostics remain available without blocking later valid telemetry.
 

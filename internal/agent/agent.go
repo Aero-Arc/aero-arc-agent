@@ -48,6 +48,7 @@ type Agent struct {
 	sleepWithBack  func(ctx context.Context, d time.Duration) bool
 	closeWALFn     func(ctx context.Context) error
 	closeMAVLinkFn func(ctx context.Context)
+	mavlinkDone    chan struct{}
 
 	stateMu          sync.RWMutex
 	sessionID        string
@@ -68,6 +69,7 @@ type Agent struct {
 	aircraftCommandActive     bool
 	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
 	appendTelemetryFrame      func(context.Context, *agentv1.TelemetryFrame) error
+	telemetryDrainTimeout     time.Duration
 
 	ingestCount        atomic.Uint64
 	sendCount          atomic.Uint64
@@ -210,9 +212,11 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 	}(ctx)
 
 	// Run MAVLink loop
+	a.mavlinkDone = make(chan struct{})
 	a.wg.Add(1)
 	go func(ctx context.Context) {
 		defer a.wg.Done()
+		defer close(a.mavlinkDone)
 		a.runMAVLink(ctx)
 	}(ctx)
 
@@ -235,6 +239,16 @@ func (a *Agent) shutdown(ctx context.Context) error {
 		slog.Info("shutting down grpc connection")
 		if err := a.conn.Close(); err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close gRPC connection: %w", err))
+		}
+	}
+
+	// Let the MAVLink reader close and drain its bounded pre-WAL queue before
+	// closing the WAL. Parent cancellation stops new ingest; runMAVLinkEvents
+	// bounds the actual drain and accounts for anything it cannot append.
+	if a.mavlinkDone != nil {
+		select {
+		case <-a.mavlinkDone:
+		case <-ctx.Done():
 		}
 	}
 
@@ -321,15 +335,25 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 		queueSize = a.options.EventQueueSize
 	}
 	telemetryQueue := make(chan *agentv1.TelemetryFrame, queueSize)
-	persistCtx, cancelPersist := context.WithCancel(ctx)
+	// Persistence owns a bounded graceful-drain context independent of the
+	// event-reader context. Start.shutdown waits for this worker before closing
+	// the WAL, allowing already-queued telemetry to reach its durable queue.
+	persistCtx, cancelPersist := context.WithCancel(context.Background())
 	persistDone := make(chan struct{})
 	go func() {
 		defer close(persistDone)
 		a.runTelemetryPersistence(persistCtx, telemetryQueue)
 	}()
 	defer func() {
-		cancelPersist()
+		close(telemetryQueue)
+		drainTimeout := 5 * time.Second
+		if a.telemetryDrainTimeout > 0 {
+			drainTimeout = a.telemetryDrainTimeout
+		}
+		forceStop := time.AfterFunc(drainTimeout, cancelPersist)
 		<-persistDone
+		forceStop.Stop()
+		cancelPersist()
 	}()
 
 	for {
@@ -401,17 +425,26 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 }
 
 func (a *Agent) runTelemetryPersistence(ctx context.Context, frames <-chan *agentv1.TelemetryFrame) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case frame := <-frames:
-			if err := a.persistTelemetryFrame(ctx, frame); err != nil {
-				if ctx.Err() != nil {
-					return
+	for frame := range frames {
+		if err := a.persistTelemetryFrame(ctx, frame); err != nil {
+			if ctx.Err() != nil {
+				droppedNow := uint64(1)
+				for range frames {
+					droppedNow++
 				}
-				slog.LogAttrs(ctx, slog.LevelError, "failed_to_persist_frame", slog.String("error", err.Error()))
+				dropped := a.telemetryDropCount.Add(droppedNow)
+				slog.LogAttrs(context.Background(), slog.LevelError, "telemetry_persistence_drain_expired",
+					slog.String("error", err.Error()),
+					slog.Uint64("dropped_count", droppedNow),
+					slog.Uint64("dropped_total", dropped),
+				)
+				return
 			}
+			dropped := a.telemetryDropCount.Add(1)
+			slog.LogAttrs(context.Background(), slog.LevelError, "failed_to_persist_frame",
+				slog.String("error", err.Error()),
+				slog.Uint64("dropped_total", dropped),
+			)
 		}
 	}
 }

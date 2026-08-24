@@ -29,6 +29,7 @@ func TestMAVLinkControlEvidenceBypassesBlockedTelemetryPersistence(t *testing.T)
 		acks:    make(chan mavlinkCommandAck, 1),
 	}
 	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
 	a := &Agent{
 		options:               &AgentOptions{EventQueueSize: 1},
 		pendingMAVLinkCommand: pending,
@@ -39,8 +40,12 @@ func TestMAVLinkControlEvidenceBypassesBlockedTelemetryPersistence(t *testing.T)
 			default:
 				close(persistStarted)
 			}
-			<-ctx.Done()
-			return ctx.Err()
+			select {
+			case <-persistRelease:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		},
 	}
 	events := make(chan gomavlib.Event, 4)
@@ -81,11 +86,119 @@ func TestMAVLinkControlEvidenceBypassesBlockedTelemetryPersistence(t *testing.T)
 	if a.telemetryDropCount.Load() == 0 {
 		t.Fatal("bounded persistence overload was not accounted")
 	}
+	close(persistRelease)
 	cancel()
 	select {
 	case <-loopDone:
 	case <-time.After(time.Second):
 		t.Fatal("MAVLink event loop did not stop")
+	}
+}
+
+func TestMAVLinkShutdownDrainsPreWALTelemetryQueue(t *testing.T) {
+	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
+	persisted := 0
+	a := &Agent{
+		options: &AgentOptions{EventQueueSize: 2},
+		appendTelemetryFrame: func(ctx context.Context, _ *agentv1.TelemetryFrame) error {
+			if persisted == 0 {
+				select {
+				case <-persistStarted:
+				default:
+					close(persistStarted)
+				}
+			}
+			select {
+			case <-persistRelease:
+				persisted++
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+	events := make(chan gomavlib.Event, 2)
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- a.runMAVLinkEvents(context.Background(), events) }()
+	heartbeat := func() gomavlib.Event {
+		return &gomavlib.EventFrame{Frame: &frame.V2Frame{
+			SystemID: 1, ComponentID: 1,
+			Message: &common.MessageHeartbeat{Type: common.MAV_TYPE_QUADROTOR},
+		}}
+	}
+	events <- heartbeat()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry persistence did not start")
+	}
+	events <- heartbeat()
+	close(events)
+	select {
+	case err := <-loopDone:
+		t.Fatalf("event loop returned before draining telemetry: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(persistRelease)
+	select {
+	case err := <-loopDone:
+		if err != nil {
+			t.Fatalf("event loop error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("event loop did not finish after persistence resumed")
+	}
+	if persisted != 2 {
+		t.Fatalf("persisted frames = %d, want 2", persisted)
+	}
+	if dropped := a.telemetryDropCount.Load(); dropped != 0 {
+		t.Fatalf("graceful drain dropped %d frames", dropped)
+	}
+}
+
+func TestMAVLinkShutdownAccountsForExpiredPreWALDrain(t *testing.T) {
+	persistStarted := make(chan struct{})
+	a := &Agent{
+		options:               &AgentOptions{EventQueueSize: 2},
+		telemetryDrainTimeout: 10 * time.Millisecond,
+		appendTelemetryFrame: func(ctx context.Context, _ *agentv1.TelemetryFrame) error {
+			select {
+			case <-persistStarted:
+			default:
+				close(persistStarted)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	events := make(chan gomavlib.Event, 2)
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- a.runMAVLinkEvents(context.Background(), events) }()
+	heartbeat := func() gomavlib.Event {
+		return &gomavlib.EventFrame{Frame: &frame.V2Frame{
+			SystemID: 1, ComponentID: 1,
+			Message: &common.MessageHeartbeat{Type: common.MAV_TYPE_QUADROTOR},
+		}}
+	}
+	events <- heartbeat()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry persistence did not start")
+	}
+	events <- heartbeat()
+	close(events)
+	select {
+	case err := <-loopDone:
+		if err != nil {
+			t.Fatalf("event loop error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired persistence drain did not stop")
+	}
+	if dropped := a.telemetryDropCount.Load(); dropped != 2 {
+		t.Fatalf("expired drain accounted %d dropped frames, want 2", dropped)
 	}
 }
 
