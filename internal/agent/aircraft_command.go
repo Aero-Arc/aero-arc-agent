@@ -190,10 +190,10 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 		acks:             make(chan mavlinkCommandAck, 4),
 		armedStateChange: make(chan bool, 4),
 	}
-	// After any uncertain write or timeout, a later COMMAND_ACK for this MAV_CMD
-	// cannot be distinguished from the stale one. Keep this Agent lifecycle in
-	// heartbeat-verification mode so only a fresh observation of the requested
-	// armed state can complete later ARM/DISARM commands.
+	// Process startup and any uncertain write or timeout fence COMMAND_ACK for
+	// this MAV_CMD: an ACK buffered across either boundary cannot be identified
+	// as stale. Keep this Agent lifecycle in heartbeat-verification mode so only
+	// a fresh observation of the requested armed state completes later commands.
 	stateVerificationRequired := a.aircraftAckAmbiguous
 	a.pendingMAVLinkCommand = pending
 	a.mavlinkMu.Unlock()
@@ -264,7 +264,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 		case armed := <-pending.armedStateChange:
 			if stateVerificationRequired && armed == pending.desiredArmed {
 				result.Status = agentv1.AircraftCommandResult_STATUS_ACCEPTED
-				result.Message = "aircraft state confirmed by a fresh heartbeat after an earlier ambiguous command"
+				result.Message = "aircraft state confirmed by a fresh heartbeat across an ambiguous acknowledgement boundary"
 				return result
 			}
 		case <-waitCtx.Done():

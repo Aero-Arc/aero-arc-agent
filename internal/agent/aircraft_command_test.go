@@ -173,6 +173,49 @@ func TestAircraftCommandDoesNotCorrelateLateAckAfterTimeout(t *testing.T) {
 	}
 }
 
+func TestFirstAircraftCommandAfterStartDoesNotCorrelateBufferedAck(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.mavlinkHeartbeatSeq = 1
+	agent.mavlinkTarget = &mavlinkTarget{
+		channel: channel, systemID: 1, componentID: 1, heartbeatSequence: 1,
+	}
+	written := make(chan struct{})
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		// Model an accepted ARM ACK left in the transport buffer by the Agent
+		// process that ran before this one. It cannot satisfy the new DISARM.
+		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:  common.MAV_RESULT_ACCEPTED,
+		})
+		close(written)
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "disarm-after-restart", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+		})
+	}()
+	<-written
+	select {
+	case got := <-result:
+		t.Fatalf("buffered pre-restart ACK completed DISARM: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	got := <-result
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED || !strings.Contains(got.GetMessage(), "fresh heartbeat") {
+		t.Fatalf("state-confirmed post-restart DISARM result = %+v", got)
+	}
+}
+
 func TestAircraftCommandFailsWhenMAVLinkUnavailable(t *testing.T) {
 	agent := &Agent{}
 	result := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{

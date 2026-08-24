@@ -102,6 +102,10 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 		options:        options,
 		backoffInitial: options.BackoffInitial,
 		backoffMax:     options.BackoffMax,
+		// A COMMAND_ACK buffered before a process restart is indistinguishable
+		// from the first new ARM/DISARM acknowledgement. Start fenced and use
+		// fresh post-send heartbeat state as the durable command boundary.
+		aircraftAckAmbiguous: true,
 	}
 	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, command *common.MessageCommandLong) error {
 		return a.node.WriteMessageTo(channel, command)

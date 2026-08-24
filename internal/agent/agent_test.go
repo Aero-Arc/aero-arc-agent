@@ -640,6 +640,9 @@ func TestNewAgent(t *testing.T) {
 	if a.backoffInitial == 0 {
 		t.Error("backoffInitial not set")
 	}
+	if !a.aircraftAckAmbiguous {
+		t.Error("new Agent must fence acknowledgements buffered across process restart")
+	}
 }
 
 func TestStart_ImmediateCancel(t *testing.T) {
