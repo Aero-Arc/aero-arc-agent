@@ -763,6 +763,58 @@ func TestAircraftCommandAlreadySatisfiedWaitsForEventQuiescence(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandACKTimeoutStartsAfterQuiescence(t *testing.T) {
+	const timeout = 80 * time.Millisecond
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: timeout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+	written := make(chan struct{})
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		close(written)
+		afterAircraftCommandEnqueue(agent, func() {
+			time.Sleep(timeout / 2)
+			agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+				Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+				Result:  common.MAV_RESULT_ACCEPTED,
+			})
+		})
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "fresh-post-admission-timeout", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+		})
+	}()
+	// Consume most of the admission budget before proving a continuous quiet
+	// epoch. The ACK then arrives after the old shared deadline but within the
+	// fresh post-admission budget.
+	time.Sleep(3 * timeout / 4)
+	agent.mavlinkMu.Lock()
+	agent.aircraftAckAmbiguousSince = time.Now().Add(-timeout)
+	agent.aircraftAckLastProgressAt = time.Now()
+	agent.mavlinkMu.Unlock()
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("command did not send after late quiescence")
+	}
+	select {
+	case got := <-result:
+		if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+			t.Fatalf("post-quiescence result = %+v, want accepted", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for post-quiescence command result")
+	}
+}
+
 func TestAircraftCommandFenceRefreshesArmedStateAtEnqueueBoundary(t *testing.T) {
 	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 60 * time.Millisecond})
 	if err != nil {

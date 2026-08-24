@@ -394,8 +394,8 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 	param1 := prepared.param1
 	desiredArmed := prepared.desiredArmed
 	timeout := a.aircraftCommandTimeout()
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	admissionCtx, cancelAdmission := context.WithTimeout(ctx, timeout)
+	defer cancelAdmission()
 
 	var target *mavlinkTarget
 	var pending *pendingMAVLinkCommand
@@ -410,7 +410,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		}
 		if a.aircraftAckAmbiguous && target.armed == desiredArmed {
 			a.mavlinkMu.Unlock()
-			if !a.waitForAircraftACKQuiescenceOrTransition(waitCtx, desiredArmed) {
+			if !a.waitForAircraftACKQuiescenceOrTransition(admissionCtx, desiredArmed) {
 				result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
 				result.Message = "timed out waiting for ACK quiescence before an already-satisfied aircraft state command"
 				return result
@@ -439,6 +439,12 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		a.mavlinkMu.Unlock()
 		break
 	}
+	// Waiting out an ambiguity fence is an admission phase, not part of the
+	// autopilot's response budget. Once the matcher is installed safely, give
+	// stream handoff and COMMAND_ACK processing their own bounded interval.
+	cancelAdmission()
+	commandCtx, cancelCommand := context.WithTimeout(ctx, timeout)
+	defer cancelCommand()
 	defer func() {
 		a.mavlinkMu.Lock()
 		if a.pendingMAVLinkCommand == pending {
@@ -543,7 +549,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 					return result
 				}
 			}
-		case <-waitCtx.Done():
+		case <-commandCtx.Done():
 			a.mavlinkMu.Lock()
 			a.rearmAircraftACKFenceLocked()
 			a.mavlinkMu.Unlock()
