@@ -622,6 +622,19 @@ func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool,
 // another command or payload returns ErrOperationCommandConflict. Rows created
 // before fingerprinting remain irrevocable no-ops because their payload cannot
 // be reconstructed safely.
+//
+// Parameters:
+//   - ctx: bounds the SQLite transaction; cancellation rolls back both the
+//     command record and context mutation.
+//   - commandID: non-empty durable idempotency key for this logical mutation.
+//   - value: flight, intent, and intent-version attribution to persist.
+//
+// Returns:
+//   - applied: true only when this call first commits the command and context;
+//     false for an exact retry or a legacy payload-unknown command record.
+//   - error: reports an empty command ID, ErrOperationCommandConflict for ID
+//     reuse with another kind or payload, context cancellation, or a SQLite
+//     transaction, query, mutation, or commit failure.
 func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value OperationContext) (bool, error) {
 	fingerprint := operationCommandFingerprint("set", value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
 	return w.applyOperationCommand(ctx, commandID, "set", fingerprint, func(tx *sql.Tx) error {
@@ -639,6 +652,20 @@ func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value O
 // retries are successful no-ops, while conflicting ID reuse returns
 // ErrOperationCommandConflict. Pre-fingerprint command IDs remain irrevocable
 // no-ops because their original payload is unavailable.
+//
+// Parameters:
+//   - ctx: bounds the SQLite transaction; cancellation rolls back both the
+//     command record and context mutation.
+//   - commandID: non-empty durable idempotency key for this logical mutation.
+//   - flightID: flight to clear when non-empty; an empty value authoritatively
+//     clears any active context during control-plane reconciliation.
+//
+// Returns:
+//   - applied: true only when this call first commits the command and clear;
+//     false for an exact retry or a legacy payload-unknown command record.
+//   - error: reports an empty command ID, ErrOperationCommandConflict for ID
+//     reuse with another kind or payload, context cancellation, or a SQLite
+//     transaction, query, mutation, or commit failure.
 func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID string) (bool, error) {
 	if commandID == "" {
 		return false, errors.New("operation command ID is required")
