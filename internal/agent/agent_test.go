@@ -430,18 +430,32 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 		t.Fatalf("idempotent ack = %+v", ack)
 	}
 
-	// A malformed clear is rejected, correlated to its command, and leaves the active context intact.
+	// An authoritative empty clear supports control-plane reconciliation when
+	// the API has no active flight ID to replay.
 	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty"}); err != nil {
 		t.Fatal(err)
 	}
 	ack = sent[len(sent)-1].GetOperationContextCommandAck()
-	if ack.GetCommandId() != "clear-empty" || ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED {
+	if ack.GetCommandId() != "clear-empty" || ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_APPLIED || ack.GetActiveContext() != nil {
 		t.Fatalf("empty-flight clear ack = %+v", ack)
 	}
 	frame = &agentv1.TelemetryFrame{}
 	a.stampFrameContext(frame)
-	if frame.FlightId != "flight-1" {
-		t.Fatalf("empty-flight clear changed flight to %q", frame.FlightId)
+	if frame.FlightId != "" || frame.IntentId != "" {
+		t.Fatalf("empty-flight clear retained context: %+v", frame)
+	}
+
+	setAfterReconciliation := proto.Clone(set).(*agentv1.SetOperationContextCommand)
+	setAfterReconciliation.CommandId = "set-2"
+	if err := a.handleSetOperationContext(ctx, stream, setAfterReconciliation); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty"}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("late empty-clear retry = %+v", ack)
 	}
 
 	// A stale clear is recorded but cannot clear a newer/different flight.

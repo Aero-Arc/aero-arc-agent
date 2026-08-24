@@ -2102,11 +2102,26 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 	}
 
 	applied, err = w.ClearOperationContext(ctx, "clear-empty", "")
-	if err == nil || applied {
-		t.Fatalf("empty-flight clear = %v, %v; want false, error", applied, err)
+	if err != nil || !applied {
+		t.Fatalf("empty-flight clear = %v, %v; want applied", applied, err)
+	}
+	if _, ok, err = w.LoadOperationContext(ctx); err != nil || ok {
+		t.Fatalf("context after empty-flight clear: ok=%v err=%v", ok, err)
+	}
+	applied, err = w.SetOperationContext(ctx, "set-2", want)
+	if err != nil || !applied {
+		t.Fatalf("restore context after reconciliation = %v, %v", applied, err)
+	}
+	applied, err = w.ClearOperationContext(ctx, "clear-empty", "")
+	if err != nil || applied {
+		t.Fatalf("late empty-clear retry = %v, %v; want durable no-op", applied, err)
 	}
 	if got, ok, err = w.LoadOperationContext(ctx); err != nil || !ok || got != want {
-		t.Fatalf("context after empty-flight clear = %#v, %v, %v; want %#v", got, ok, err, want)
+		t.Fatalf("context after late empty-clear retry = %#v, %v, %v; want %#v", got, ok, err, want)
+	}
+	applied, err = w.ClearOperationContext(ctx, "clear-empty", want.FlightID)
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("empty-clear command ID conflict = %v, %v", applied, err)
 	}
 
 	applied, err = w.ClearOperationContext(ctx, "clear-old", "another-flight")

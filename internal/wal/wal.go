@@ -610,20 +610,23 @@ func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value O
 	})
 }
 
-// ClearOperationContext atomically clears the active context once. Exact
-// fingerprinted retries are successful no-ops, while conflicting ID reuse
-// returns ErrOperationCommandConflict. Pre-fingerprint command IDs remain
-// irrevocable no-ops because their original payload is unavailable.
+// ClearOperationContext atomically clears the active context once. A non-empty
+// flight ID clears only that matching flight; an empty flight ID authoritatively
+// clears any context during control-plane reconciliation. Exact fingerprinted
+// retries are successful no-ops, while conflicting ID reuse returns
+// ErrOperationCommandConflict. Pre-fingerprint command IDs remain irrevocable
+// no-ops because their original payload is unavailable.
 func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID string) (bool, error) {
 	if commandID == "" {
 		return false, errors.New("operation command ID is required")
 	}
-	if flightID == "" {
-		return false, errors.New("flight ID is required")
-	}
 
 	fingerprint := operationCommandFingerprint("clear", flightID)
 	return w.applyOperationCommand(ctx, commandID, "clear", fingerprint, func(tx *sql.Tx) error {
+		if flightID == "" {
+			_, err := tx.ExecContext(ctx, `DELETE FROM operation_context WHERE id = 1`)
+			return err
+		}
 		_, err := tx.ExecContext(ctx, `DELETE FROM operation_context WHERE id = 1 AND flight_id = ?`, flightID)
 		return err
 	})

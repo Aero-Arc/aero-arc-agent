@@ -606,9 +606,6 @@ func (a *Agent) handleClearOperationContext(ctx context.Context, stream grpc.Bid
 	if command.GetCommandId() == "" {
 		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "command_id is required")
 	}
-	if command.GetFlightId() == "" {
-		return a.sendOperationContextAck(stream, command.GetCommandId(), agentv1.OperationContextCommandAck_STATUS_REJECTED, "flight id is required")
-	}
 	applied, err := a.wal.ClearOperationContext(ctx, command.CommandId, command.FlightId)
 	if err != nil {
 		if errors.Is(err, wal.ErrOperationCommandConflict) {
