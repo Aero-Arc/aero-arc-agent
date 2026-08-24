@@ -169,7 +169,7 @@ func TestAircraftCommandDoesNotCorrelateLateAckAfterTimeout(t *testing.T) {
 	}
 	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
 	got := <-result
-	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED || !strings.Contains(got.GetMessage(), "fresh heartbeat") {
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED || !strings.Contains(got.GetMessage(), "fresh aircraft state") {
 		t.Fatalf("state-confirmed DISARM result = %+v", got)
 	}
 }
@@ -212,7 +212,7 @@ func TestFirstAircraftCommandAfterStartDoesNotCorrelateBufferedAck(t *testing.T)
 
 	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
 	got := <-result
-	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED || !strings.Contains(got.GetMessage(), "fresh heartbeat") {
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED || !strings.Contains(got.GetMessage(), "fresh aircraft state") {
 		t.Fatalf("state-confirmed post-restart DISARM result = %+v", got)
 	}
 }
@@ -279,7 +279,7 @@ func TestAircraftCommandFenceRequiresObservedTransitionFromMatchingState(t *test
 	}
 }
 
-func TestAircraftCommandFenceRefreshesArmedStateAtSendBoundary(t *testing.T) {
+func TestAircraftCommandFenceRefreshesArmedStateAtEnqueueBoundary(t *testing.T) {
 	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 60 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +288,7 @@ func TestAircraftCommandFenceRefreshesArmedStateAtSendBoundary(t *testing.T) {
 	agent.mavlinkTarget = &mavlinkTarget{channel: channel, systemID: 1, componentID: 1, armed: false}
 	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
 		// The aircraft reaches the requested state while the write is in
-		// progress. That is now the send-boundary baseline, not evidence that
+		// progress. That is now the enqueue-boundary baseline, not evidence that
 		// can complete the command.
 		agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
 		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
@@ -310,6 +310,34 @@ func TestAircraftCommandFenceRefreshesArmedStateAtSendBoundary(t *testing.T) {
 	got := <-result
 	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
 		t.Fatalf("state reached before send boundary completed command = %+v, want timeout", got)
+	}
+}
+
+func TestAircraftCommandFenceDoesNotAcceptStateTransitionWithoutAck(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 60 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.mavlinkTarget = &mavlinkTarget{channel: channel, systemID: 1, componentID: 1, armed: false}
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		// gomavlib can accept this handoff and still drop it at a full channel
+		// queue. No ACK means there is no proof it reached the autopilot.
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "arm-with-dropped-enqueue", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+		})
+	}()
+	time.Sleep(10 * time.Millisecond)
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+	got := <-result
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
+		t.Fatalf("state transition without ACK result = %+v, want timeout", got)
 	}
 }
 

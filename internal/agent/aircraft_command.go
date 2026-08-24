@@ -34,15 +34,15 @@ type mavlinkCommandAck struct {
 }
 
 type pendingMAVLinkCommand struct {
-	systemID         uint8
-	componentID      uint8
-	command          common.MAV_CMD
-	desiredArmed     bool
-	armedAtSend      bool
-	heartbeatAtSend  uint64
-	sent             bool
-	acks             chan mavlinkCommandAck
-	armedStateChange chan bool
+	systemID           uint8
+	componentID        uint8
+	command            common.MAV_CMD
+	desiredArmed       bool
+	armedAtEnqueue     bool
+	heartbeatAtEnqueue uint64
+	enqueueComplete    bool
+	acks               chan mavlinkCommandAck
+	armedStateChange   chan bool
 }
 
 func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
@@ -70,9 +70,9 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	pending := a.pendingMAVLinkCommand
 	var stateChanges chan bool
 	if pending != nil && pending.systemID == systemID && pending.componentID == componentID {
-		if !pending.sent {
-			pending.armedAtSend = armed
-		} else if sequence > pending.heartbeatAtSend {
+		if !pending.enqueueComplete {
+			pending.armedAtEnqueue = armed
+		} else if sequence > pending.heartbeatAtEnqueue {
 			stateChanges = pending.armedStateChange
 		}
 	}
@@ -190,18 +190,18 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	}
 	pending := &pendingMAVLinkCommand{
 		systemID: target.systemID, componentID: target.componentID,
-		command:          common.MAV_CMD_COMPONENT_ARM_DISARM,
-		desiredArmed:     desiredArmed,
-		armedAtSend:      target.armed,
-		heartbeatAtSend:  target.heartbeatSequence,
-		acks:             make(chan mavlinkCommandAck, 4),
-		armedStateChange: make(chan bool, 4),
+		command:            common.MAV_CMD_COMPONENT_ARM_DISARM,
+		desiredArmed:       desiredArmed,
+		armedAtEnqueue:     target.armed,
+		heartbeatAtEnqueue: target.heartbeatSequence,
+		acks:               make(chan mavlinkCommandAck, 4),
+		armedStateChange:   make(chan bool, 4),
 	}
 	// Process startup and any uncertain write or timeout fence COMMAND_ACK for
 	// this MAV_CMD: an ACK buffered across either boundary cannot be identified
-	// as stale. Keep this Agent lifecycle in heartbeat-verification mode so only
-	// a fresh observation of the requested armed state positively completes later
-	// commands; an explicit negative acknowledgement still fails closed.
+	// as stale. Keep this Agent lifecycle in combined ACK/state-verification mode:
+	// positive completion requires both an accepted acknowledgement and a fresh
+	// armed-state transition, while a negative acknowledgement still fails closed.
 	stateVerificationRequired := a.aircraftAckAmbiguous
 	a.pendingMAVLinkCommand = pending
 	a.mavlinkMu.Unlock()
@@ -217,7 +217,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 		TargetSystem: target.systemID, TargetComponent: target.componentID,
 		Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Param1: param1,
 	}
-	slog.LogAttrs(ctx, slog.LevelInfo, "mavlink_command_sent",
+	slog.LogAttrs(ctx, slog.LevelInfo, "mavlink_command_enqueue_started",
 		slog.String("command_id", command.GetCommandId()),
 		slog.String("aircraft_id", command.GetAircraftId()),
 		slog.String("command_type", command.GetType().String()),
@@ -239,12 +239,14 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	}
 	a.mavlinkMu.Lock()
 	if a.pendingMAVLinkCommand == pending {
-		pending.heartbeatAtSend = a.mavlinkHeartbeatSeq
+		pending.heartbeatAtEnqueue = a.mavlinkHeartbeatSeq
 		if current := a.mavlinkTarget; current != nil && current.channel == target.channel &&
 			current.systemID == pending.systemID && current.componentID == pending.componentID {
-			pending.armedAtSend = current.armed
+			pending.armedAtEnqueue = current.armed
 		}
-		pending.sent = true
+		// gomavlib WriteMessageTo returning confirms handoff to the node, not
+		// physical channel I/O. COMMAND_ACK remains the transmission evidence.
+		pending.enqueueComplete = true
 	}
 	a.mavlinkMu.Unlock()
 
@@ -254,7 +256,9 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	oppositeStateObserved := pending.armedAtSend != pending.desiredArmed
+	oppositeStateObserved := pending.armedAtEnqueue != pending.desiredArmed
+	acceptedAckObserved := false
+	stateTransitionObserved := false
 	for {
 		select {
 		case ack := <-pending.acks:
@@ -276,6 +280,12 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 				result.Message = "autopilot acknowledged command"
 				return result
 			}
+			acceptedAckObserved = true
+			if stateTransitionObserved {
+				result.Status = agentv1.AircraftCommandResult_STATUS_ACCEPTED
+				result.Message = "accepted acknowledgement and fresh aircraft state transition confirmed command"
+				return result
+			}
 		case armed := <-pending.armedStateChange:
 			if !stateVerificationRequired {
 				continue
@@ -285,9 +295,12 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 				continue
 			}
 			if oppositeStateObserved {
-				result.Status = agentv1.AircraftCommandResult_STATUS_ACCEPTED
-				result.Message = "aircraft state confirmed by a fresh heartbeat across an ambiguous acknowledgement boundary"
-				return result
+				stateTransitionObserved = true
+				if acceptedAckObserved {
+					result.Status = agentv1.AircraftCommandResult_STATUS_ACCEPTED
+					result.Message = "accepted acknowledgement and fresh aircraft state transition confirmed command"
+					return result
+				}
 			}
 		case <-waitCtx.Done():
 			a.mavlinkMu.Lock()
@@ -295,7 +308,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 			a.mavlinkMu.Unlock()
 			result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
 			if stateVerificationRequired {
-				result.Message = "timed out waiting for fresh heartbeat confirmation of aircraft state"
+				result.Message = "timed out waiting for accepted acknowledgement and fresh aircraft state transition"
 			} else {
 				result.Message = "timed out waiting for autopilot COMMAND_ACK"
 			}
