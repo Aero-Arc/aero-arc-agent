@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,20 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 )
+
+type cancelAfterFirstRead struct {
+	reader io.Reader
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (r *cancelAfterFirstRead) Read(buffer []byte) (int, error) {
+	n, err := r.reader.Read(buffer)
+	if n > 0 {
+		r.once.Do(r.cancel)
+	}
+	return n, err
+}
 
 func TestWALGenerationRotatesAndPersistedFramesRetainIdentity(t *testing.T) {
 	ctx := context.Background()
@@ -2104,6 +2119,61 @@ func TestWAL_ReadLimit(t *testing.T) {
 	_, err = w.ReadUndelivered(ctx, 0)
 	if err == nil {
 		t.Error("Expected error for limit=0, got nil")
+	}
+}
+
+func TestSpoolReadHelpersHonorCancellationBetweenChunks(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5a}, spoolReadChunkSize*2)
+
+	readCtx, cancelRead := context.WithCancel(context.Background())
+	reader := &cancelAfterFirstRead{reader: bytes.NewReader(payload), cancel: cancelRead}
+	buffer := make([]byte, len(payload))
+	n, err := readFullContext(readCtx, reader, buffer)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("readFullContext() error = %v, want canceled", err)
+	}
+	if n != spoolReadChunkSize {
+		t.Fatalf("bytes read before cancellation = %d, want %d", n, spoolReadChunkSize)
+	}
+
+	copyCtx, cancelCopy := context.WithCancel(context.Background())
+	copyReader := &cancelAfterFirstRead{reader: bytes.NewReader(payload), cancel: cancelCopy}
+	var destination bytes.Buffer
+	written, err := copyContext(copyCtx, &destination, copyReader)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copyContext() error = %v, want canceled", err)
+	}
+	if written != spoolReadChunkSize || destination.Len() != spoolReadChunkSize {
+		t.Fatalf("bytes copied before cancellation = (%d,%d), want (%d,%d)",
+			written, destination.Len(), spoolReadChunkSize, spoolReadChunkSize)
+	}
+}
+
+func TestWALDrainCancellationRetainsValidSpool(t *testing.T) {
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "cancel-spool-read.db"))
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	spoolPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("retain-on-cancel")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.drainSpoolContext(canceledCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("drainSpoolContext() error = %v, want canceled", err)
+	}
+	if _, err := os.Stat(spoolPath); err != nil {
+		t.Fatalf("valid spool was not retained after canceled read: %v", err)
+	}
+	quarantined, err := os.ReadDir(w.spoolQuarantineDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(quarantined) != 0 {
+		t.Fatalf("quarantine files after canceled read = %d, want 0", len(quarantined))
 	}
 }
 

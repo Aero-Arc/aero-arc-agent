@@ -39,6 +39,7 @@ const (
 	spoolFileMagic           = "AEROARC-SPOOL\x00\x01"
 	spoolIDLength            = 36
 	maxSpoolFramePayloadSize = 16 << 20
+	spoolReadChunkSize       = 64 << 10
 )
 
 // Entry represents a single log entry in the WAL.
@@ -1015,8 +1016,12 @@ func (w *WAL) drainSpoolContext(ctx context.Context) error {
 			continue
 		}
 		path := filepath.Join(w.spoolDir, entry.Name())
-		spoolID, frames, err := readSpoolFile(path)
+		spoolID, frames, err := readSpoolFileContext(ctx, path)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				drainErr = errors.Join(drainErr, err)
+				break
+			}
 			quarantinePath, activeDirDurable, quarantineErr := w.quarantineSpoolFile(path)
 			if quarantinePath != "" && !activeDirDurable {
 				spoolDirSyncFailed = true
@@ -1174,7 +1179,7 @@ func (w *WAL) pruneOrphanedSpoolImports(ctx context.Context, entries []os.DirEnt
 			continue
 		}
 		path := filepath.Join(w.spoolDir, entry.Name())
-		spoolID, err := readSpoolIdentityFromPath(path)
+		spoolID, err := readSpoolIdentityFromPathContext(ctx, path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -1207,6 +1212,13 @@ func (w *WAL) pruneOrphanedSpoolImports(ctx context.Context, entries []os.DirEnt
 }
 
 func readSpoolIdentityFromPath(path string) (string, error) {
+	return readSpoolIdentityFromPathContext(context.Background(), path)
+}
+
+func readSpoolIdentityFromPathContext(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -1214,11 +1226,18 @@ func readSpoolIdentityFromPath(path string) (string, error) {
 	defer func() {
 		_ = file.Close()
 	}()
-	spoolID, _, err := readSpoolIdentity(file, path)
+	spoolID, _, err := readSpoolIdentity(ctx, file, path)
 	return spoolID, err
 }
 
 func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
+	return readSpoolFileContext(context.Background(), path)
+}
+
+func readSpoolFileContext(ctx context.Context, path string) (string, []*agentv1.TelemetryFrame, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return "", nil, err
@@ -1227,7 +1246,7 @@ func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
 		_ = file.Close()
 	}()
 
-	spoolID, payloadOffset, err := readSpoolIdentity(file, path)
+	spoolID, payloadOffset, err := readSpoolIdentity(ctx, file, path)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1238,8 +1257,11 @@ func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
 	reader := bufio.NewReader(file)
 	var frames []*agentv1.TelemetryFrame
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
 		var lenBuf [4]byte
-		if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
+		if _, err := readFullContext(ctx, reader, lenBuf[:]); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
@@ -1258,10 +1280,13 @@ func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
 		}
 
 		payload := make([]byte, length)
-		if _, err := io.ReadFull(reader, payload); err != nil {
+		if _, err := readFullContext(ctx, reader, payload); err != nil {
 			return "", nil, fmt.Errorf("truncated spool payload: %w", err)
 		}
 
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
 		var frame agentv1.TelemetryFrame
 		if err := proto.Unmarshal(payload, &frame); err != nil {
 			return "", nil, fmt.Errorf("failed to unmarshal spool frame: %w", err)
@@ -1269,10 +1294,16 @@ func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
 		frames = append(frames, &frame)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
 	return spoolID, frames, nil
 }
 
-func readSpoolIdentity(file *os.File, path string) (string, int64, error) {
+func readSpoolIdentity(ctx context.Context, file *os.File, path string) (string, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
 	headerSize := len(spoolFileMagic) + spoolIDLength
 	header := make([]byte, headerSize)
 	n, err := file.ReadAt(header, 0)
@@ -1301,10 +1332,71 @@ func readSpoolIdentity(file *os.File, path string) (string, int64, error) {
 	if _, err := hash.Write([]byte{0}); err != nil {
 		return "", 0, fmt.Errorf("hash legacy spool separator: %w", err)
 	}
-	if _, err := io.Copy(hash, file); err != nil {
+	if _, err := copyContext(ctx, hash, file); err != nil {
 		return "", 0, fmt.Errorf("hash legacy spool payload: %w", err)
 	}
 	return "legacy:" + hex.EncodeToString(hash.Sum(nil)), 0, nil
+}
+
+func readFullContext(ctx context.Context, reader io.Reader, buffer []byte) (int, error) {
+	total := 0
+	for total < len(buffer) {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		end := min(total+spoolReadChunkSize, len(buffer))
+		n, err := reader.Read(buffer[total:end])
+		total += n
+		if total == len(buffer) {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return total, contextErr
+			}
+			return total, nil
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) && total > 0 {
+				return total, io.ErrUnexpectedEOF
+			}
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
+	return total, nil
+}
+
+func copyContext(ctx context.Context, writer io.Writer, reader io.Reader) (int64, error) {
+	buffer := make([]byte, spoolReadChunkSize)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			writeN, writeErr := writer.Write(buffer[:n])
+			written += int64(writeN)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if writeN != n {
+				return written, io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			if err := ctx.Err(); err != nil {
+				return written, err
+			}
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+		if n == 0 {
+			return written, io.ErrNoProgress
+		}
+	}
 }
 
 // Append appends a raw telemetry frame payload to the log and returns its ID.
