@@ -100,6 +100,22 @@ The agent performs three key tasks:
      - TelemetryFrames are persisted to a durable write ahead log before being sent and replayed on reconnect
    - This ensures continuity even on unstable connections.
 
+## Durability and Delivery Contract
+
+- The Agent never sends a frame until that frame has reached SQLite through
+  the durable spool/WAL path.
+- Each successful WAL open creates a fresh append-generation UUID. The Agent
+  stamps it into newly captured frames, making `(wal_id, seq)` the durable
+  cursor; already-persisted frames keep their original cursor on retry.
+- Relay ACKs provide at-least-once admission semantics. Retries are expected,
+  and end-to-end exactly-once storage is not claimed.
+- `AppendAsync` first transfers an immutable copy into a bounded memory queue.
+  The copy becomes crash-durable when its batch reaches SQLite or a synced
+  spool file. Graceful shutdown attempts to spool the accepted queue, while an
+  abrupt process or power loss may lose the current unflushed batch.
+- Malformed legacy rows and spool files are quarantined so their bytes and
+  diagnostics remain available without blocking later valid telemetry.
+
 ## Configuration
 
 The agent is configured entirely via CLI flags.

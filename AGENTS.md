@@ -15,10 +15,14 @@
 ## Delivery invariants
 
 - Persist a telemetry frame before attempting network delivery. WAL sequence
-  numbers identify entries within one WAL database, not across a recreated or
-  cloned database.
-- Keep frame identity stable across retries. Do not regenerate capture time or
-  sequence metadata when resending the same entry.
+  numbers are scoped by the `wal_id` append generation stamped into the frame.
+  A successful WAL open rotates to a new generation for newly captured frames;
+  frames already persisted retain their original generation across replay.
+- Keep the composite `(wal_id, seq)` cursor and capture time stable across
+  retries. Never restamp a persisted frame with the current open generation.
+- `AppendAsync` acceptance transfers an immutable frame copy to the in-memory
+  writer queue; it is crash-durable only after the batch reaches SQLite or a
+  synced spool file. Graceful close attempts to spool every accepted frame.
 - Mark a WAL entry delivered only after Relay acknowledges that exact frame.
 - Preserve operation context with each captured frame so a later retry does
   not inherit a different mission assignment.

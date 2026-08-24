@@ -34,6 +34,60 @@ func TestNextBackoff(t *testing.T) {
 	}
 }
 
+func TestAgentShutdownPassesDeadlineToWALClose(t *testing.T) {
+	a := &Agent{}
+	closeCalled := make(chan struct{})
+	a.closeWALFn = func(ctx context.Context) error {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("WAL close context has no deadline")
+		}
+		close(closeCalled)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := a.shutdown(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown() error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-closeCalled:
+	default:
+		t.Fatal("shutdown did not invoke context-aware WAL close")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("shutdown ignored WAL deadline for %v", time.Since(started))
+	}
+}
+
+func TestAgentShutdownFlushesWALBeforeMAVLinkDeadline(t *testing.T) {
+	a := &Agent{}
+	walClosed := make(chan struct{})
+	a.closeWALFn = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("WAL close started without reserved shutdown time: %v", err)
+		}
+		close(walClosed)
+		return nil
+	}
+	a.closeMAVLinkFn = func(ctx context.Context) {
+		select {
+		case <-walClosed:
+		case <-ctx.Done():
+			t.Error("MAVLink close started before WAL close")
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -133,6 +187,8 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 	dialCount := 0
 	registerCount := 0
 	streamOpenCount := 0
+	sleepCount := 0
+	sleepCountAtReconnect := 0
 
 	// We want to simulate:
 	// 1. Successful connection
@@ -147,6 +203,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 	a.dialFn = func(ctx context.Context) (*grpc.ClientConn, error) {
 		dialCount++
 		if dialCount > 1 {
+			sleepCountAtReconnect = sleepCount
 			// Signal that we attempted a reconnect
 			select {
 			case reconnected <- struct{}{}:
@@ -190,6 +247,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 
 	a.sleepWithBack = func(c context.Context, d time.Duration) bool {
 		// Don't actually sleep in test, just check context
+		sleepCount++
 		return c.Err() == nil
 	}
 
@@ -220,6 +278,9 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 
 	if dialCount < 2 {
 		t.Errorf("expected at least 2 dial attempts (initial + reconnect), got %d", dialCount)
+	}
+	if sleepCountAtReconnect == 0 {
+		t.Error("stream failure reconnected without backoff")
 	}
 }
 
@@ -266,6 +327,14 @@ func TestHandleTelemetryAck(t *testing.T) {
 type mockGateway struct {
 	agentv1.AgentGatewayClient
 	registerFunc func(ctx context.Context, in *agentv1.RegisterRequest, opts ...grpc.CallOption) (*agentv1.RegisterResponse, error)
+	streamFunc   func(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
+}
+
+func (m *mockGateway) TelemetryStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
+	if m.streamFunc != nil {
+		return m.streamFunc(ctx, opts...)
+	}
+	return nil, errors.New("unexpected telemetry stream")
 }
 
 func (m *mockGateway) Register(ctx context.Context, in *agentv1.RegisterRequest, opts ...grpc.CallOption) (*agentv1.RegisterResponse, error) {
@@ -403,7 +472,7 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 		}
 	}
 	if stored.FlightId != "flight-1" || stored.IntentId != "intent-1" || stored.IntentVersion != 2 {
-		t.Fatalf("WAL frame context changed after clear: %+v", stored)
+		t.Fatalf("WAL frame context changed after clear: %+v", &stored)
 	}
 }
 
@@ -440,6 +509,66 @@ func TestSessionIsStampedAtSendTimeAcrossOfflineCaptureAndReconnect(t *testing.T
 	a.stampCurrentSession(oldWALFrame)
 	if oldWALFrame.SessionId != "session-2" {
 		t.Fatalf("reconnected replay session = %q", oldWALFrame.SessionId)
+	}
+}
+
+func TestDebugTransportCanExplicitlySkipCertificateVerification(t *testing.T) {
+	creds, err := relayTransportCredentials(&AgentOptions{Debug: true, SkipTLSVerification: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := creds.Info().SecurityProtocol; got != "tls" {
+		t.Fatalf("security protocol = %q, want TLS", got)
+	}
+}
+
+func TestOpenTelemetryStreamRequiresRegisteredSession(t *testing.T) {
+	a := &Agent{gateway: &mockGateway{}, sessionID: "", options: &AgentOptions{RelayTarget: "relay"}}
+	if _, err := a.openTelemetryStream(context.Background()); err == nil {
+		t.Fatal("openTelemetryStream() accepted an empty Relay session ID")
+	}
+}
+
+func TestOpenTelemetryStreamBindsRegisteredSessionMetadata(t *testing.T) {
+	var outgoing metadata.MD
+	gateway := &mockGateway{streamFunc: func(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
+		outgoing, _ = metadata.FromOutgoingContext(ctx)
+		return &mockStream{}, nil
+	}}
+	a := &Agent{gateway: gateway, sessionID: "session-1", options: &AgentOptions{RelayTarget: "relay"}}
+	if _, err := a.openTelemetryStream(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := outgoing.Get("aero-arc-session-id"); len(got) != 1 || got[0] != "session-1" {
+		t.Fatalf("session metadata = %#v", got)
+	}
+	if got := outgoing.Get("aero-arc-agent-id"); len(got) != 1 || got[0] == "" {
+		t.Fatalf("agent metadata = %#v", got)
+	}
+}
+
+func TestWALGenerationIsStableForLegacyReplay(t *testing.T) {
+	ctx := context.Background()
+	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "wal.db"), 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	a := &Agent{wal: w}
+
+	legacy := &agentv1.TelemetryFrame{}
+	a.stampWALGeneration(legacy)
+	if legacy.GetWalId() != w.GenerationID() {
+		t.Fatalf("legacy WAL ID = %q, want %q", legacy.GetWalId(), w.GenerationID())
+	}
+	original := &agentv1.TelemetryFrame{WalId: "original-generation"}
+	a.stampWALGeneration(original)
+	if original.GetWalId() != "original-generation" {
+		t.Fatalf("persisted WAL ID changed to %q", original.GetWalId())
 	}
 }
 
@@ -527,9 +656,19 @@ func TestStart_ImmediateCancel(t *testing.T) {
 	if err := a.node.Initialize(); err != nil {
 		t.Fatalf("Failed to initialize node: %v", err)
 	}
+	shutdownErr := errors.New("forced shutdown diagnostic")
+	a.closeWALFn = func(ctx context.Context) error {
+		if a.wal == nil {
+			return shutdownErr
+		}
+		return errors.Join(a.wal.CloseContext(ctx), shutdownErr)
+	}
 
 	err = a.Start(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Expected context.Canceled, got %v", err)
+	}
+	if !errors.Is(err, shutdownErr) {
+		t.Errorf("Start did not surface shutdown error: %v", err)
 	}
 }
