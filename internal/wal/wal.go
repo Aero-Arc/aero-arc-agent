@@ -202,8 +202,8 @@ func initDB(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS operation_context_commands (
 		command_id TEXT PRIMARY KEY,
 		processed_at INTEGER NOT NULL,
-		command_kind TEXT NOT NULL,
-		payload_fingerprint TEXT NOT NULL
+		command_kind TEXT NOT NULL DEFAULT '',
+		payload_fingerprint TEXT NOT NULL DEFAULT ''
 	);
 	CREATE TABLE IF NOT EXISTS wal_metadata (
 		id INTEGER PRIMARY KEY CHECK (id = 1),

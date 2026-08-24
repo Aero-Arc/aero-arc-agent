@@ -13,7 +13,11 @@ import (
 	"google.golang.org/grpc"
 )
 
-const defaultAircraftCommandTimeout = 4 * time.Second
+const (
+	defaultAircraftCommandTimeout = 4 * time.Second
+	mavlinkSourceSystemID         = 254
+	mavlinkSourceComponentID      = uint8(common.MAV_COMP_ID_ONBOARD_COMPUTER)
+)
 
 type mavlinkTarget struct {
 	channel           *gomavlib.Channel
@@ -82,7 +86,9 @@ func (a *Agent) observeMAVLinkCommandAck(systemID, componentID uint8, ack *commo
 	}
 	a.mavlinkMu.Lock()
 	pending := a.pendingMAVLinkCommand
-	if pending == nil || pending.command != ack.Command || pending.systemID != systemID || pending.componentID != componentID {
+	if pending == nil || pending.command != ack.Command || pending.systemID != systemID || pending.componentID != componentID ||
+		(ack.TargetSystem != 0 && ack.TargetSystem != mavlinkSourceSystemID) ||
+		(ack.TargetComponent != 0 && ack.TargetComponent != mavlinkSourceComponentID) {
 		a.mavlinkMu.Unlock()
 		return
 	}

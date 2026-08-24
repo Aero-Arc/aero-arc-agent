@@ -65,6 +65,35 @@ func TestAircraftCommandMapsMAVLinkRejection(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandIgnoresAckAddressedToAnotherMAVLinkNode(t *testing.T) {
+	agent := &Agent{
+		options:       &AgentOptions{AircraftCommandTimeout: 100 * time.Millisecond},
+		mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1},
+	}
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+			Command:         common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:          common.MAV_RESULT_ACCEPTED,
+			TargetSystem:    mavlinkSourceSystemID,
+			TargetComponent: uint8(common.MAV_COMP_ID_MISSIONPLANNER),
+		})
+		agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+			Command:         common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:          common.MAV_RESULT_DENIED,
+			TargetSystem:    mavlinkSourceSystemID,
+			TargetComponent: mavlinkSourceComponentID,
+		})
+		return nil
+	}
+	result := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+		CommandId: "command-recipient", AircraftId: "aircraft-1",
+		Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+	})
+	if result.GetStatus() != agentv1.AircraftCommandResult_STATUS_REJECTED || !strings.Contains(result.GetMessage(), common.MAV_RESULT_DENIED.String()) {
+		t.Fatalf("result = %+v, want denial addressed to Agent MAVLink identity", result)
+	}
+}
+
 func TestAircraftCommandTimesOutWithoutAck(t *testing.T) {
 	agent := &Agent{
 		options:       &AgentOptions{AircraftCommandTimeout: 10 * time.Millisecond},

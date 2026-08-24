@@ -95,8 +95,8 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 				},
 			},
 			OutVersion:     gomavlib.V2,
-			OutSystemID:    255,
-			OutComponentID: uint8(common.MAV_COMP_ID_MISSIONPLANNER),
+			OutSystemID:    mavlinkSourceSystemID,
+			OutComponentID: mavlinkSourceComponentID,
 			Dialect:        common.Dialect,
 		},
 		options:        options,
@@ -116,8 +116,8 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 				},
 			},
 			OutVersion:     gomavlib.V2,
-			OutSystemID:    255,
-			OutComponentID: uint8(common.MAV_COMP_ID_MISSIONPLANNER),
+			OutSystemID:    mavlinkSourceSystemID,
+			OutComponentID: mavlinkSourceComponentID,
 			Dialect:        common.Dialect,
 		}
 	}
