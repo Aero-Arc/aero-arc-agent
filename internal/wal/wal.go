@@ -1159,9 +1159,14 @@ func (w *WAL) deleteSpoolImport(ctx context.Context, spoolID string) error {
 }
 
 func (w *WAL) cleanupOrphanedSpoolImports(ctx context.Context) error {
-	w.spoolMu.Lock()
+	if err := lockMutexContext(ctx, &w.spoolMu); err != nil {
+		return err
+	}
 	defer w.spoolMu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(w.spoolDir)
 	if err != nil {
 		return fmt.Errorf("failed to read spool dir for import cleanup: %w", err)

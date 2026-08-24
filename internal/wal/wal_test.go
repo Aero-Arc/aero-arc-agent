@@ -2177,6 +2177,28 @@ func TestWALDrainCancellationRetainsValidSpool(t *testing.T) {
 	}
 }
 
+func TestWALOrphanCleanupLockHonorsCancellation(t *testing.T) {
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "cancel-cleanup-lock.db"))
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	w.spoolMu.Lock()
+	defer w.spoolMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := w.cleanupOrphanedSpoolImports(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cleanupOrphanedSpoolImports() error = %v, want deadline exceeded", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("cleanup lock ignored context for %v", time.Since(started))
+	}
+}
+
 func TestWALCloseContextInterruptsBlockedStartupDrain(t *testing.T) {
 	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "blocked-drain.db"))
 	w.writerDone = make(chan struct{})

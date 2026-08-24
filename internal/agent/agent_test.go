@@ -63,6 +63,31 @@ func TestAgentShutdownPassesDeadlineToWALClose(t *testing.T) {
 	}
 }
 
+func TestAgentShutdownFlushesWALBeforeMAVLinkDeadline(t *testing.T) {
+	a := &Agent{}
+	walClosed := make(chan struct{})
+	a.closeWALFn = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("WAL close started without reserved shutdown time: %v", err)
+		}
+		close(walClosed)
+		return nil
+	}
+	a.closeMAVLinkFn = func(ctx context.Context) {
+		select {
+		case <-walClosed:
+		case <-ctx.Done():
+			t.Error("MAVLink close started before WAL close")
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := a.shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -631,9 +656,19 @@ func TestStart_ImmediateCancel(t *testing.T) {
 	if err := a.node.Initialize(); err != nil {
 		t.Fatalf("Failed to initialize node: %v", err)
 	}
+	shutdownErr := errors.New("forced shutdown diagnostic")
+	a.closeWALFn = func(ctx context.Context) error {
+		if a.wal == nil {
+			return shutdownErr
+		}
+		return errors.Join(a.wal.CloseContext(ctx), shutdownErr)
+	}
 
 	err = a.Start(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Expected context.Canceled, got %v", err)
+	}
+	if !errors.Is(err, shutdownErr) {
+		t.Errorf("Start did not surface shutdown error: %v", err)
 	}
 }

@@ -41,12 +41,13 @@ type Agent struct {
 
 	// Internal hooks primarily for testing; in production these are wired to
 	// the concrete implementations below.
-	dialFn        func(ctx context.Context) (*grpc.ClientConn, error)
-	registerFn    func(ctx context.Context) error
-	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
-	ackLoopFn     func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
-	sleepWithBack func(ctx context.Context, d time.Duration) bool
-	closeWALFn    func(ctx context.Context) error
+	dialFn         func(ctx context.Context) (*grpc.ClientConn, error)
+	registerFn     func(ctx context.Context) error
+	openStreamFn   func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
+	ackLoopFn      func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
+	sleepWithBack  func(ctx context.Context, d time.Duration) bool
+	closeWALFn     func(ctx context.Context) error
+	closeMAVLinkFn func(ctx context.Context)
 
 	stateMu          sync.RWMutex
 	sessionID        string
@@ -117,7 +118,7 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 
 // Start runs the MAVLink ingest loop and the gRPC reconnect/stream lifecycle
 // until the provided context is cancelled or a fatal error occurs.
-func (a *Agent) Start(ctx context.Context) error {
+func (a *Agent) Start(ctx context.Context) (startErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -126,8 +127,9 @@ func (a *Agent) Start(ctx context.Context) error {
 		// Use a fresh context for shutdown since 'ctx' might be cancelled.
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelShutdown()
-		// We ignore the error here as we are shutting down anyway.
-		_ = a.shutdown(shutdownCtx)
+		if err := a.shutdown(shutdownCtx); err != nil {
+			startErr = errors.Join(startErr, fmt.Errorf("agent shutdown: %w", err))
+		}
 	}()
 
 	// Resolve Identity
@@ -208,12 +210,6 @@ func (a *Agent) shutdown(ctx context.Context) error {
 		}
 	}
 
-	slog.Info("shutting down mavlink node (best effort)")
-	mavlinkCloseCtx, cancel := context.WithTimeout(ctx, time.Second*10)
-	defer cancel()
-
-	a.closeMAVLinkBestEffort(mavlinkCloseCtx)
-
 	if a.closeWALFn != nil {
 		slog.Info("shutting down write-ahead log connection")
 		if err := a.closeWALFn(ctx); err != nil {
@@ -224,6 +220,15 @@ func (a *Agent) shutdown(ctx context.Context) error {
 		if err := a.wal.CloseContext(ctx); err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close write-ahead log: %w", err))
 		}
+	}
+
+	slog.Info("shutting down mavlink node (best effort)")
+	mavlinkCloseCtx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+	if a.closeMAVLinkFn != nil {
+		a.closeMAVLinkFn(mavlinkCloseCtx)
+	} else {
+		a.closeMAVLinkBestEffort(mavlinkCloseCtx)
 	}
 
 	done := make(chan struct{})
