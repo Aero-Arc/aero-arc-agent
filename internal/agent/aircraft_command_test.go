@@ -291,6 +291,81 @@ func TestAircraftCommandFenceIgnoresLateDenialForPreviousCommand(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandLeavesAmbiguityAfterQuietEpoch(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		armed      bool
+		command    agentv1.AircraftCommandType
+		ack        common.MAV_RESULT
+		wantStatus agentv1.AircraftCommandResult_Status
+	}{
+		{name: "definitive denial", armed: false, command: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM, ack: common.MAV_RESULT_DENIED, wantStatus: agentv1.AircraftCommandResult_STATUS_REJECTED},
+		{name: "accepted no-op", armed: true, command: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM, ack: common.MAV_RESULT_ACCEPTED, wantStatus: agentv1.AircraftCommandResult_STATUS_ACCEPTED},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 50 * time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			channel := &gomavlib.Channel{}
+			agent.observeMAVLinkHeartbeat(channel, 1, 1, test.armed)
+			agent.mavlinkMu.Lock()
+			agent.aircraftAckAmbiguousSince = time.Now().Add(-agent.aircraftCommandTimeout())
+			agent.mavlinkMu.Unlock()
+			agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+				agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+					Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Result: test.ack,
+				})
+				return nil
+			}
+
+			got := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+				CommandId: "after-quiet-epoch", AircraftId: "aircraft-1", Type: test.command,
+			})
+			if got.GetStatus() != test.wantStatus {
+				t.Fatalf("post-quiescence result = %+v, want %s", got, test.wantStatus)
+			}
+			agent.mavlinkMu.Lock()
+			stillAmbiguous := agent.aircraftAckAmbiguous
+			agent.mavlinkMu.Unlock()
+			if stillAmbiguous {
+				t.Fatal("quiet ACK epoch did not leave ambiguity mode")
+			}
+		})
+	}
+}
+
+func TestAircraftCommandAckActivityRestartsQuietEpoch(t *testing.T) {
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	agent.mavlinkMu.Lock()
+	agent.aircraftAckAmbiguousSince = time.Now().Add(-agent.aircraftCommandTimeout())
+	agent.mavlinkMu.Unlock()
+	// An ACK observed before the next send proves the transport is not yet
+	// quiescent and restarts the epoch even when no command is pending.
+	agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+		Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Result: common.MAV_RESULT_DENIED,
+	})
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+			Command: common.MAV_CMD_COMPONENT_ARM_DISARM, Result: common.MAV_RESULT_DENIED,
+		})
+		return nil
+	}
+
+	got := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+		CommandId: "before-renewed-quiet-epoch", AircraftId: "aircraft-1",
+		Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+	})
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
+		t.Fatalf("result after pre-send ACK activity = %+v, want fenced timeout", got)
+	}
+}
+
 func TestAircraftCommandFenceRequiresObservedTransitionFromMatchingState(t *testing.T) {
 	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 60 * time.Millisecond})
 	if err != nil {

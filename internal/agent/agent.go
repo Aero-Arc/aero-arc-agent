@@ -59,9 +59,14 @@ type Agent struct {
 	mavlinkHeartbeatSeq   uint64
 	pendingMAVLinkCommand *pendingMAVLinkCommand
 	aircraftAckAmbiguous  bool
-	aircraftCommandMu     sync.Mutex
-	aircraftCommandActive bool
-	writeMAVLinkCommand   func(*gomavlib.Channel, *common.MessageCommandLong) error
+	// aircraftAckAmbiguousSince starts a transport-quiescence epoch at the
+	// first target heartbeat and after matching ACK activity or an uncertain
+	// command outcome. A full command-timeout interval without such activity
+	// safely returns later commands to direct ACK correlation.
+	aircraftAckAmbiguousSince time.Time
+	aircraftCommandMu         sync.Mutex
+	aircraftCommandActive     bool
+	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
 
 	ingestCount atomic.Uint64
 	sendCount   atomic.Uint64
@@ -103,8 +108,9 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 		backoffInitial: options.BackoffInitial,
 		backoffMax:     options.BackoffMax,
 		// A COMMAND_ACK buffered before a process restart is indistinguishable
-		// from the first new ARM/DISARM acknowledgement. Start fenced and use
-		// fresh post-send heartbeat state as the durable command boundary.
+		// from the first new ARM/DISARM acknowledgement. Start fenced; the first
+		// target heartbeat begins a full ACK-quiescence epoch before direct
+		// correlation is enabled again.
 		aircraftAckAmbiguous: true,
 	}
 	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, command *common.MessageCommandLong) error {
