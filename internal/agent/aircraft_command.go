@@ -364,12 +364,7 @@ func aircraftCommandBusyResult(result *agentv1.AircraftCommandResult) *agentv1.A
 }
 
 func (a *Agent) waitForAircraftACKQuiescenceOrTransition(ctx context.Context, desiredArmed bool) bool {
-	pollInterval := a.aircraftCommandTimeout() / 20
-	if pollInterval < time.Millisecond {
-		pollInterval = time.Millisecond
-	} else if pollInterval > 50*time.Millisecond {
-		pollInterval = 50 * time.Millisecond
-	}
+	pollInterval := aircraftACKQuiescencePollInterval(a.aircraftCommandTimeout())
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
@@ -388,13 +383,28 @@ func (a *Agent) waitForAircraftACKQuiescenceOrTransition(ctx context.Context, de
 	}
 }
 
+func aircraftACKQuiescencePollInterval(timeout time.Duration) time.Duration {
+	pollInterval := timeout / 20
+	if pollInterval < time.Millisecond {
+		pollInterval = time.Millisecond
+	} else if pollInterval > 50*time.Millisecond {
+		pollInterval = 50 * time.Millisecond
+	}
+	return pollInterval
+}
+
 func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *preparedAircraftCommand) *agentv1.AircraftCommandResult {
 	command := prepared.command
 	result := prepared.result
 	param1 := prepared.param1
 	desiredArmed := prepared.desiredArmed
 	timeout := a.aircraftCommandTimeout()
-	admissionCtx, cancelAdmission := context.WithTimeout(ctx, timeout)
+	// A newly re-armed fence has no epoch until the next selected-channel event.
+	// Bound admission by one interval to observe that first progress, one full
+	// interval to prove continuous quiescence, and one polling interval of
+	// scheduling slack.
+	admissionTimeout := 2*timeout + aircraftACKQuiescencePollInterval(timeout)
+	admissionCtx, cancelAdmission := context.WithTimeout(ctx, admissionTimeout)
 	defer cancelAdmission()
 
 	var target *mavlinkTarget

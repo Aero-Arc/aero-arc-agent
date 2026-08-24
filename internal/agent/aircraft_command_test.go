@@ -815,6 +815,54 @@ func TestAircraftCommandACKTimeoutStartsAfterQuiescence(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandAdmissionAllowsQuietEpochToStart(t *testing.T) {
+	const timeout = 80 * time.Millisecond
+	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: timeout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+	// Model the fence immediately after a prior command completes: the selected
+	// target is known, but no event has started the next quiet epoch yet.
+	agent.mavlinkMu.Lock()
+	agent.rearmAircraftACKFenceLocked()
+	agent.mavlinkMu.Unlock()
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		afterAircraftCommandEnqueue(agent, func() {
+			agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+				Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+				Result:  common.MAV_RESULT_ACCEPTED,
+			})
+		})
+		return nil
+	}
+
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "late-quiet-epoch", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+		})
+	}()
+	// Start progress halfway through the first interval, then maintain it long
+	// enough to complete a full quiet epoch. An admission deadline equal to one
+	// interval would expire before this proof could finish.
+	time.Sleep(timeout / 2)
+	for range 5 {
+		agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+		time.Sleep(timeout / 4)
+	}
+	select {
+	case got := <-result:
+		if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+			t.Fatalf("late-starting quiet epoch result = %+v, want accepted", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for late-starting quiet epoch command")
+	}
+}
+
 func TestAircraftCommandFenceRefreshesArmedStateAtEnqueueBoundary(t *testing.T) {
 	agent, err := NewAgent(&AgentOptions{AircraftCommandTimeout: 60 * time.Millisecond})
 	if err != nil {
