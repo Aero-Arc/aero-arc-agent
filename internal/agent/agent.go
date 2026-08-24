@@ -41,11 +41,13 @@ type Agent struct {
 
 	// Internal hooks primarily for testing; in production these are wired to
 	// the concrete implementations below.
-	dialFn        func(ctx context.Context) (*grpc.ClientConn, error)
-	registerFn    func(ctx context.Context) error
-	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
-	ackLoopFn     func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
-	sleepWithBack func(ctx context.Context, d time.Duration) bool
+	dialFn         func(ctx context.Context) (*grpc.ClientConn, error)
+	registerFn     func(ctx context.Context) error
+	openStreamFn   func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
+	ackLoopFn      func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
+	sleepWithBack  func(ctx context.Context, d time.Duration) bool
+	closeWALFn     func(ctx context.Context) error
+	closeMAVLinkFn func(ctx context.Context)
 
 	stateMu          sync.RWMutex
 	sessionID        string
@@ -130,7 +132,7 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 
 // Start runs the MAVLink ingest loop and the gRPC reconnect/stream lifecycle
 // until the provided context is cancelled or a fatal error occurs.
-func (a *Agent) Start(ctx context.Context) error {
+func (a *Agent) Start(ctx context.Context) (startErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -139,8 +141,9 @@ func (a *Agent) Start(ctx context.Context) error {
 		// Use a fresh context for shutdown since 'ctx' might be cancelled.
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelShutdown()
-		// We ignore the error here as we are shutting down anyway.
-		_ = a.shutdown(shutdownCtx)
+		if err := a.shutdown(shutdownCtx); err != nil {
+			startErr = errors.Join(startErr, fmt.Errorf("agent shutdown: %w", err))
+		}
 	}()
 
 	// Resolve Identity
@@ -213,20 +216,33 @@ func (a *Agent) Start(ctx context.Context) error {
 }
 
 func (a *Agent) shutdown(ctx context.Context) error {
+	var shutdownErr error
 	if a.conn != nil {
 		slog.Info("shutting down grpc connection")
-		a.conn.Close()
+		if err := a.conn.Close(); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close gRPC connection: %w", err))
+		}
+	}
+
+	if a.closeWALFn != nil {
+		slog.Info("shutting down write-ahead log connection")
+		if err := a.closeWALFn(ctx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close write-ahead log: %w", err))
+		}
+	} else if a.wal != nil {
+		slog.Info("shutting down write-ahead log connection")
+		if err := a.wal.CloseContext(ctx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close write-ahead log: %w", err))
+		}
 	}
 
 	slog.Info("shutting down mavlink node (best effort)")
 	mavlinkCloseCtx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
-
-	a.closeMAVLinkBestEffort(mavlinkCloseCtx)
-
-	if a.wal != nil {
-		slog.Info("shutting down write-ahead log connection")
-		a.wal.Close()
+	if a.closeMAVLinkFn != nil {
+		a.closeMAVLinkFn(mavlinkCloseCtx)
+	} else {
+		a.closeMAVLinkBestEffort(mavlinkCloseCtx)
 	}
 
 	done := make(chan struct{})
@@ -239,12 +255,13 @@ func (a *Agent) shutdown(ctx context.Context) error {
 	case <-done:
 	case <-ctx.Done():
 		slog.Warn("shutdown timed out waiting for goroutines to finish")
+		shutdownErr = errors.Join(shutdownErr, ctx.Err())
 	}
 
 	a.gateway = nil
 	a.conn = nil
 
-	return nil
+	return shutdownErr
 }
 
 func (a *Agent) closeMAVLinkBestEffort(ctx context.Context) {
@@ -384,27 +401,12 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// TODO: Use a proper TLS config with a valid certificate.
-	var creds credentials.TransportCredentials
-	var err error
-
-	if a.options.Debug {
-
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
+	creds, err := relayTransportCredentials(a.options)
+	if err != nil {
+		if errors.Is(err, ErrGettingHomeDir) {
 			slog.LogAttrs(ctx, slog.LevelError, ErrGettingHomeDir.Error(), slog.String("error", err.Error()))
-			return nil, ErrGettingHomeDir
 		}
-
-		certPath := fmt.Sprintf("%s/%s", homeDir, DebugTLSCertPath)
-		creds, err = credentials.NewClientTLSFromFile(certPath, "localhost")
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		creds = credentials.NewTLS(&tls.Config{
-			InsecureSkipVerify: a.options.SkipTLSVerification,
-		})
+		return nil, err
 	}
 
 	slog.LogAttrs(
@@ -426,6 +428,25 @@ func (a *Agent) establishRelayConnection(ctx context.Context) (*grpc.ClientConn,
 	}
 
 	return conn, nil
+}
+
+func relayTransportCredentials(options *AgentOptions) (credentials.TransportCredentials, error) {
+	if options.SkipTLSVerification {
+		return credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}), nil //nolint:gosec // Explicit development-only CLI option.
+	}
+	if options.Debug {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrGettingHomeDir, err)
+		}
+		certPath := fmt.Sprintf("%s/%s", homeDir, DebugTLSCertPath)
+		creds, err := credentials.NewClientTLSFromFile(certPath, "localhost")
+		if err != nil {
+			return nil, err
+		}
+		return creds, nil
+	}
+	return credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12}), nil
 }
 
 // register performs the Register RPC with the relay.
@@ -479,11 +500,16 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 	)
 
 	agentID := identity.Resolve().FinalID
-	streamCtx := metadata.AppendToOutgoingContext(ctx, "aero-arc-agent-id", agentID)
 	a.stateMu.RLock()
 	sessionID := a.sessionID
 	a.stateMu.RUnlock()
-	streamCtx = metadata.AppendToOutgoingContext(streamCtx, "aero-arc-session-id", sessionID)
+	if sessionID == "" {
+		return nil, errors.New("relay session ID is unavailable")
+	}
+	streamCtx := metadata.AppendToOutgoingContext(ctx,
+		"aero-arc-agent-id", agentID,
+		"aero-arc-session-id", sessionID,
+	)
 
 	stream, err := a.gateway.TelemetryStream(streamCtx)
 	if err != nil {
@@ -658,6 +684,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				continue
 			}
 			tFrame.Seq = uint64(entries[i].ID)
+			a.stampWALGeneration(tFrame)
 			a.stampCurrentSession(tFrame)
 
 			message := &agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_TelemetryFrame{TelemetryFrame: tFrame}}
@@ -679,6 +706,12 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		}
 
 		slog.LogAttrs(ctx, slog.LevelInfo, "mark_batch_succeed", slog.Int("batch_size", entriesLen))
+	}
+}
+
+func (a *Agent) stampWALGeneration(frame *agentv1.TelemetryFrame) {
+	if frame.WalId == "" {
+		frame.WalId = a.wal.GenerationID()
 	}
 }
 
@@ -736,6 +769,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 				slog.Int64("backoff_ms", backoff.Milliseconds()),
 			)
 
+			cancelConn()
 			_ = conn.Close()
 			a.conn = nil
 			a.gateway = nil
@@ -758,6 +792,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 				slog.Int64("backoff_ms", backoff.Milliseconds()),
 			)
 
+			cancelConn()
 			_ = conn.Close()
 			a.conn = nil
 			a.gateway = nil
@@ -784,7 +819,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			err = ctx.Err()
-		case err := <-errChan:
+		case err = <-errChan:
 			slog.LogAttrs(ctx, slog.LevelInfo, "stream_ended", slog.String("error", fmt.Sprint(err)))
 		}
 

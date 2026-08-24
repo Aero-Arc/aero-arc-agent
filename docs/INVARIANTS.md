@@ -12,23 +12,33 @@ They are written to preserve correctness, durability, and operability under real
 
 ### 1.1 WAL Is the System of Record
 
-- All telemetry frames **must be written to the WAL before being sent** to the relay
+- All telemetry frames **must be durably written before being sent** to the relay
 - No frame is transmitted over gRPC unless it has been durably persisted
-- The WAL is the authoritative source for replay, recovery, and resend
+- SQLite and finalized spool files together are the authoritative source for
+  replay, recovery, and resend
 - If the WAL is unavailable, telemetry ingestion must fail rather than bypass durability
+- `AppendAsync` acceptance owns an immutable copy but is not itself a disk
+  durability boundary; an abrupt process or power loss can lose the current
+  unflushed batch
 
-**Rationale:**  
-Durability is more important than availability. The WAL provides crash safety and enables at-least-once delivery semantics.
+**Rationale:**
+Durability is more important than availability. Persisted frames are crash-safe,
+while batching makes the pre-flush capture window an explicit performance and
+durability tradeoff.
 
 ---
 
-### 1.2 At-Least-Once Delivery Is Guaranteed
+### 1.2 Delivery Is At Least Once After Durable Admission
 
 - Telemetry frames may be delivered more than once
 - Exactly-once delivery is **not** a goal
 - Frames are only marked as delivered after an explicit ACK from the relay
+- The guarantee begins when a frame reaches SQLite or a synced spool file, not
+  when it first enters the asynchronous memory queue
+- A Relay ACK confirms admission by the official telemetry consumer; it does
+  not prove that every downstream sink has durably committed the frame
 
-**Rationale:**  
+**Rationale:**
 Distributed systems favor correctness and durability over strict deduplication guarantees.
 
 ---
@@ -41,6 +51,24 @@ Distributed systems favor correctness and durability over strict deduplication g
 
 **Rationale:**  
 The relay is the downstream system of record for delivery confirmation.
+
+---
+
+### 1.4 WAL Cursor Identity Is Composite
+
+- `seq` is monotonic only within its WAL append generation
+- Every successful WAL open rotates to a fresh non-nil UUID for newly captured
+  frames
+- Every persisted frame owns the `(wal_id, seq)` pair stamped before its first
+  durable write
+- Retry, reconnect, spool import, and process restart must preserve that pair
+- A cloned, restored, recreated, or rollback-appended database must not cause a
+  cursor pair to be reused
+
+**Rationale:**
+A row sequence alone is ambiguous across WAL lifetimes. The generation-scoped
+cursor lets downstream systems distinguish retry from new capture without
+coupling identity to a process or Relay session.
 
 ---
 
@@ -83,14 +111,19 @@ Hardware I/O and serial connections may block forever. The agent prioritizes pro
 
 ---
 
-### 2.4 WAL Is Closed After Ingest Stops
+### 2.4 WAL Durability Is Reserved Before Hardware Teardown
 
-- MAVLink ingest must stop before WAL shutdown
-- WAL shutdown must unblock any waiting readers/writers
-- WAL shutdown must not deadlock the process
+- Lifecycle cancellation stops new ingest and reconnect work
+- WAL close rejects late appends, durably spools its accepted in-memory batch,
+  and must not close SQLite beneath an active writer
+- The WAL close attempt occurs before potentially blocking best-effort MAVLink
+  teardown so hardware cleanup cannot consume the durability deadline
+- Shutdown is bounded; a deadline failure must be surfaced rather than reported
+  as a successful durable close
 
 **Rationale:**  
-WAL durability and consistency depend on an orderly teardown sequence.
+Accepted telemetry gets the first opportunity to reach durable storage while
+hardware I/O remains best-effort.
 
 ---
 
@@ -120,12 +153,25 @@ The agent is designed to operate in hostile and resource-constrained environment
 
 ### 3.3 WAL Capacity Is Finite
 
-- WAL storage is finite and may fill up
+- WAL and spool storage are finite and may fill up
 - When WAL capacity is exhausted, ingestion must fail loudly
 - Silent data loss is not acceptable
 
 **Rationale:**  
 Backpressure must surface explicitly rather than corrupting system correctness.
+
+---
+
+### 3.4 Poison Data Must Be Isolated
+
+- Nil, unserializable, and oversized frames must be rejected before queueing
+- Malformed legacy SQLite rows and spool files must be quarantined with their
+  diagnostic evidence retained
+- One malformed record must not permanently block later valid telemetry
+
+**Rationale:**
+Durability includes preserving failure evidence, but availability requires a
+bad record to have a bounded blast radius.
 
 ---
 

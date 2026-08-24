@@ -3,8 +3,10 @@ package wal
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,8 +19,27 @@ import (
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
+)
+
+// Keep legacy migration memory bounded on constrained companion computers.
+const legacyFrameMigrationBatchSize = 128
+
+// Keep durable marker reclamation transactions bounded as well.
+const spoolImportCleanupBatchSize = 128
+
+// Keep explicit quarantine cleanup transactions bounded on constrained disks.
+const quarantineCleanupBatchSize = 128
+
+const lifecycleShutdownGrace = 5 * time.Second
+
+const (
+	spoolFileMagic           = "AEROARC-SPOOL\x00\x01"
+	spoolIDLength            = 36
+	maxSpoolFramePayloadSize = 16 << 20
+	spoolReadChunkSize       = 64 << 10
 )
 
 // Entry represents a single log entry in the WAL.
@@ -30,18 +51,54 @@ type Entry struct {
 
 // WAL implements a Write-Ahead Log using SQLite.
 type WAL struct {
-	db           *sql.DB
-	doneChan     chan struct{}
-	batchChan    chan *agentv1.TelemetryFrame
-	signalChan   chan struct{}
-	batchSize    int64
-	batchTimeout time.Duration
-	spoolDir     string
-	spoolSeq     uint64
-	spoolMu      sync.Mutex
+	db                 *sql.DB
+	generationID       string
+	closeWake          chan struct{}
+	closeDone          chan struct{}
+	writerDone         chan struct{}
+	batchChan          chan *agentv1.TelemetryFrame
+	signalChan         chan struct{}
+	batchSize          int64
+	batchTimeout       time.Duration
+	spoolDir           string
+	spoolQuarantineDir string
+	spoolSeq           uint64
+	spoolMu            sync.Mutex
+	appendMu           sync.RWMutex
+	removeFile         func(string) error
+	renameFile         func(string, string) error
+	syncDir            func(string) error
+	marshalSpoolFrame  func(*agentv1.TelemetryFrame) ([]byte, error)
+	closeDB            func() error
+	writerWorkMu       sync.Mutex
+	cancelWriterWork   context.CancelFunc
+	closeRequestMu     sync.Mutex
+	closeContexts      []context.Context
+	finalizeOnce       sync.Once
+	closing            atomic.Bool
+	closeErr           error
 }
 
-// New creates or opens a WAL at the specified path.
+// New creates or opens a WAL and starts a new durable append generation.
+// Frames appended through the returned WAL are stamped before persistence, so
+// retries retain their original `(generation, sequence)` cursor across process
+// restarts. Starting a new generation on every open prevents a restored or
+// cloned database from reusing cursors allocated after its snapshot.
+//
+// Parameters:
+//   - ctx: bounds initialization and triggers a bounded durable writer shutdown
+//     when its lifecycle is cancelled.
+//   - path: identifies the SQLite database and its adjacent spill directory.
+//   - batchSize: controls asynchronous transaction size; non-positive values
+//     select the default.
+//   - batchTimeout: controls asynchronous flush latency; non-positive values
+//     select the default.
+//
+// Returns:
+//   - wal: owns the database, spill directory, and background writer.
+//   - error: reports database configuration, schema, generation identity, or
+//     spill-directory initialization failures.
+//
 // TODO: Add time.Duration for the WAL cleanup interval.
 func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
@@ -58,6 +115,11 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		db.Close()
 		return nil, err
 	}
+	generationID, err := startGenerationID(ctx, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	// Default values if not provided
 	if batchSize <= 0 {
@@ -69,17 +131,28 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 
 	wal := &WAL{
 		db:           db,
-		doneChan:     make(chan struct{}),
+		generationID: generationID,
+		closeWake:    make(chan struct{}, 1),
+		closeDone:    make(chan struct{}),
+		writerDone:   make(chan struct{}),
 		batchChan:    make(chan *agentv1.TelemetryFrame, batchSize*2), // Buffer a bit more than one batch
 		signalChan:   make(chan struct{}, 1),                          // Buffer 1 to prevent blocking
 		batchSize:    batchSize,
 		batchTimeout: batchTimeout,
 		spoolDir:     path + ".spool",
+		removeFile:   os.Remove,
+		renameFile:   os.Rename,
+		syncDir:      syncDirectory,
+		marshalSpoolFrame: func(frame *agentv1.TelemetryFrame) ([]byte, error) {
+			return proto.Marshal(frame)
+		},
+		closeDB: db.Close,
 	}
+	wal.spoolQuarantineDir = filepath.Join(wal.spoolDir, "quarantine")
 
-	if err := os.MkdirAll(wal.spoolDir, 0o755); err != nil {
+	if err := os.MkdirAll(wal.spoolQuarantineDir, 0o755); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to create spool dir: %w", err)
+		return nil, fmt.Errorf("failed to create spool quarantine dir: %w", err)
 	}
 
 	// Start the background writer
@@ -126,6 +199,28 @@ func initDB(db *sql.DB) error {
 		command_id TEXT PRIMARY KEY,
 		processed_at INTEGER NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS wal_metadata (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		generation_id TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS wal_identity_migration (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		legacy_generation_id TEXT NOT NULL,
+		last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+		completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
+	);
+	CREATE TABLE IF NOT EXISTS telemetry_frame_quarantine (
+		seq INTEGER PRIMARY KEY,
+		quarantined_at INTEGER NOT NULL,
+		reason TEXT NOT NULL,
+		original_delivery_status INTEGER NOT NULL,
+		FOREIGN KEY(seq) REFERENCES telemetry_frames(seq) ON DELETE CASCADE
+	);
+	CREATE TABLE IF NOT EXISTS spool_imports (
+		spool_id TEXT PRIMARY KEY,
+		imported_at INTEGER NOT NULL,
+		seen_token TEXT NOT NULL DEFAULT ''
+	);
 	`
 	_, err := db.Exec(query)
 	if err != nil {
@@ -135,13 +230,316 @@ func initDB(db *sql.DB) error {
 	indexQuery := `
 	CREATE INDEX IF NOT EXISTS idx_telemetry_undelivered
 	ON telemetry_frames (delivery_status, seq);
+	CREATE INDEX IF NOT EXISTS idx_telemetry_frame_quarantine_newest
+	ON telemetry_frame_quarantine (quarantined_at DESC, seq DESC);
 	`
 	_, err = db.Exec(indexQuery)
 	if err != nil {
 		return fmt.Errorf("failed to create index: %w", err)
 	}
+	if err := ensureSpoolImportSeenToken(db); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func ensureSpoolImportSeenToken(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('spool_imports') WHERE name = 'seen_token'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect spool import schema: %w", err)
+	}
+	if count != 0 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE spool_imports ADD COLUMN seen_token TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("add spool import cleanup token: %w", err)
+	}
+	return nil
+}
+
+func startGenerationID(ctx context.Context, db *sql.DB) (string, error) {
+	state, err := loadOrCreateLegacyMigration(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	for !state.completed {
+		state, err = migrateLegacyFrameBatch(ctx, db, state.generationID)
+		if err != nil {
+			return "", err
+		}
+	}
+	return rotateGenerationID(ctx, db)
+}
+
+type legacyMigrationState struct {
+	generationID string
+	lastSeq      int64
+	completed    bool
+}
+
+// loadOrCreateLegacyMigration durably selects the one generation used for all
+// unstamped rows before any payload batches are rewritten. A completed cursor
+// remains a high-water mark: if an older Agent binary later appends rows
+// without wal_id, the next upgrade reopens migration only for that new tail
+// and assigns it the generation that remained persisted during the rollback.
+func loadOrCreateLegacyMigration(ctx context.Context, db *sql.DB) (legacyMigrationState, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("begin WAL identity migration setup: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	state, found, err := loadLegacyMigrationState(ctx, tx)
+	if err != nil {
+		return legacyMigrationState{}, err
+	}
+	if found {
+		var currentGenerationID string
+		if err := tx.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&currentGenerationID); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("load current WAL generation identity: %w", err)
+		}
+		if _, err := uuid.Parse(currentGenerationID); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("load current WAL generation identity: invalid UUID %q: %w", currentGenerationID, err)
+		}
+		if !state.completed && currentGenerationID != state.generationID {
+			return legacyMigrationState{}, fmt.Errorf("incomplete WAL identity migration generation %q does not match current generation %q", state.generationID, currentGenerationID)
+		}
+		if state.completed {
+			var maxSeq int64
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM telemetry_frames`).Scan(&maxSeq); err != nil {
+				return legacyMigrationState{}, fmt.Errorf("inspect WAL identity migration high-water mark: %w", err)
+			}
+			if maxSeq > state.lastSeq {
+				result, err := tx.ExecContext(ctx, `UPDATE wal_identity_migration
+					SET legacy_generation_id = ?, completed = 0
+					WHERE id = 1`, currentGenerationID)
+				if err != nil {
+					return legacyMigrationState{}, fmt.Errorf("reopen WAL identity migration after legacy append: %w", err)
+				}
+				if rows, err := result.RowsAffected(); err != nil {
+					return legacyMigrationState{}, fmt.Errorf("inspect reopened WAL identity migration: %w", err)
+				} else if rows != 1 {
+					return legacyMigrationState{}, fmt.Errorf("reopen WAL identity migration: updated %d rows, want 1", rows)
+				}
+				if err := tx.Commit(); err != nil {
+					return legacyMigrationState{}, fmt.Errorf("commit reopened WAL identity migration: %w", err)
+				}
+				state.generationID = currentGenerationID
+				state.completed = false
+			}
+		}
+		return state, nil
+	}
+
+	var generationID string
+	err = tx.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&generationID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return legacyMigrationState{}, fmt.Errorf("load WAL generation for identity migration: %w", err)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		generationID = uuid.NewString()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO wal_metadata(id, generation_id) VALUES(1, ?)`, generationID); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("initialize WAL generation for identity migration: %w", err)
+		}
+	} else if _, err := uuid.Parse(generationID); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("load WAL generation for identity migration: invalid UUID %q: %w", generationID, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `INSERT INTO wal_identity_migration(
+		id, legacy_generation_id, last_seq, completed) VALUES(1, ?, 0, 0)`, generationID); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("initialize WAL identity migration: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("commit WAL identity migration setup: %w", err)
+	}
+	return legacyMigrationState{generationID: generationID}, nil
+}
+
+func loadLegacyMigrationState(ctx context.Context, tx *sql.Tx) (legacyMigrationState, bool, error) {
+	var state legacyMigrationState
+	var completed int
+	err := tx.QueryRowContext(ctx, `SELECT legacy_generation_id, last_seq, completed
+		FROM wal_identity_migration WHERE id = 1`).Scan(&state.generationID, &state.lastSeq, &completed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return legacyMigrationState{}, false, nil
+	}
+	if err != nil {
+		return legacyMigrationState{}, false, fmt.Errorf("load WAL identity migration: %w", err)
+	}
+	if _, err := uuid.Parse(state.generationID); err != nil {
+		return legacyMigrationState{}, false, fmt.Errorf("load WAL identity migration: invalid UUID %q: %w", state.generationID, err)
+	}
+	if state.lastSeq < 0 || (completed != 0 && completed != 1) {
+		return legacyMigrationState{}, false, fmt.Errorf("load WAL identity migration: invalid progress last_seq=%d completed=%d", state.lastSeq, completed)
+	}
+	state.completed = completed == 1
+	return state, true, nil
+}
+
+// migrateLegacyFrameBatch commits at most one bounded payload batch together
+// with its cursor. Valid frames are stamped, while malformed frames and their
+// diagnostic reason are atomically quarantined so later startups can resume.
+func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID string) (legacyMigrationState, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("begin WAL identity migration batch: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	state, found, err := loadLegacyMigrationState(ctx, tx)
+	if err != nil {
+		return legacyMigrationState{}, err
+	}
+	if !found {
+		return legacyMigrationState{}, errors.New("WAL identity migration state is missing")
+	}
+	if state.generationID != generationID {
+		return legacyMigrationState{}, fmt.Errorf("WAL identity migration generation changed from %q to %q", generationID, state.generationID)
+	}
+	if state.completed {
+		return state, nil
+	}
+
+	type update struct {
+		seq                    int64
+		payload                []byte
+		quarantineReason       string
+		originalDeliveryStatus int
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT seq, payload, delivery_status
+		FROM telemetry_frames
+		WHERE seq > ?
+		ORDER BY seq
+		LIMIT ?`, state.lastSeq, legacyFrameMigrationBatchSize)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("query legacy WAL frames after sequence %d: %w", state.lastSeq, err)
+	}
+
+	updates := make([]update, 0, legacyFrameMigrationBatchSize)
+	scanned := 0
+	for rows.Next() {
+		var seq int64
+		var payload []byte
+		var deliveryStatus int
+		if err := rows.Scan(&seq, &payload, &deliveryStatus); err != nil {
+			return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("scan legacy WAL frame: %w", err))
+		}
+		scanned++
+		state.lastSeq = seq
+
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(payload, &frame); err != nil {
+			updates = append(updates, update{
+				seq:                    seq,
+				quarantineReason:       fmt.Sprintf("legacy WAL identity migration protobuf decode failed: %v", err),
+				originalDeliveryStatus: deliveryStatus,
+			})
+			continue
+		}
+		if frame.GetWalId() != "" {
+			continue
+		}
+		frame.WalId = generationID
+		encoded, err := proto.Marshal(&frame)
+		if err != nil {
+			return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("marshal legacy WAL frame %d: %w", seq, err))
+		}
+		updates = append(updates, update{seq: seq, payload: encoded})
+	}
+	if err := rows.Err(); err != nil {
+		return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("iterate legacy WAL frames: %w", err))
+	}
+	if err := closeLegacyRows(rows, nil); err != nil {
+		return legacyMigrationState{}, err
+	}
+
+	for _, item := range updates {
+		if item.quarantineReason != "" {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO telemetry_frame_quarantine(
+				seq, quarantined_at, reason, original_delivery_status) VALUES(?, ?, ?, ?)
+				ON CONFLICT(seq) DO NOTHING`,
+				item.seq, time.Now().UnixNano(), item.quarantineReason, item.originalDeliveryStatus); err != nil {
+				return legacyMigrationState{}, fmt.Errorf("quarantine malformed legacy WAL frame %d: %w", item.seq, err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ?`,
+				DeliveryStatusQuarantined, item.seq); err != nil {
+				return legacyMigrationState{}, fmt.Errorf("mark malformed legacy WAL frame %d quarantined: %w", item.seq, err)
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, item.payload, item.seq); err != nil {
+			return legacyMigrationState{}, fmt.Errorf("stamp legacy WAL frame %d: %w", item.seq, err)
+		}
+	}
+	state.completed = scanned < legacyFrameMigrationBatchSize
+	result, err := tx.ExecContext(ctx, `UPDATE wal_identity_migration
+		SET last_seq = ?, completed = ? WHERE id = 1`, state.lastSeq, state.completed)
+	if err != nil {
+		return legacyMigrationState{}, fmt.Errorf("persist WAL identity migration progress: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("inspect WAL identity migration progress: %w", err)
+	} else if rows != 1 {
+		return legacyMigrationState{}, fmt.Errorf("persist WAL identity migration progress: updated %d rows, want 1", rows)
+	}
+	if err := tx.Commit(); err != nil {
+		return legacyMigrationState{}, fmt.Errorf("commit WAL identity migration batch: %w", err)
+	}
+	return state, nil
+}
+
+// rotateGenerationID advances the append epoch only after legacy migration is
+// durably complete, so an interrupted migration continues using one identity.
+func rotateGenerationID(ctx context.Context, db *sql.DB) (string, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin WAL generation rotation: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	state, found, err := loadLegacyMigrationState(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	if !found || !state.completed {
+		return "", errors.New("cannot rotate WAL generation before identity migration completes")
+	}
+	nextID := uuid.NewString()
+	result, err := tx.ExecContext(ctx, `UPDATE wal_metadata SET generation_id = ? WHERE id = 1`, nextID)
+	if err != nil {
+		return "", fmt.Errorf("rotate WAL generation identity: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return "", fmt.Errorf("inspect WAL generation rotation: %w", err)
+	} else if rows != 1 {
+		return "", fmt.Errorf("rotate WAL generation identity: updated %d rows, want 1", rows)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit WAL generation rotation: %w", err)
+	}
+	return nextID, nil
+}
+
+func closeLegacyRows(rows *sql.Rows, cause error) error {
+	if err := rows.Close(); err != nil {
+		return errors.Join(cause, fmt.Errorf("close legacy WAL frame rows: %w", err))
+	}
+	return cause
+}
+
+// GenerationID returns the append generation assigned to frames newly
+// persisted by this WAL instance. A new value is created on every open while
+// generation IDs already stored in queued frames remain unchanged.
+func (w *WAL) GenerationID() string {
+	return w.generationID
 }
 
 // OperationContext is the capture-time flight attribution persisted by the agent.
@@ -227,42 +625,100 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply
 	return true, nil
 }
 
-// AppendAsync queues a frame for writing.
-// This is non-blocking unless the buffer is completely full.
+// AppendAsync validates and queues a private copy of a frame for durable
+// writing. Once this method returns, the caller may safely reuse or mutate its
+// frame without changing the accepted telemetry. Frames that cannot be
+// serialized, including protobuf strings with invalid UTF-8, are rejected
+// before entering the writer queue so they cannot block later telemetry.
+//
+// Parameters:
+//   - ctx: bounds waiting for capacity when the asynchronous queue is full.
+//   - tFrame: is copied and stamped with this WAL's append generation.
+//
+// Returns:
+//   - error: reports a nil, invalid, oversized, cancelled, or closing append;
+//     nil means the immutable private copy was accepted by the writer.
 func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) error {
-	select {
-	case w.batchChan <- tFrame:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		// If buffer is full, we can choose to drop or block.
-		// For safety, let's block with a short timeout or just block until context.
-		// For now, let's block on the channel send to provide backpressure.
+	if tFrame == nil {
+		return errors.New("cannot append a nil telemetry frame")
+	}
+	queuedFrame := proto.Clone(tFrame).(*agentv1.TelemetryFrame)
+	w.stampGeneration(queuedFrame)
+	encoded, err := proto.Marshal(queuedFrame)
+	if err != nil {
+		return fmt.Errorf("validate telemetry frame for asynchronous append: %w", err)
+	}
+	if len(encoded) > maxSpoolFramePayloadSize {
+		return fmt.Errorf("telemetry frame for asynchronous append exceeds %d-byte safety limit: %d",
+			maxSpoolFramePayloadSize, len(encoded))
+	}
+
+	for {
+		w.appendMu.RLock()
+		if w.closing.Load() {
+			w.appendMu.RUnlock()
+			return errors.New("WAL is closing")
+		}
 		select {
-		case w.batchChan <- tFrame:
+		case w.batchChan <- queuedFrame:
+			w.appendMu.RUnlock()
 			return nil
+		default:
+			w.appendMu.RUnlock()
+		}
+		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-time.After(time.Millisecond):
 		}
 	}
 }
 
-func (w *WAL) runBatchWriter(ctx context.Context) {
+func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
+	writerCtx, cancelWriterWork := context.WithCancel(lifecycleCtx)
+	w.writerWorkMu.Lock()
+	w.cancelWriterWork = cancelWriterWork
+	if w.closing.Load() {
+		cancelWriterWork()
+	}
+	w.writerWorkMu.Unlock()
+	defer func() {
+		cancelWriterWork()
+		close(w.writerDone)
+		w.finalizeClose()
+	}()
+
 	var batch []*agentv1.TelemetryFrame
+	var pendingSpoolPath string
 	ticker := time.NewTicker(w.batchTimeout)
 	defer ticker.Stop()
 
-	if err := w.drainSpool(); err != nil {
+	if err := w.drainSpoolContext(writerCtx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("WAL spool drain failed", "error", err)
 	}
 
-	flush := func() error {
+	flush := func(ctx context.Context) error {
 		if len(batch) == 0 {
 			return nil
 		}
 
-		if _, err := w.spoolBatch(batch); err != nil {
+		if pendingSpoolPath != "" {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := w.syncDir(w.spoolDir); err != nil {
+				return fmt.Errorf("sync finalized spool file %s: %w", pendingSpoolPath, err)
+			}
+			pendingSpoolPath = ""
+			batch = nil
+			return nil
+		}
+
+		path, err := w.spoolBatchFrames(ctx, batch)
+		if err != nil {
+			if path != "" {
+				pendingSpoolPath = path
+			}
 			return err
 		}
 
@@ -272,20 +728,69 @@ func (w *WAL) runBatchWriter(ctx context.Context) {
 
 	flushPending := false
 	retryDelay := 200 * time.Millisecond
+	shutdown := func(ctx context.Context, drain bool) bool {
+	collectQueued:
+		for {
+			select {
+			case frame := <-w.batchChan:
+				batch = append(batch, frame)
+			default:
+				break collectQueued
+			}
+		}
+		if err := flush(ctx); err != nil {
+			slog.Error("WAL Batch Spool Failed", "error", err)
+			return false
+		}
+		batch = nil
+		if drain {
+			if err := w.drainSpoolContext(ctx); err != nil {
+				slog.Error("WAL Spool Drain Failed", "error", err)
+			}
+		}
+		return true
+	}
 
+	lifecycleDone := lifecycleCtx.Done()
+	closePending := false
 	for {
+		if closeCtx, ok := w.takeCloseContext(); ok {
+			if shutdown(closeCtx, false) {
+				return
+			}
+			closePending = true
+			continue
+		}
+		if closePending {
+			<-w.closeWake
+			continue
+		}
 		if flushPending {
-			if err := flush(); err != nil {
-				slog.Error("WAL Batch Spool Failed", "error", err)
+			if err := flush(writerCtx); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Error("WAL Batch Spool Failed", "error", err)
+				}
 				select {
 				case <-time.After(retryDelay):
 					continue
-				case <-ctx.Done():
-					return
+				case <-w.closeWake:
+					continue
+				case <-lifecycleDone:
+					lifecycleDone = nil
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), lifecycleShutdownGrace)
+					w.requestClose(shutdownCtx)
+					go func() {
+						select {
+						case <-w.closeDone:
+						case <-shutdownCtx.Done():
+						}
+						cancel()
+					}()
+					continue
 				}
 			}
 
-			if err := w.drainSpool(); err != nil {
+			if err := w.drainSpoolContext(writerCtx); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
 
@@ -302,35 +807,83 @@ func (w *WAL) runBatchWriter(ctx context.Context) {
 		case <-ticker.C:
 			if len(batch) > 0 {
 				flushPending = true
-			} else if err := w.drainSpool(); err != nil {
+			} else if err := w.drainSpoolContext(writerCtx); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
-		case <-ctx.Done():
-			if err := flush(); err != nil {
-				slog.Error("WAL Batch Spool Failed", "error", err)
-			}
-			if err := w.drainSpool(); err != nil {
-				slog.Error("WAL Spool Drain Failed", "error", err)
-			}
-			return
+		case <-w.closeWake:
+			continue
+		case <-lifecycleDone:
+			lifecycleDone = nil
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), lifecycleShutdownGrace)
+			w.requestClose(shutdownCtx)
+			go func() {
+				select {
+				case <-w.closeDone:
+				case <-shutdownCtx.Done():
+				}
+				cancel()
+			}()
 		}
 	}
 }
 
+func (w *WAL) requestClose(ctx context.Context) {
+	w.appendMu.Lock()
+	w.closing.Store(true)
+	w.appendMu.Unlock()
+	w.writerWorkMu.Lock()
+	if w.cancelWriterWork != nil {
+		w.cancelWriterWork()
+	}
+	w.writerWorkMu.Unlock()
+	w.closeRequestMu.Lock()
+	w.closeContexts = append(w.closeContexts, ctx)
+	w.closeRequestMu.Unlock()
+	select {
+	case w.closeWake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *WAL) takeCloseContext() (context.Context, bool) {
+	w.closeRequestMu.Lock()
+	defer w.closeRequestMu.Unlock()
+	if len(w.closeContexts) == 0 {
+		return nil, false
+	}
+	ctx := w.closeContexts[0]
+	w.closeContexts[0] = nil
+	w.closeContexts = w.closeContexts[1:]
+	return ctx, true
+}
+
+func (w *WAL) finalizeClose() {
+	w.finalizeOnce.Do(func() {
+		w.closeErr = w.closeDB()
+		close(w.closeDone)
+	})
+}
+
 func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
+	return w.spoolBatchFrames(context.Background(), frames)
+}
+
+func (w *WAL) spoolBatchFrames(ctx context.Context, frames []*agentv1.TelemetryFrame) (string, error) {
 	if len(frames) == 0 {
 		return "", nil
 	}
 
 	payloads := make([][]byte, 0, len(frames))
 	for _, frame := range frames {
-		encoded, err := proto.Marshal(frame)
-		if err != nil {
-			slog.Warn("failed to marshal frame for spool, skipping", "error", err)
-			continue
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-		if len(encoded) > int(^uint32(0)) {
-			return "", fmt.Errorf("spool frame too large: %d", len(encoded))
+		encoded, err := w.marshalSpoolFrame(frame)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal frame for spool: %w", err)
+		}
+		if len(encoded) > maxSpoolFramePayloadSize {
+			return "", fmt.Errorf("spool frame exceeds %d-byte safety limit: %d", maxSpoolFramePayloadSize, len(encoded))
 		}
 		payloads = append(payloads, encoded)
 	}
@@ -339,11 +892,15 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 		return "", nil
 	}
 
+	spoolID := uuid.NewString()
 	seq := atomic.AddUint64(&w.spoolSeq, 1)
-	name := fmt.Sprintf("%020d-%06d.batch", time.Now().UnixNano(), seq)
+	name := fmt.Sprintf("%020d-%06d-%s.batch", time.Now().UnixNano(), seq, spoolID)
 	path := filepath.Join(w.spoolDir, name)
 	tmpPath := path + ".tmp"
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("failed to create spool file: %w", err)
@@ -352,13 +909,22 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 	cleanup := true
 	defer func() {
 		if cleanup {
-			file.Close()
+			_ = file.Close()
 			_ = os.Remove(tmpPath)
 		}
 	}()
 
 	writer := bufio.NewWriter(file)
+	if _, err := writer.WriteString(spoolFileMagic); err != nil {
+		return "", fmt.Errorf("failed to write spool header magic: %w", err)
+	}
+	if _, err := writer.WriteString(spoolID); err != nil {
+		return "", fmt.Errorf("failed to write spool identity: %w", err)
+	}
 	for _, payload := range payloads {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		var lenBuf [4]byte
 		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(payload)))
 		if _, err := writer.Write(lenBuf[:]); err != nil {
@@ -369,8 +935,14 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := writer.Flush(); err != nil {
 		return "", fmt.Errorf("failed to flush spool file: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	if err := file.Sync(); err != nil {
 		return "", fmt.Errorf("failed to sync spool file: %w", err)
@@ -378,33 +950,65 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 	if err := file.Close(); err != nil {
 		return "", fmt.Errorf("failed to close spool file: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := w.renameFile(tmpPath, path); err != nil {
 		return "", fmt.Errorf("failed to finalize spool file: %w", err)
 	}
-
 	cleanup = false
+	if err := ctx.Err(); err != nil {
+		return path, err
+	}
+	if err := w.syncDir(w.spoolDir); err != nil {
+		// The final path may already be visible even though its directory entry
+		// is not durable. Return that path so the writer can retry the directory
+		// sync without creating a second spool for the same in-memory batch.
+		return path, fmt.Errorf("failed to sync finalized spool file %s: %w", path, err)
+	}
 	return path, nil
 }
 
 func (w *WAL) drainSpool() error {
-	w.spoolMu.Lock()
+	return w.drainSpoolContext(context.Background())
+}
+
+func (w *WAL) drainSpoolContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := lockMutexContext(ctx, &w.spoolMu); err != nil {
+		return err
+	}
 	defer w.spoolMu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(w.spoolDir)
 	if err != nil {
 		return fmt.Errorf("failed to read spool dir: %w", err)
 	}
-
-	if len(entries) == 0 {
-		return nil
-	}
-
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})
 
 	wrote := false
+	spoolDirSyncFailed := false
+	var drainErr error
+	defer func() {
+		if wrote {
+			select {
+			case w.signalChan <- struct{}{}:
+			default:
+			}
+		}
+	}()
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			drainErr = errors.Join(drainErr, err)
+			break
+		}
 		if entry.IsDir() {
 			continue
 		}
@@ -412,81 +1016,399 @@ func (w *WAL) drainSpool() error {
 			continue
 		}
 		path := filepath.Join(w.spoolDir, entry.Name())
-		frames, err := readSpoolFile(path)
+		spoolID, frames, err := readSpoolFileContext(ctx, path)
 		if err != nil {
-			return fmt.Errorf("failed to read spool file %s: %w", path, err)
-		}
-		if len(frames) == 0 {
-			if err := os.Remove(path); err != nil {
-				return fmt.Errorf("failed to remove empty spool file: %w", err)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				drainErr = errors.Join(drainErr, err)
+				break
+			}
+			quarantinePath, activeDirDurable, quarantineErr := w.quarantineSpoolFile(path)
+			if quarantinePath != "" && !activeDirDurable {
+				spoolDirSyncFailed = true
+			}
+			if quarantineErr != nil {
+				drainErr = errors.Join(drainErr,
+					fmt.Errorf("read malformed spool file %s: %w", path, err),
+					fmt.Errorf("quarantine malformed spool file %s: %w", path, quarantineErr))
+				if quarantinePath != "" {
+					drainErr = errors.Join(drainErr, fmt.Errorf("malformed spool file moved to %s before quarantine sync failed", quarantinePath))
+				}
+			} else {
+				drainErr = errors.Join(drainErr, fmt.Errorf("quarantined malformed spool file %s at %s: %w", path, quarantinePath, err))
 			}
 			continue
 		}
-		if _, err := w.AppendBatch(context.Background(), frames); err != nil {
-			return err
+		if len(frames) == 0 {
+			removed, err := w.removeActiveSpoolFile(path)
+			if err != nil {
+				if removed {
+					spoolDirSyncFailed = true
+				}
+				drainErr = errors.Join(drainErr, fmt.Errorf("remove empty spool file %s: %w", path, err))
+				continue
+			}
+			if err := w.deleteSpoolImport(ctx, spoolID); err != nil {
+				drainErr = errors.Join(drainErr, err)
+			}
+			continue
 		}
-		if err := os.Remove(path); err != nil {
-			return fmt.Errorf("failed to remove spool file: %w", err)
+		imported, err := w.appendSpoolBatch(ctx, spoolID, frames)
+		if err != nil {
+			drainErr = errors.Join(drainErr, fmt.Errorf("import spool file %s: %w", path, err))
+			continue
 		}
-		wrote = true
+		wrote = wrote || imported
+		removed, err := w.removeActiveSpoolFile(path)
+		if err != nil {
+			if removed {
+				spoolDirSyncFailed = true
+			}
+			drainErr = errors.Join(drainErr, fmt.Errorf("remove spool file %s: %w", path, err))
+			continue
+		}
+		if err := w.deleteSpoolImport(ctx, spoolID); err != nil {
+			drainErr = errors.Join(drainErr, err)
+		}
 	}
 
-	if wrote {
+	if !spoolDirSyncFailed {
+		remainingEntries, err := os.ReadDir(w.spoolDir)
+		if err != nil {
+			drainErr = errors.Join(drainErr, fmt.Errorf("failed to reread spool dir for import cleanup: %w", err))
+		} else if err := w.syncDir(w.spoolDir); err != nil {
+			// An absent entry is not safe evidence that its import marker is
+			// orphaned until the directory state itself is durable.
+			drainErr = errors.Join(drainErr, fmt.Errorf("sync spool dir before import cleanup: %w", err))
+		} else if err := w.pruneOrphanedSpoolImports(ctx, remainingEntries); err != nil {
+			drainErr = errors.Join(drainErr, err)
+		}
+	}
+
+	return drainErr
+}
+
+func lockMutexContext(ctx context.Context, mu *sync.Mutex) error {
+	for !mu.TryLock() {
 		select {
-		case w.signalChan <- struct{}{}:
-		default:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
 		}
 	}
-
 	return nil
 }
 
-func readSpoolFile(path string) ([]*agentv1.TelemetryFrame, error) {
+func (w *WAL) removeActiveSpoolFile(path string) (bool, error) {
+	if err := w.removeFile(path); err != nil {
+		return false, err
+	}
+	if err := w.syncDir(w.spoolDir); err != nil {
+		return true, fmt.Errorf("sync active spool dir: %w", err)
+	}
+	return true, nil
+}
+
+func (w *WAL) quarantineSpoolFile(path string) (string, bool, error) {
+	if err := os.MkdirAll(w.spoolQuarantineDir, 0o755); err != nil {
+		return "", false, fmt.Errorf("create spool quarantine dir: %w", err)
+	}
+	if err := syncFile(path); err != nil {
+		return "", false, fmt.Errorf("sync malformed spool file before quarantine: %w", err)
+	}
+	destination := filepath.Join(w.spoolQuarantineDir,
+		fmt.Sprintf("%020d-%s-%s.corrupt", time.Now().UnixNano(), uuid.NewString(), filepath.Base(path)))
+	if err := w.renameFile(path, destination); err != nil {
+		return "", false, fmt.Errorf("move spool file to quarantine: %w", err)
+	}
+	if err := w.syncDir(w.spoolQuarantineDir); err != nil {
+		return destination, false, fmt.Errorf("sync spool quarantine dir: %w", err)
+	}
+	if err := w.syncDir(w.spoolDir); err != nil {
+		return destination, false, fmt.Errorf("sync active spool dir: %w", err)
+	}
+	return destination, true, nil
+}
+
+func syncFile(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
+	return file.Sync()
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = dir.Close()
+	}()
+	return dir.Sync()
+}
+
+func (w *WAL) deleteSpoolImport(ctx context.Context, spoolID string) error {
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM spool_imports WHERE spool_id = ?`, spoolID); err != nil {
+		return fmt.Errorf("delete spool import %q: %w", spoolID, err)
+	}
+	return nil
+}
+
+func (w *WAL) cleanupOrphanedSpoolImports(ctx context.Context) error {
+	if err := lockMutexContext(ctx, &w.spoolMu); err != nil {
+		return err
+	}
+	defer w.spoolMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(w.spoolDir)
+	if err != nil {
+		return fmt.Errorf("failed to read spool dir for import cleanup: %w", err)
+	}
+	if err := w.syncDir(w.spoolDir); err != nil {
+		return fmt.Errorf("sync spool dir before import cleanup: %w", err)
+	}
+	return w.pruneOrphanedSpoolImports(ctx, entries)
+}
+
+func (w *WAL) pruneOrphanedSpoolImports(ctx context.Context, entries []os.DirEntry) error {
+	seenToken := uuid.NewString()
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".batch" {
+			continue
+		}
+		path := filepath.Join(w.spoolDir, entry.Name())
+		spoolID, err := readSpoolIdentityFromPathContext(ctx, path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read live spool identity %s: %w", path, err)
+		}
+		if _, err := w.db.ExecContext(ctx, `UPDATE spool_imports SET seen_token = ? WHERE spool_id = ?`, seenToken, spoolID); err != nil {
+			return fmt.Errorf("mark live spool import %q: %w", spoolID, err)
+		}
+	}
+
+	for {
+		result, err := w.db.ExecContext(ctx, `DELETE FROM spool_imports WHERE spool_id IN (
+			SELECT spool_id FROM spool_imports
+			WHERE seen_token <> ?
+			ORDER BY spool_id
+			LIMIT ?
+		)`, seenToken, spoolImportCleanupBatchSize)
+		if err != nil {
+			return fmt.Errorf("prune orphaned spool imports: %w", err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect orphaned spool import cleanup: %w", err)
+		}
+		if rows < spoolImportCleanupBatchSize {
+			return nil
+		}
+	}
+}
+
+func readSpoolIdentityFromPath(path string) (string, error) {
+	return readSpoolIdentityFromPathContext(context.Background(), path)
+}
+
+func readSpoolIdentityFromPathContext(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	spoolID, _, err := readSpoolIdentity(ctx, file, path)
+	return spoolID, err
+}
+
+func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
+	return readSpoolFileContext(context.Background(), path)
+}
+
+func readSpoolFileContext(ctx context.Context, path string) (string, []*agentv1.TelemetryFrame, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	spoolID, payloadOffset, err := readSpoolIdentity(ctx, file, path)
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := file.Seek(payloadOffset, io.SeekStart); err != nil {
+		return "", nil, fmt.Errorf("seek to spool payload: %w", err)
+	}
 
 	reader := bufio.NewReader(file)
 	var frames []*agentv1.TelemetryFrame
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
 		var lenBuf [4]byte
-		if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
+		if _, err := readFullContext(ctx, reader, lenBuf[:]); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil, fmt.Errorf("truncated spool record: %w", err)
+				return "", nil, fmt.Errorf("truncated spool record: %w", err)
 			}
-			return nil, err
+			return "", nil, err
 		}
 
 		length := binary.LittleEndian.Uint32(lenBuf[:])
 		if length == 0 {
 			continue
 		}
-
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			return nil, fmt.Errorf("truncated spool payload: %w", err)
+		if length > maxSpoolFramePayloadSize {
+			return "", nil, fmt.Errorf("spool payload length %d exceeds %d-byte safety limit", length, maxSpoolFramePayloadSize)
 		}
 
+		payload := make([]byte, length)
+		if _, err := readFullContext(ctx, reader, payload); err != nil {
+			return "", nil, fmt.Errorf("truncated spool payload: %w", err)
+		}
+
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
 		var frame agentv1.TelemetryFrame
 		if err := proto.Unmarshal(payload, &frame); err != nil {
-			slog.Warn("failed to unmarshal spool frame, skipping", "error", err)
-			continue
+			return "", nil, fmt.Errorf("failed to unmarshal spool frame: %w", err)
 		}
 		frames = append(frames, &frame)
 	}
 
-	return frames, nil
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	return spoolID, frames, nil
+}
+
+func readSpoolIdentity(ctx context.Context, file *os.File, path string) (string, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	headerSize := len(spoolFileMagic) + spoolIDLength
+	header := make([]byte, headerSize)
+	n, err := file.ReadAt(header, 0)
+	if n >= len(spoolFileMagic) && string(header[:len(spoolFileMagic)]) == spoolFileMagic {
+		if err != nil || n != headerSize {
+			return "", 0, fmt.Errorf("truncated spool identity header: read %d bytes, want %d", n, headerSize)
+		}
+		spoolID := string(header[len(spoolFileMagic):])
+		parsed, err := uuid.Parse(spoolID)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid spool identity %q: %w", spoolID, err)
+		}
+		return parsed.String(), int64(headerSize), nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", 0, fmt.Errorf("inspect spool identity header: %w", err)
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, fmt.Errorf("seek legacy spool file: %w", err)
+	}
+	hash := sha256.New()
+	if _, err := io.WriteString(hash, filepath.Base(path)); err != nil {
+		return "", 0, fmt.Errorf("hash legacy spool filename: %w", err)
+	}
+	if _, err := hash.Write([]byte{0}); err != nil {
+		return "", 0, fmt.Errorf("hash legacy spool separator: %w", err)
+	}
+	if _, err := copyContext(ctx, hash, file); err != nil {
+		return "", 0, fmt.Errorf("hash legacy spool payload: %w", err)
+	}
+	return "legacy:" + hex.EncodeToString(hash.Sum(nil)), 0, nil
+}
+
+func readFullContext(ctx context.Context, reader io.Reader, buffer []byte) (int, error) {
+	total := 0
+	for total < len(buffer) {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		end := min(total+spoolReadChunkSize, len(buffer))
+		n, err := reader.Read(buffer[total:end])
+		total += n
+		if total == len(buffer) {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return total, contextErr
+			}
+			return total, nil
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) && total > 0 {
+				return total, io.ErrUnexpectedEOF
+			}
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
+	return total, nil
+}
+
+func copyContext(ctx context.Context, writer io.Writer, reader io.Reader) (int64, error) {
+	buffer := make([]byte, spoolReadChunkSize)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			writeN, writeErr := writer.Write(buffer[:n])
+			written += int64(writeN)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if writeN != n {
+				return written, io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			if err := ctx.Err(); err != nil {
+				return written, err
+			}
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+		if n == 0 {
+			return written, io.ErrNoProgress
+		}
+	}
 }
 
 // Append appends a raw telemetry frame payload to the log and returns its ID.
 // This is the synchronous version.
 func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64, error) {
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
+	w.stampGeneration(tFrame)
 	encoded, err := proto.Marshal(tFrame)
 	if err != nil {
 		return 0, fmt.Errorf("failed to marshal telemetry frame: %w", err)
@@ -501,58 +1423,101 @@ func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64
 
 // AppendBatch writes multiple frames in a single transaction.
 func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame) (int64, error) {
+	lastID, _, err := w.appendBatch(ctx, frames, "")
+	return lastID, err
+}
+
+func (w *WAL) appendSpoolBatch(ctx context.Context, spoolID string, frames []*agentv1.TelemetryFrame) (bool, error) {
+	if spoolID == "" {
+		return false, errors.New("spool identity is required")
+	}
+	_, imported, err := w.appendBatch(ctx, frames, spoolID)
+	return imported, err
+}
+
+func (w *WAL) appendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame, spoolID string) (int64, bool, error) {
 	if len(frames) == 0 {
-		return 0, nil
+		return 0, false, nil
 	}
 
-	// start the transaction
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		return 0, false, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if spoolID != "" {
+		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO spool_imports(spool_id, imported_at) VALUES(?, ?)`, spoolID, time.Now().UnixNano())
+		if err != nil {
+			return 0, false, fmt.Errorf("record spool import %q: %w", spoolID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, false, fmt.Errorf("inspect spool import %q: %w", spoolID, err)
+		}
+		if rows == 0 {
+			return 0, false, nil
+		}
 	}
 
-	// defer rollback. If Commit() is called then RollBack is a no-op
-	defer tx.Rollback()
-
-	// prepare the statement
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("failed to prepare statement: %w", err)
+		return 0, false, fmt.Errorf("failed to prepare statement: %w", err)
 	}
-
-	defer stmt.Close()
+	defer func() {
+		_ = stmt.Close()
+	}()
 
 	var lastID int64
 	now := time.Now().UnixNano()
 
-	// loop and insert
 	for _, frame := range frames {
+		w.stampGeneration(frame)
 		encoded, err := proto.Marshal(frame)
 		if err != nil {
-			// Skip malformed frames instead of failing the whole batch
-			slog.Warn("failed to marshal frame, skipping", "error", err)
-			continue
+			return 0, false, fmt.Errorf("failed to marshal frame: %w", err)
 		}
 
-		// Execute against the *statement* (which is bound to the transaction)
 		res, err := stmt.ExecContext(ctx, now, encoded, DeliveryStatusWritten)
 		if err != nil {
-			return 0, fmt.Errorf("failed to insert frames: %w", err)
+			return 0, false, fmt.Errorf("failed to insert frames: %w", err)
 		}
-
-		lastID, _ = res.LastInsertId()
+		lastID, err = res.LastInsertId()
+		if err != nil {
+			return 0, false, fmt.Errorf("failed to inspect inserted frame: %w", err)
+		}
 	}
 
-	// commit
+	if err := stmt.Close(); err != nil {
+		return 0, false, fmt.Errorf("failed to close frame insert statement: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+		return 0, false, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return lastID, nil
+	return lastID, true, nil
 }
 
-// ReadUndelivered reads up to limit undelivered entries from the log.
+func (w *WAL) stampGeneration(frame *agentv1.TelemetryFrame) {
+	if frame != nil {
+		frame.WalId = w.generationID
+	}
+}
+
+// ReadUndelivered reads up to the requested number of written entries in
+// sequence order. Malformed legacy frames recorded in the durable quarantine
+// are excluded from delivery without deleting their original payloads.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the query.
+//   - limit: bounds returned entries and must be greater than zero.
+//
+// Returns:
+//   - entries: contains deliverable WAL records in ascending sequence order.
+//   - error: reports an invalid limit, SQLite failure, or context cancellation.
 func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("limit must be > 0")
@@ -562,6 +1527,10 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	SELECT seq, created_at, payload
 	FROM telemetry_frames
 	WHERE delivery_status = ?
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
 	ORDER BY seq ASC
 	LIMIT ?
 	`
@@ -587,12 +1556,17 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	return entries, nil
 }
 
-// CountUndelivered returns the total number of undelivered entries.
+// CountUndelivered returns the number of written entries eligible for
+// delivery, excluding durable quarantine records.
 func (w *WAL) CountUndelivered(ctx context.Context) (int64, error) {
 	query := `
 	SELECT COUNT(1)
 	FROM telemetry_frames
 	WHERE delivery_status = ?
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
 	`
 	var count int64
 	if err := w.db.QueryRowContext(ctx, query, DeliveryStatusWritten).Scan(&count); err != nil {
@@ -745,9 +1719,18 @@ func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error
 	return rows, err
 }
 
-// CleanupDelivered deletes delivered frames that are older than the specified retention count.
-// It ensures that at most `retentionCount` delivered frames remain in the WAL.
-// This is a basic form of garbage collection to prevent unbounded growth.
+// CleanupDelivered deletes delivered frames older than the requested retention
+// count and reclaims completed spool-import markers that have no live spool
+// file. Live-file markers are retained so a pending cleanup retry cannot
+// re-import its frames.
+//
+// Parameters:
+//   - ctx: bounds both telemetry deletion and bounded marker reclamation.
+//   - retentionCount: keeps this many of the newest delivered frames; negative
+//     values are treated as zero.
+//
+// Returns:
+//   - error: reports SQLite, spool-directory, or live-file inspection failures.
 func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 	if retentionCount < 0 {
 		retentionCount = 0
@@ -760,9 +1743,17 @@ func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 	query := `
 	DELETE FROM telemetry_frames 
 	WHERE delivery_status = ? 
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
 	AND seq NOT IN (
 		SELECT seq FROM telemetry_frames 
-		WHERE delivery_status = ? 
+		WHERE delivery_status = ?
+		AND NOT EXISTS (
+			SELECT 1 FROM telemetry_frame_quarantine
+			WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+		)
 		ORDER BY seq DESC 
 		LIMIT ?
 	)`
@@ -771,11 +1762,208 @@ func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 	if err != nil {
 		return fmt.Errorf("failed to cleanup delivered frames: %w", err)
 	}
+	if err := w.cleanupOrphanedSpoolImports(ctx); err != nil {
+		return fmt.Errorf("cleanup spool imports: %w", err)
+	}
 	return nil
 }
 
-// Close closes the underlying database connection.
+// CleanupQuarantined explicitly deletes older malformed legacy frames while
+// retaining the requested number of newest quarantine records. Quarantined
+// payloads are otherwise preserved indefinitely and CleanupDelivered never
+// removes them.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for each bounded transaction.
+//   - retentionCount: keeps this many newest quarantined rows; negative values
+//     are treated as zero.
+//
+// Returns:
+//   - rowsDeleted: is the number of quarantined telemetry payloads removed,
+//     including committed batches if a later batch fails.
+//   - error: reports bounded-batch transaction, SQLite, or context failures.
+func (w *WAL) CleanupQuarantined(ctx context.Context, retentionCount int) (int64, error) {
+	if retentionCount < 0 {
+		retentionCount = 0
+	}
+
+	var totalDeleted int64
+	for {
+		selected, deleted, err := w.cleanupQuarantinedBatch(ctx, retentionCount)
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += deleted
+		if selected < quarantineCleanupBatchSize {
+			return totalDeleted, nil
+		}
+	}
+}
+
+// CleanupSpoolQuarantine explicitly deletes older malformed spool files while
+// retaining the requested number of newest artifacts. Normal spool draining
+// never removes quarantined files.
+//
+// Parameters:
+//   - ctx: stops cleanup between individual file removals when cancelled.
+//   - retentionCount: keeps this many newest artifacts; negative values are
+//     treated as zero.
+//
+// Returns:
+//   - filesDeleted: is the number of quarantine artifacts removed.
+//   - error: joins file removal and context failures after making
+//     as much progress as possible.
+func (w *WAL) CleanupSpoolQuarantine(ctx context.Context, retentionCount int) (int, error) {
+	if retentionCount < 0 {
+		retentionCount = 0
+	}
+
+	w.spoolMu.Lock()
+	defer w.spoolMu.Unlock()
+
+	entries, err := os.ReadDir(w.spoolQuarantineDir)
+	if err != nil {
+		return 0, fmt.Errorf("read spool quarantine dir: %w", err)
+	}
+	artifacts := make([]string, 0, len(entries))
+	var cleanupErr error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		artifacts = append(artifacts, entry.Name())
+	}
+	sort.Slice(artifacts, func(i, j int) bool {
+		return artifacts[i] > artifacts[j]
+	})
+
+	filesDeleted := 0
+	for _, name := range artifacts[min(retentionCount, len(artifacts)):] {
+		if err := ctx.Err(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			break
+		}
+		path := filepath.Join(w.spoolQuarantineDir, name)
+		if err := w.removeFile(path); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete spool quarantine artifact %s: %w", path, err))
+			continue
+		}
+		filesDeleted++
+	}
+	if filesDeleted > 0 {
+		if err := w.syncDir(w.spoolQuarantineDir); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("sync spool quarantine cleanup: %w", err))
+		}
+	}
+	return filesDeleted, cleanupErr
+}
+
+func (w *WAL) cleanupQuarantinedBatch(ctx context.Context, retentionCount int) (int64, int64, error) {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin quarantined frame cleanup: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	rows, err := tx.QueryContext(ctx, `SELECT telemetry_frame_quarantine.seq
+		FROM telemetry_frame_quarantine
+		JOIN telemetry_frames USING(seq)
+		ORDER BY quarantined_at DESC, telemetry_frame_quarantine.seq DESC
+		LIMIT ? OFFSET ?`, quarantineCleanupBatchSize, retentionCount)
+	if err != nil {
+		return 0, 0, fmt.Errorf("select quarantined telemetry cleanup batch: %w", err)
+	}
+	seqs := make([]int64, 0, quarantineCleanupBatchSize)
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			return 0, 0, closeQuarantineRows(rows, fmt.Errorf("scan quarantined telemetry cleanup batch: %w", err))
+		}
+		seqs = append(seqs, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, closeQuarantineRows(rows, fmt.Errorf("iterate quarantined telemetry cleanup batch: %w", err))
+	}
+	if err := closeQuarantineRows(rows, nil); err != nil {
+		return 0, 0, err
+	}
+
+	var rowsDeleted int64
+	for _, seq := range seqs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM telemetry_frame_quarantine WHERE seq = ?`, seq); err != nil {
+			return 0, 0, fmt.Errorf("delete quarantined frame %d diagnostics: %w", seq, err)
+		}
+		result, err := tx.ExecContext(ctx, `DELETE FROM telemetry_frames WHERE seq = ?`, seq)
+		if err != nil {
+			return 0, 0, fmt.Errorf("delete quarantined telemetry frame %d: %w", seq, err)
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return 0, 0, fmt.Errorf("inspect quarantined telemetry frame %d cleanup: %w", seq, err)
+		}
+		rowsDeleted += deleted
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit quarantined frame cleanup: %w", err)
+	}
+	return int64(len(seqs)), rowsDeleted, nil
+}
+
+func closeQuarantineRows(rows *sql.Rows, cause error) error {
+	if err := rows.Close(); err != nil {
+		return errors.Join(cause, fmt.Errorf("close quarantined telemetry cleanup rows: %w", err))
+	}
+	return cause
+}
+
+// Close durably spools any in-memory asynchronous batch, stops and waits for
+// the background writer, and then closes the database without a deadline.
+// Existing spool files are left for the next open to import under its new
+// append generation.
+//
+// Returns:
+//   - error: reports failure to close the underlying SQLite connection.
 func (w *WAL) Close() error {
-	close(w.doneChan) // Signal writer to stop
-	return w.db.Close()
+	return w.CloseContext(context.Background())
+}
+
+// CloseContext requests a durable final spool, waits for the background
+// writer, and closes SQLite while respecting the caller's cancellation or
+// deadline. If the context expires first, CloseContext returns immediately;
+// SQLite remains open until the writer exits, so an active writer never races
+// a database close. If final spooling has not started, the writer retains its
+// in-memory batch and waits for a later Close or CloseContext call to retry;
+// if an uninterruptible filesystem operation is already running, it may safely
+// finish in the background. Close requests are idempotent and never close the
+// producer channel.
+//
+// Parameters:
+//   - ctx: bounds the final spool operations and this caller's wait.
+//
+// Returns:
+//   - error: reports context cancellation/deadline or the eventual SQLite
+//     close failure.
+func (w *WAL) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("close context is required")
+	}
+	select {
+	case <-w.closeDone:
+		return w.closeErr
+	default:
+	}
+	if w.writerDone == nil {
+		go w.finalizeClose()
+	} else {
+		w.requestClose(ctx)
+	}
+
+	select {
+	case <-w.closeDone:
+		return w.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
