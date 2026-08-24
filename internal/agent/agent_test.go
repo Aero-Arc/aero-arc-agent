@@ -273,6 +273,31 @@ func TestAgentShutdownFlushesWALBeforeMAVLinkDeadline(t *testing.T) {
 	}
 }
 
+func TestAgentWALLifecycleOutlivesRunContextForTelemetryDrain(t *testing.T) {
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	a := &Agent{options: &AgentOptions{
+		WALPath: filepath.Join(t.TempDir(), "agent.db"), WALBatchSize: 1,
+		WALFlushTimeout: time.Millisecond,
+	}}
+	if err := a.initializeWAL(runCtx); err != nil {
+		t.Fatal(err)
+	}
+	cancelRun()
+	// A WAL constructed with runCtx would begin closing asynchronously here.
+	// The production Agent owns an independent lifecycle until explicit shutdown.
+	time.Sleep(20 * time.Millisecond)
+	if err := a.persistTelemetryFrame(context.Background(), &agentv1.TelemetryFrame{
+		RawMavlink: []byte("drained-after-run-cancel"),
+	}); err != nil {
+		t.Fatalf("persist after run cancellation: %v", err)
+	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+	defer cancelShutdown()
+	if err := a.shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

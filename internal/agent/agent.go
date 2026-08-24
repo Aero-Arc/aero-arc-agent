@@ -49,6 +49,7 @@ type Agent struct {
 	closeWALFn     func(ctx context.Context) error
 	closeMAVLinkFn func(ctx context.Context)
 	mavlinkDone    chan struct{}
+	cancelWAL      context.CancelFunc
 
 	stateMu          sync.RWMutex
 	sessionID        string
@@ -166,18 +167,9 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 	identity := identity.Resolve()
 	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
 
-	// Initialize WAL
-	w, err := wal.New(ctx, a.options.WALPath, a.options.WALBatchSize, a.options.WALFlushTimeout)
-	if err != nil {
-		return fmt.Errorf("failed to initialize WAL: %w", err)
-	}
-	a.wal = w
-	if operationContext, ok, err := w.LoadOperationContext(ctx); err != nil {
+	if err := a.initializeWAL(ctx); err != nil {
 		return err
-	} else if ok {
-		a.operationContext = &operationContext
 	}
-	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
 
 	a.wg.Add(1)
 	go func(ctx context.Context) {
@@ -235,6 +227,9 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 
 func (a *Agent) shutdown(ctx context.Context) error {
 	var shutdownErr error
+	if a.cancelWAL != nil {
+		defer a.cancelWAL()
+	}
 	if a.conn != nil {
 		slog.Info("shutting down grpc connection")
 		if err := a.conn.Close(); err != nil {
@@ -290,6 +285,31 @@ func (a *Agent) shutdown(ctx context.Context) error {
 	a.conn = nil
 
 	return shutdownErr
+}
+
+// initializeWAL gives the durable writer a lifecycle independent of the Agent
+// run context. Agent cancellation first stops MAVLink ingest and drains the
+// bounded pre-WAL queue; shutdown then closes the WAL explicitly. Passing the
+// run context directly to wal.New would start WAL closure before that drain.
+func (a *Agent) initializeWAL(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	walCtx, cancelWAL := context.WithCancel(context.Background())
+	w, err := wal.NewWithLifecycle(ctx, walCtx, a.options.WALPath, a.options.WALBatchSize, a.options.WALFlushTimeout)
+	if err != nil {
+		cancelWAL()
+		return fmt.Errorf("failed to initialize WAL: %w", err)
+	}
+	a.wal = w
+	a.cancelWAL = cancelWAL
+	if operationContext, ok, err := w.LoadOperationContext(ctx); err != nil {
+		return err
+	} else if ok {
+		a.operationContext = &operationContext
+	}
+	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
+	return nil
 }
 
 func (a *Agent) closeMAVLinkBestEffort(ctx context.Context) {

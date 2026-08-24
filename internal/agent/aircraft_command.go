@@ -71,8 +71,14 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, componentID uint8, armed bool) {
 	a.mavlinkMu.Lock()
 	previous := a.mavlinkTarget
-	if a.aircraftAckAmbiguous && (a.aircraftAckAmbiguousSince.IsZero() || previous == nil ||
-		previous.channel != channel || previous.systemID != systemID || previous.componentID != componentID) {
+	targetChanged := previous == nil || previous.channel != channel || previous.systemID != systemID || previous.componentID != componentID
+	if targetChanged {
+		// A different transport target starts a new ACK-correlation domain. Even
+		// if the old target completed a quiet epoch, delayed ARM/DISARM evidence
+		// from before this selection cannot be correlated directly.
+		a.aircraftAckAmbiguous = true
+		a.aircraftAckAmbiguousSince = time.Now()
+	} else if a.aircraftAckAmbiguous && a.aircraftAckAmbiguousSince.IsZero() {
 		a.aircraftAckAmbiguousSince = time.Now()
 	}
 	a.mavlinkHeartbeatSeq++

@@ -105,6 +105,14 @@ type WAL struct {
 //
 // TODO: Add time.Duration for the WAL cleanup interval.
 func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
+	return NewWithLifecycle(ctx, ctx, path, batchSize, batchTimeout)
+}
+
+// NewWithLifecycle initializes a WAL under initCtx while running its durable
+// writer under lifecycleCtx. Most callers should use New. The Agent uses the
+// split lifecycle so run cancellation can stop MAVLink ingest and drain its
+// pre-WAL queue before explicitly closing the still-writable WAL.
+func NewWithLifecycle(initCtx, lifecycleCtx context.Context, path string, batchSize int64, batchTimeout time.Duration) (*WAL, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open wal db: %w", err)
@@ -119,7 +127,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		db.Close()
 		return nil, err
 	}
-	generationID, err := startGenerationID(ctx, db)
+	generationID, err := startGenerationID(initCtx, db)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -160,7 +168,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 	}
 
 	// Start the background writer
-	go wal.runBatchWriter(ctx)
+	go wal.runBatchWriter(lifecycleCtx)
 
 	return wal, nil
 }

@@ -13,6 +13,31 @@ import (
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 )
 
+func TestMAVLinkTargetChangeRearmsAircraftACKFence(t *testing.T) {
+	oldChannel := &gomavlib.Channel{}
+	newChannel := &gomavlib.Channel{}
+	agent := &Agent{
+		mavlinkTarget:        &mavlinkTarget{channel: oldChannel, systemID: 1, componentID: 1},
+		aircraftAckAmbiguous: false,
+	}
+	agent.observeMAVLinkHeartbeat(newChannel, 1, 1, false)
+	if !agent.aircraftAckAmbiguous || agent.aircraftAckAmbiguousSince.IsZero() {
+		t.Fatal("new MAVLink channel did not restart the ACK-ambiguity epoch")
+	}
+
+	agent.aircraftAckAmbiguous = false
+	agent.aircraftAckAmbiguousSince = time.Time{}
+	agent.observeMAVLinkHeartbeat(newChannel, 1, 1, false)
+	if agent.aircraftAckAmbiguous || !agent.aircraftAckAmbiguousSince.IsZero() {
+		t.Fatal("heartbeat from the unchanged target re-armed a quiet ACK fence")
+	}
+
+	agent.observeMAVLinkHeartbeat(newChannel, 2, 1, false)
+	if !agent.aircraftAckAmbiguous || agent.aircraftAckAmbiguousSince.IsZero() {
+		t.Fatal("new MAVLink system ID did not restart the ACK-ambiguity epoch")
+	}
+}
+
 func TestRunAckLoopRejectsConcurrentAircraftCommandWithoutDelayingReceive(t *testing.T) {
 	channel := &gomavlib.Channel{}
 	commandStarted := make(chan struct{})
