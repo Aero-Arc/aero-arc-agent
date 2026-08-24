@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -211,6 +212,94 @@ func TestWALGenerationRotationStampsLegacyFramesBeforeChangingGeneration(t *test
 	}
 	if stored.GetWalId() != previousGeneration {
 		t.Fatalf("legacy frame WAL ID = %q, want previous generation %q", stored.GetWalId(), previousGeneration)
+	}
+}
+
+func TestWALGenerationMigrationBatchesAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy-backlog.db")
+	w, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousGeneration := w.GenerationID()
+	frameCount := legacyFrameMigrationBatchSize + 1
+	for i := 0; i < frameCount; i++ {
+		if _, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte{byte(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyPayload, err := proto.Marshal(&agentv1.TelemetryFrame{RawMavlink: []byte("legacy")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ?`, legacyPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, []byte{0xff}, frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New(ctx, dbPath, 0, 0); err == nil {
+		t.Fatal("migration with corrupt frame succeeded, want error")
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generationAfterFailure string
+	if err := db.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&generationAfterFailure); err != nil {
+		t.Fatal(err)
+	}
+	if generationAfterFailure != previousGeneration {
+		t.Fatalf("generation after rollback = %q, want %q", generationAfterFailure, previousGeneration)
+	}
+	var firstPayload []byte
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = 1`).Scan(&firstPayload); err != nil {
+		t.Fatal(err)
+	}
+	var firstFrame agentv1.TelemetryFrame
+	if err := proto.Unmarshal(firstPayload, &firstFrame); err != nil {
+		t.Fatal(err)
+	}
+	if firstFrame.GetWalId() != "" {
+		t.Fatalf("first batch committed before later failure; WAL ID = %q", firstFrame.GetWalId())
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, legacyPayload, frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := migrated.Close(); err != nil {
+			t.Errorf("close migrated WAL: %v", err)
+		}
+	})
+	entries, err := migrated.ReadUndelivered(ctx, frameCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != frameCount {
+		t.Fatalf("migrated entries = %d, want %d", len(entries), frameCount)
+	}
+	for _, entry := range entries {
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(entry.Payload, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.GetWalId() != previousGeneration {
+			t.Fatalf("frame %d WAL ID = %q, want %q", entry.ID, frame.GetWalId(), previousGeneration)
+		}
 	}
 }
 

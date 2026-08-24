@@ -22,6 +22,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Keep legacy migration memory bounded on constrained companion computers.
+const legacyFrameMigrationBatchSize = 128
+
 // Entry represents a single log entry in the WAL.
 type Entry struct {
 	ID        int64
@@ -214,49 +217,63 @@ func startGenerationID(ctx context.Context, db *sql.DB) (string, error) {
 }
 
 func stampLegacyFrames(ctx context.Context, tx *sql.Tx, generationID string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT seq, payload FROM telemetry_frames`)
-	if err != nil {
-		return fmt.Errorf("query legacy WAL frames: %w", err)
-	}
-
 	type update struct {
 		seq     int64
 		payload []byte
 	}
-	var updates []update
-	for rows.Next() {
-		var seq int64
-		var payload []byte
-		if err := rows.Scan(&seq, &payload); err != nil {
-			return closeLegacyRows(rows, fmt.Errorf("scan legacy WAL frame: %w", err))
-		}
-		var frame agentv1.TelemetryFrame
-		if err := proto.Unmarshal(payload, &frame); err != nil {
-			return closeLegacyRows(rows, fmt.Errorf("unmarshal legacy WAL frame %d: %w", seq, err))
-		}
-		if frame.GetWalId() != "" {
-			continue
-		}
-		frame.WalId = generationID
-		encoded, err := proto.Marshal(&frame)
-		if err != nil {
-			return closeLegacyRows(rows, fmt.Errorf("marshal legacy WAL frame %d: %w", seq, err))
-		}
-		updates = append(updates, update{seq: seq, payload: encoded})
-	}
-	if err := rows.Err(); err != nil {
-		return closeLegacyRows(rows, fmt.Errorf("iterate legacy WAL frames: %w", err))
-	}
-	if err := closeLegacyRows(rows, nil); err != nil {
-		return err
-	}
 
-	for _, item := range updates {
-		if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, item.payload, item.seq); err != nil {
-			return fmt.Errorf("stamp legacy WAL frame %d: %w", item.seq, err)
+	var cursor int64
+	for {
+		rows, err := tx.QueryContext(ctx, `SELECT seq, payload
+			FROM telemetry_frames
+			WHERE seq > ?
+			ORDER BY seq
+			LIMIT ?`, cursor, legacyFrameMigrationBatchSize)
+		if err != nil {
+			return fmt.Errorf("query legacy WAL frames after sequence %d: %w", cursor, err)
+		}
+
+		updates := make([]update, 0, legacyFrameMigrationBatchSize)
+		scanned := 0
+		for rows.Next() {
+			var seq int64
+			var payload []byte
+			if err := rows.Scan(&seq, &payload); err != nil {
+				return closeLegacyRows(rows, fmt.Errorf("scan legacy WAL frame: %w", err))
+			}
+			scanned++
+			cursor = seq
+
+			var frame agentv1.TelemetryFrame
+			if err := proto.Unmarshal(payload, &frame); err != nil {
+				return closeLegacyRows(rows, fmt.Errorf("unmarshal legacy WAL frame %d: %w", seq, err))
+			}
+			if frame.GetWalId() != "" {
+				continue
+			}
+			frame.WalId = generationID
+			encoded, err := proto.Marshal(&frame)
+			if err != nil {
+				return closeLegacyRows(rows, fmt.Errorf("marshal legacy WAL frame %d: %w", seq, err))
+			}
+			updates = append(updates, update{seq: seq, payload: encoded})
+		}
+		if err := rows.Err(); err != nil {
+			return closeLegacyRows(rows, fmt.Errorf("iterate legacy WAL frames: %w", err))
+		}
+		if err := closeLegacyRows(rows, nil); err != nil {
+			return err
+		}
+
+		for _, item := range updates {
+			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, item.payload, item.seq); err != nil {
+				return fmt.Errorf("stamp legacy WAL frame %d: %w", item.seq, err)
+			}
+		}
+		if scanned < legacyFrameMigrationBatchSize {
+			return nil
 		}
 	}
-	return nil
 }
 
 func closeLegacyRows(rows *sql.Rows, cause error) error {
