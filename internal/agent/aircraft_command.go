@@ -16,9 +16,10 @@ import (
 const defaultAircraftCommandTimeout = 4 * time.Second
 
 type mavlinkTarget struct {
-	channel     *gomavlib.Channel
-	systemID    uint8
-	componentID uint8
+	channel           *gomavlib.Channel
+	systemID          uint8
+	componentID       uint8
+	heartbeatSequence uint64
 }
 
 type mavlinkCommandAck struct {
@@ -28,10 +29,14 @@ type mavlinkCommandAck struct {
 }
 
 type pendingMAVLinkCommand struct {
-	systemID    uint8
-	componentID uint8
-	command     common.MAV_CMD
-	acks        chan mavlinkCommandAck
+	systemID         uint8
+	componentID      uint8
+	command          common.MAV_CMD
+	desiredArmed     bool
+	heartbeatAtSend  uint64
+	sent             bool
+	acks             chan mavlinkCommandAck
+	armedStateChange chan bool
 }
 
 func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
@@ -41,12 +46,33 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 	switch message := frame.Message().(type) {
 	case *common.MessageHeartbeat:
 		if frame.ComponentID() == uint8(common.MAV_COMP_ID_AUTOPILOT1) && message.Type != common.MAV_TYPE_GCS {
-			a.mavlinkMu.Lock()
-			a.mavlinkTarget = &mavlinkTarget{channel: frame.Channel, systemID: frame.SystemID(), componentID: frame.ComponentID()}
-			a.mavlinkMu.Unlock()
+			a.observeMAVLinkHeartbeat(frame.Channel, frame.SystemID(), frame.ComponentID(), message.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0)
 		}
 	case *common.MessageCommandAck:
 		a.observeMAVLinkCommandAck(frame.SystemID(), frame.ComponentID(), message)
+	}
+}
+
+func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, componentID uint8, armed bool) {
+	a.mavlinkMu.Lock()
+	a.mavlinkHeartbeatSeq++
+	sequence := a.mavlinkHeartbeatSeq
+	a.mavlinkTarget = &mavlinkTarget{
+		channel: channel, systemID: systemID, componentID: componentID,
+		heartbeatSequence: sequence,
+	}
+	pending := a.pendingMAVLinkCommand
+	var stateChanges chan bool
+	if pending != nil && pending.sent && pending.systemID == systemID && pending.componentID == componentID && sequence > pending.heartbeatAtSend {
+		stateChanges = pending.armedStateChange
+	}
+	a.mavlinkMu.Unlock()
+	if stateChanges == nil {
+		return
+	}
+	select {
+	case stateChanges <- armed:
+	default:
 	}
 }
 
@@ -111,9 +137,11 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	}
 
 	param1 := float32(0)
+	desiredArmed := false
 	switch command.GetType() {
 	case agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM:
 		param1 = 1
+		desiredArmed = true
 	case agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM:
 	case agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_UNSPECIFIED:
 		result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
@@ -150,9 +178,17 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	}
 	pending := &pendingMAVLinkCommand{
 		systemID: target.systemID, componentID: target.componentID,
-		command: common.MAV_CMD_COMPONENT_ARM_DISARM,
-		acks:    make(chan mavlinkCommandAck, 4),
+		command:          common.MAV_CMD_COMPONENT_ARM_DISARM,
+		desiredArmed:     desiredArmed,
+		heartbeatAtSend:  target.heartbeatSequence,
+		acks:             make(chan mavlinkCommandAck, 4),
+		armedStateChange: make(chan bool, 4),
 	}
+	// After any uncertain write or timeout, a later COMMAND_ACK for this MAV_CMD
+	// cannot be distinguished from the stale one. Keep this Agent lifecycle in
+	// heartbeat-verification mode so only a fresh observation of the requested
+	// armed state can complete later ARM/DISARM commands.
+	stateVerificationRequired := a.aircraftAckAmbiguous
 	a.pendingMAVLinkCommand = pending
 	a.mavlinkMu.Unlock()
 	defer func() {
@@ -180,10 +216,19 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 		return result
 	}
 	if err := a.writeMAVLinkCommand(target.channel, mavlinkCommand); err != nil {
+		a.mavlinkMu.Lock()
+		a.aircraftAckAmbiguous = true
+		a.mavlinkMu.Unlock()
 		result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
 		result.Message = "send MAVLink command: " + err.Error()
 		return result
 	}
+	a.mavlinkMu.Lock()
+	if a.pendingMAVLinkCommand == pending {
+		pending.heartbeatAtSend = a.mavlinkHeartbeatSeq
+		pending.sent = true
+	}
+	a.mavlinkMu.Unlock()
 
 	timeout := defaultAircraftCommandTimeout
 	if a.options != nil && a.options.AircraftCommandTimeout > 0 {
@@ -199,7 +244,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 				slog.String("aircraft_id", command.GetAircraftId()),
 				slog.String("mavlink_result", ack.result.String()),
 			)
-			if ack.result == common.MAV_RESULT_IN_PROGRESS {
+			if ack.result == common.MAV_RESULT_IN_PROGRESS || stateVerificationRequired {
 				continue
 			}
 			if ack.result == common.MAV_RESULT_ACCEPTED {
@@ -210,9 +255,22 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 			result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
 			result.Message = "autopilot rejected command: " + ack.result.String()
 			return result
+		case armed := <-pending.armedStateChange:
+			if stateVerificationRequired && armed == pending.desiredArmed {
+				result.Status = agentv1.AircraftCommandResult_STATUS_ACCEPTED
+				result.Message = "aircraft state confirmed by a fresh heartbeat after an earlier ambiguous command"
+				return result
+			}
 		case <-waitCtx.Done():
+			a.mavlinkMu.Lock()
+			a.aircraftAckAmbiguous = true
+			a.mavlinkMu.Unlock()
 			result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
-			result.Message = "timed out waiting for autopilot COMMAND_ACK"
+			if stateVerificationRequired {
+				result.Message = "timed out waiting for fresh heartbeat confirmation of aircraft state"
+			} else {
+				result.Message = "timed out waiting for autopilot COMMAND_ACK"
+			}
 			return result
 		}
 	}

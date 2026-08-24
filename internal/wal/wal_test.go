@@ -175,6 +175,38 @@ func TestInitDBAddsOperationCommandFingerprintsToExistingSchema(t *testing.T) {
 	if kind != "" || fingerprint != "" {
 		t.Fatalf("legacy fingerprint = (%q, %q), want empty", kind, fingerprint)
 	}
+
+	// A retry whose already-persisted result matches a legacy command may adopt
+	// the new fingerprint once. A different payload remains a conflict.
+	w := &WAL{db: db}
+	want := OperationContext{FlightID: "flight-legacy", IntentID: "intent-legacy", IntentVersion: 4}
+	if _, err := db.Exec(`INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at) VALUES(1, ?, ?, ?, 1)`, want.FlightID, want.IntentID, want.IntentVersion); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := w.SetOperationContext(context.Background(), "legacy", want)
+	if err != nil || applied {
+		t.Fatalf("legacy matching retry = %v, %v", applied, err)
+	}
+	if err := db.QueryRow(`SELECT command_kind, payload_fingerprint FROM operation_context_commands WHERE command_id = 'legacy'`).Scan(&kind, &fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "set" || fingerprint == "" {
+		t.Fatalf("adopted legacy fingerprint = (%q, %q)", kind, fingerprint)
+	}
+	if applied, err = w.SetOperationContext(context.Background(), "legacy", OperationContext{FlightID: "different"}); !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("conflicting adopted legacy retry = %v, %v", applied, err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO operation_context_commands(command_id, processed_at, command_kind, payload_fingerprint) VALUES('legacy-clear', 2, '', '')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM operation_context WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	applied, err = w.ClearOperationContext(context.Background(), "legacy-clear", want.FlightID)
+	if err != nil || applied {
+		t.Fatalf("legacy clear retry = %v, %v", applied, err)
+	}
 }
 
 func TestWALGenerationRotationPreventsRestoredSequenceReuse(t *testing.T) {

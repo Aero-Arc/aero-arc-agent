@@ -82,6 +82,68 @@ func TestAircraftCommandTimesOutWithoutAck(t *testing.T) {
 	}
 }
 
+func TestAircraftCommandDoesNotCorrelateLateAckAfterTimeout(t *testing.T) {
+	channel := &gomavlib.Channel{}
+	secondWrite := make(chan struct{})
+	writes := 0
+	agent := &Agent{
+		options:             &AgentOptions{AircraftCommandTimeout: 200 * time.Millisecond},
+		mavlinkHeartbeatSeq: 1,
+		mavlinkTarget: &mavlinkTarget{
+			channel: channel, systemID: 1, componentID: 1, heartbeatSequence: 1,
+		},
+	}
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		writes++
+		if writes == 2 {
+			// This ACK belongs to the timed-out ARM, but the wire protocol cannot
+			// distinguish it from the DISARM now in progress.
+			agent.observeMAVLinkCommandAck(1, 1, &common.MessageCommandAck{
+				Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+				Result:  common.MAV_RESULT_ACCEPTED,
+			})
+			close(secondWrite)
+		}
+		return nil
+	}
+
+	agent.options.AircraftCommandTimeout = 10 * time.Millisecond
+	first := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+		CommandId: "arm-1", AircraftId: "aircraft-1",
+		Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+	})
+	if first.GetStatus() != agentv1.AircraftCommandResult_STATUS_TIMEOUT {
+		t.Fatalf("first result = %+v, want timeout", first)
+	}
+
+	agent.options.AircraftCommandTimeout = 200 * time.Millisecond
+	result := make(chan *agentv1.AircraftCommandResult, 1)
+	go func() {
+		result <- agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{
+			CommandId: "disarm-2", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+		})
+	}()
+	<-secondWrite
+	select {
+	case got := <-result:
+		t.Fatalf("late ARM ACK completed DISARM: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, true)
+	select {
+	case got := <-result:
+		t.Fatalf("opposite armed state completed DISARM: %+v", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	agent.observeMAVLinkHeartbeat(channel, 1, 1, false)
+	got := <-result
+	if got.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED || !strings.Contains(got.GetMessage(), "fresh heartbeat") {
+		t.Fatalf("state-confirmed DISARM result = %+v", got)
+	}
+}
+
 func TestAircraftCommandFailsWhenMAVLinkUnavailable(t *testing.T) {
 	agent := &Agent{}
 	result := agent.executeAircraftCommand(context.Background(), &agentv1.AircraftCommand{

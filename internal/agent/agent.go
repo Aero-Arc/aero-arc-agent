@@ -56,7 +56,9 @@ type Agent struct {
 
 	mavlinkMu             sync.Mutex
 	mavlinkTarget         *mavlinkTarget
+	mavlinkHeartbeatSeq   uint64
 	pendingMAVLinkCommand *pendingMAVLinkCommand
+	aircraftAckAmbiguous  bool
 	aircraftCommandMu     sync.Mutex
 	aircraftCommandActive bool
 	writeMAVLinkCommand   func(*gomavlib.Channel, *common.MessageCommandLong) error
