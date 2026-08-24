@@ -787,7 +787,11 @@ func TestWAL_Lifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create WAL: %v", err)
 	}
-	defer w.Close()
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
 
 	// Check if file exists
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -797,7 +801,11 @@ func TestWAL_Lifecycle(t *testing.T) {
 
 func TestWAL_AppendAndRead(t *testing.T) {
 	w := mustNewWAL(t)
-	defer w.Close()
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
 	ctx := context.Background()
 
 	payloads := [][]byte{
@@ -844,7 +852,11 @@ func TestWAL_AsyncBatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}
-	defer w.Close()
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
 	ctx := context.Background()
 
 	// 1. AppendAsync 1 frame (should buffer)
