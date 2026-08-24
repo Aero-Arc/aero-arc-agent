@@ -98,6 +98,37 @@ func TestWALGenerationRotatesAndPersistedFramesRetainIdentity(t *testing.T) {
 	}
 }
 
+func TestInitDBAddsSpoolImportCleanupTokenToExistingSchema(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "schema.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close schema database: %v", err)
+		}
+	})
+	if _, err := db.Exec(`CREATE TABLE spool_imports (
+		spool_id TEXT PRIMARY KEY,
+		imported_at INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO spool_imports(spool_id, imported_at) VALUES('existing', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	var seenToken string
+	if err := db.QueryRow(`SELECT seen_token FROM spool_imports WHERE spool_id = 'existing'`).Scan(&seenToken); err != nil {
+		t.Fatal(err)
+	}
+	if seenToken != "" {
+		t.Fatalf("migrated cleanup token = %q, want empty", seenToken)
+	}
+}
+
 func TestWALGenerationRotationPreventsRestoredSequenceReuse(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -610,6 +641,13 @@ func TestWAL_SpoolAndDrain(t *testing.T) {
 	if len(entries) != 2 {
 		t.Errorf("Expected 2 entries, got %d", len(entries))
 	}
+	var importCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if importCount != 0 {
+		t.Fatalf("completed spool import markers = %d, want 0", importCount)
+	}
 }
 
 func TestWALSpoolUsesGenerationThatAssignsSequence(t *testing.T) {
@@ -734,6 +772,12 @@ func TestWALSpoolImportIsIdempotentAfterCleanupFailureAndRestart(t *testing.T) {
 			t.Fatalf("frame %d WAL ID = %q, want original import generation %q", after[i].ID, frame.GetWalId(), firstGeneration)
 		}
 	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if importCount != 0 {
+		t.Fatalf("spool markers after cleanup retry = %d, want 0", importCount)
+	}
 }
 
 func TestWALSpoolImportMarkerRollsBackWithFailedFrameInsert(t *testing.T) {
@@ -781,12 +825,12 @@ func TestWALSpoolImportMarkerRollsBackWithFailedFrameInsert(t *testing.T) {
 	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
 		t.Fatal(err)
 	}
-	if frameCount != 1 || importCount != 1 {
-		t.Fatalf("recovered import persisted frames=%d markers=%d, want 1,1", frameCount, importCount)
+	if frameCount != 1 || importCount != 0 {
+		t.Fatalf("recovered import persisted frames=%d markers=%d, want 1,0", frameCount, importCount)
 	}
 }
 
-func TestWALDrainsLegacySpoolFilesIdempotently(t *testing.T) {
+func TestWALDrainsLegacySpoolFiles(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "legacy-spool.db")
 	w := mustOpenWALWithoutWriter(t, dbPath)
@@ -798,17 +842,106 @@ func TestWALDrainsLegacySpoolFilesIdempotently(t *testing.T) {
 	spoolPath := filepath.Join(w.spoolDir, "00000000000000000001-000001.batch")
 	frames := []*agentv1.TelemetryFrame{{RawMavlink: []byte("legacy-spool")}}
 	writeLegacySpoolFile(t, spoolPath, frames)
-	if err := w.drainSpool(); err != nil {
-		t.Fatal(err)
-	}
-	var spoolID string
-	if err := w.db.QueryRowContext(ctx, `SELECT spool_id FROM spool_imports`).Scan(&spoolID); err != nil {
+	spoolID, err := readSpoolIdentityFromPath(spoolPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(spoolID, "legacy:") {
 		t.Fatalf("legacy spool identity = %q", spoolID)
 	}
-	writeLegacySpoolFile(t, spoolPath, frames)
+	if err := w.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	var frameCount, importCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 1 || importCount != 0 {
+		t.Fatalf("legacy spool import persisted frames=%d markers=%d, want 1,0", frameCount, importCount)
+	}
+}
+
+func TestWALPrunesOrphanedSpoolImportsAfterRestartInBoundedBatches(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "orphaned-spool-imports.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	spoolPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("committed-before-crash")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolID, frames, err := readSpoolFile(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported, err := w.appendSpoolBatch(ctx, spoolID, frames); err != nil || !imported {
+		t.Fatalf("appendSpoolBatch() = %v, %v", imported, err)
+	}
+	if err := os.Remove(spoolPath); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < spoolImportCleanupBatchSize*2; i++ {
+		if _, err := w.db.ExecContext(ctx, `INSERT INTO spool_imports(spool_id, imported_at) VALUES(?, ?)`, uuid.NewString(), time.Now().UnixNano()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if err := reopened.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	var frameCount, importCount int
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 1 || importCount != 0 {
+		t.Fatalf("orphan cleanup retained frames=%d markers=%d, want 1,0", frameCount, importCount)
+	}
+}
+
+func TestWALSpoolImportCleanupPreservesMarkersWithLiveFiles(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "live-spool-import.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	spoolPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("live")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolID, frames, err := readSpoolFile(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported, err := w.appendSpoolBatch(ctx, spoolID, frames); err != nil || !imported {
+		t.Fatalf("appendSpoolBatch() = %v, %v", imported, err)
+	}
+	if err := w.CleanupDelivered(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	var importCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports WHERE spool_id = ?`, spoolID).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if importCount != 1 {
+		t.Fatalf("live spool marker count = %d, want 1", importCount)
+	}
 	if err := w.drainSpool(); err != nil {
 		t.Fatal(err)
 	}
@@ -817,7 +950,13 @@ func TestWALDrainsLegacySpoolFilesIdempotently(t *testing.T) {
 		t.Fatal(err)
 	}
 	if frameCount != 1 {
-		t.Fatalf("legacy spool retry rows = %d, want 1", frameCount)
+		t.Fatalf("live spool re-imported rows = %d, want 1", frameCount)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if importCount != 0 {
+		t.Fatalf("completed live spool markers = %d, want 0", importCount)
 	}
 }
 
@@ -978,6 +1117,9 @@ func TestWAL_CleanupDelivered(t *testing.T) {
 	}
 
 	// Keep last 3
+	if _, err := w.db.ExecContext(ctx, `INSERT INTO spool_imports(spool_id, imported_at) VALUES(?, ?)`, uuid.NewString(), time.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.CleanupDelivered(ctx, 3); err != nil {
 		t.Fatalf("CleanupDelivered failed: %v", err)
 	}
@@ -1004,6 +1146,13 @@ func TestWAL_CleanupDelivered(t *testing.T) {
 	}
 	if id1Exists != 0 {
 		t.Error("Expected old ID to be deleted, but it exists")
+	}
+	var importCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if importCount != 0 {
+		t.Fatalf("orphaned spool import markers after cleanup = %d, want 0", importCount)
 	}
 }
 

@@ -27,6 +27,9 @@ import (
 // Keep legacy migration memory bounded on constrained companion computers.
 const legacyFrameMigrationBatchSize = 128
 
+// Keep durable marker reclamation transactions bounded as well.
+const spoolImportCleanupBatchSize = 128
+
 const (
 	spoolFileMagic = "AEROARC-SPOOL\x00\x01"
 	spoolIDLength  = 36
@@ -44,6 +47,7 @@ type WAL struct {
 	db           *sql.DB
 	generationID string
 	doneChan     chan struct{}
+	writerDone   chan struct{}
 	batchChan    chan *agentv1.TelemetryFrame
 	signalChan   chan struct{}
 	batchSize    int64
@@ -52,6 +56,8 @@ type WAL struct {
 	spoolSeq     uint64
 	spoolMu      sync.Mutex
 	removeFile   func(string) error
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 // New creates or opens a WAL and starts a new durable append generation.
@@ -107,6 +113,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		db:           db,
 		generationID: generationID,
 		doneChan:     make(chan struct{}),
+		writerDone:   make(chan struct{}),
 		batchChan:    make(chan *agentv1.TelemetryFrame, batchSize*2), // Buffer a bit more than one batch
 		signalChan:   make(chan struct{}, 1),                          // Buffer 1 to prevent blocking
 		batchSize:    batchSize,
@@ -176,7 +183,8 @@ func initDB(db *sql.DB) error {
 	);
 	CREATE TABLE IF NOT EXISTS spool_imports (
 		spool_id TEXT PRIMARY KEY,
-		imported_at INTEGER NOT NULL
+		imported_at INTEGER NOT NULL,
+		seen_token TEXT NOT NULL DEFAULT ''
 	);
 	`
 	_, err := db.Exec(query)
@@ -192,7 +200,24 @@ func initDB(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("failed to create index: %w", err)
 	}
+	if err := ensureSpoolImportSeenToken(db); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func ensureSpoolImportSeenToken(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('spool_imports') WHERE name = 'seen_token'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect spool import schema: %w", err)
+	}
+	if count != 0 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE spool_imports ADD COLUMN seen_token TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("add spool import cleanup token: %w", err)
+	}
 	return nil
 }
 
@@ -536,6 +561,8 @@ func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) e
 }
 
 func (w *WAL) runBatchWriter(ctx context.Context) {
+	defer close(w.writerDone)
+
 	var batch []*agentv1.TelemetryFrame
 	ticker := time.NewTicker(w.batchTimeout)
 	defer ticker.Stop()
@@ -559,6 +586,16 @@ func (w *WAL) runBatchWriter(ctx context.Context) {
 
 	flushPending := false
 	retryDelay := 200 * time.Millisecond
+	shutdown := func(drain bool) {
+		if err := flush(); err != nil {
+			slog.Error("WAL Batch Spool Failed", "error", err)
+		}
+		if drain {
+			if err := w.drainSpool(); err != nil {
+				slog.Error("WAL Spool Drain Failed", "error", err)
+			}
+		}
+	}
 
 	for {
 		if flushPending {
@@ -568,6 +605,10 @@ func (w *WAL) runBatchWriter(ctx context.Context) {
 				case <-time.After(retryDelay):
 					continue
 				case <-ctx.Done():
+					shutdown(true)
+					return
+				case <-w.doneChan:
+					shutdown(false)
 					return
 				}
 			}
@@ -593,12 +634,10 @@ func (w *WAL) runBatchWriter(ctx context.Context) {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
 		case <-ctx.Done():
-			if err := flush(); err != nil {
-				slog.Error("WAL Batch Spool Failed", "error", err)
-			}
-			if err := w.drainSpool(); err != nil {
-				slog.Error("WAL Spool Drain Failed", "error", err)
-			}
+			shutdown(true)
+			return
+		case <-w.doneChan:
+			shutdown(false)
 			return
 		}
 	}
@@ -687,6 +726,9 @@ func (w *WAL) drainSpool() error {
 	if err != nil {
 		return fmt.Errorf("failed to read spool dir: %w", err)
 	}
+	if err := w.pruneOrphanedSpoolImports(context.Background(), entries); err != nil {
+		return err
+	}
 
 	if len(entries) == 0 {
 		return nil
@@ -721,6 +763,9 @@ func (w *WAL) drainSpool() error {
 			if err := w.removeFile(path); err != nil {
 				return fmt.Errorf("failed to remove empty spool file: %w", err)
 			}
+			if err := w.deleteSpoolImport(context.Background(), spoolID); err != nil {
+				return err
+			}
 			continue
 		}
 		imported, err := w.appendSpoolBatch(context.Background(), spoolID, frames)
@@ -731,9 +776,81 @@ func (w *WAL) drainSpool() error {
 		if err := w.removeFile(path); err != nil {
 			return fmt.Errorf("failed to remove spool file: %w", err)
 		}
+		if err := w.deleteSpoolImport(context.Background(), spoolID); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+func (w *WAL) deleteSpoolImport(ctx context.Context, spoolID string) error {
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM spool_imports WHERE spool_id = ?`, spoolID); err != nil {
+		return fmt.Errorf("delete spool import %q: %w", spoolID, err)
+	}
+	return nil
+}
+
+func (w *WAL) cleanupOrphanedSpoolImports(ctx context.Context) error {
+	w.spoolMu.Lock()
+	defer w.spoolMu.Unlock()
+
+	entries, err := os.ReadDir(w.spoolDir)
+	if err != nil {
+		return fmt.Errorf("failed to read spool dir for import cleanup: %w", err)
+	}
+	return w.pruneOrphanedSpoolImports(ctx, entries)
+}
+
+func (w *WAL) pruneOrphanedSpoolImports(ctx context.Context, entries []os.DirEntry) error {
+	seenToken := uuid.NewString()
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".batch" {
+			continue
+		}
+		path := filepath.Join(w.spoolDir, entry.Name())
+		spoolID, err := readSpoolIdentityFromPath(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read live spool identity %s: %w", path, err)
+		}
+		if _, err := w.db.ExecContext(ctx, `UPDATE spool_imports SET seen_token = ? WHERE spool_id = ?`, seenToken, spoolID); err != nil {
+			return fmt.Errorf("mark live spool import %q: %w", spoolID, err)
+		}
+	}
+
+	for {
+		result, err := w.db.ExecContext(ctx, `DELETE FROM spool_imports WHERE spool_id IN (
+			SELECT spool_id FROM spool_imports
+			WHERE seen_token <> ?
+			ORDER BY spool_id
+			LIMIT ?
+		)`, seenToken, spoolImportCleanupBatchSize)
+		if err != nil {
+			return fmt.Errorf("prune orphaned spool imports: %w", err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect orphaned spool import cleanup: %w", err)
+		}
+		if rows < spoolImportCleanupBatchSize {
+			return nil
+		}
+	}
+}
+
+func readSpoolIdentityFromPath(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	spoolID, _, err := readSpoolIdentity(file, path)
+	return spoolID, err
 }
 
 func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
@@ -1118,9 +1235,18 @@ func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error
 	return rows, err
 }
 
-// CleanupDelivered deletes delivered frames that are older than the specified retention count.
-// It ensures that at most `retentionCount` delivered frames remain in the WAL.
-// This is a basic form of garbage collection to prevent unbounded growth.
+// CleanupDelivered deletes delivered frames older than the requested retention
+// count and reclaims completed spool-import markers that have no live spool
+// file. Live-file markers are retained so a pending cleanup retry cannot
+// re-import its frames.
+//
+// Parameters:
+//   - ctx: bounds both telemetry deletion and bounded marker reclamation.
+//   - retentionCount: keeps this many of the newest delivered frames; negative
+//     values are treated as zero.
+//
+// Returns:
+//   - error: reports SQLite, spool-directory, or live-file inspection failures.
 func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 	if retentionCount < 0 {
 		retentionCount = 0
@@ -1144,11 +1270,25 @@ func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 	if err != nil {
 		return fmt.Errorf("failed to cleanup delivered frames: %w", err)
 	}
+	if err := w.cleanupOrphanedSpoolImports(ctx); err != nil {
+		return fmt.Errorf("cleanup spool imports: %w", err)
+	}
 	return nil
 }
 
-// Close closes the underlying database connection.
+// Close durably spools any in-memory asynchronous batch, stops and waits for
+// the background writer, and then closes the database. Existing spool files
+// are left for the next open to import under its new append generation.
+//
+// Returns:
+//   - error: reports failure to close the underlying SQLite connection.
 func (w *WAL) Close() error {
-	close(w.doneChan) // Signal writer to stop
-	return w.db.Close()
+	w.closeOnce.Do(func() {
+		if w.writerDone != nil {
+			close(w.doneChan)
+			<-w.writerDone
+		}
+		w.closeErr = w.db.Close()
+	})
+	return w.closeErr
 }
