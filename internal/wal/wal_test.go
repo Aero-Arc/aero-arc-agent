@@ -956,6 +956,181 @@ func TestWAL_SpoolAndDrain(t *testing.T) {
 	}
 }
 
+func TestWALDrainQuarantinesMalformedSpoolAndContinues(t *testing.T) {
+	tests := []struct {
+		name         string
+		corruptBytes func(t *testing.T) []byte
+	}{
+		{
+			name: "current format",
+			corruptBytes: func(t *testing.T) []byte {
+				t.Helper()
+				var length [4]byte
+				binary.LittleEndian.PutUint32(length[:], 1)
+				return bytes.Join([][]byte{[]byte(spoolFileMagic), []byte(uuid.NewString()), length[:], []byte{0xff}}, nil)
+			},
+		},
+		{
+			name: "legacy format",
+			corruptBytes: func(t *testing.T) []byte {
+				t.Helper()
+				return []byte{0x01, 0x00, 0x00}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "malformed-spool.db")
+			w := mustOpenWALWithoutWriter(t, dbPath)
+			corruptPath := filepath.Join(w.spoolDir, "000-corrupt.batch")
+			corruptBytes := test.corruptBytes(t)
+			if err := os.WriteFile(corruptPath, corruptBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			validPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("valid-after-corruption")}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			validSortedPath := filepath.Join(w.spoolDir, "999-valid.batch")
+			if err := os.Rename(validPath, validSortedPath); err != nil {
+				t.Fatal(err)
+			}
+
+			drainErr := w.drainSpool()
+			if drainErr == nil || !strings.Contains(drainErr.Error(), "quarantined malformed spool file") {
+				t.Fatalf("drain error = %v, want quarantine diagnostic", drainErr)
+			}
+			select {
+			case <-w.signalChan:
+			default:
+				t.Fatal("valid batch imported without signaling data")
+			}
+			entries, err := w.ReadUndelivered(ctx, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("valid imported rows = %d, want 1", len(entries))
+			}
+			var frame agentv1.TelemetryFrame
+			if err := proto.Unmarshal(entries[0].Payload, &frame); err != nil {
+				t.Fatal(err)
+			}
+			if string(frame.GetRawMavlink()) != "valid-after-corruption" {
+				t.Fatalf("imported payload = %q", frame.GetRawMavlink())
+			}
+			if _, err := os.Stat(corruptPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("active corrupt spool still exists: %v", err)
+			}
+			quarantineEntries, err := os.ReadDir(w.spoolQuarantineDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(quarantineEntries) != 1 {
+				t.Fatalf("quarantine artifacts = %d, want 1", len(quarantineEntries))
+			}
+			artifactName := quarantineEntries[0].Name()
+			if !strings.Contains(artifactName, "-"+filepath.Base(corruptPath)+".corrupt") {
+				t.Fatalf("quarantine artifact name = %q", artifactName)
+			}
+			artifactPath := filepath.Join(w.spoolQuarantineDir, artifactName)
+			preserved, err := os.ReadFile(artifactPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(preserved, corruptBytes) {
+				t.Fatalf("quarantined bytes changed: got %x want %x", preserved, corruptBytes)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened := mustOpenWALWithoutWriter(t, dbPath)
+			t.Cleanup(func() {
+				if err := reopened.Close(); err != nil {
+					t.Errorf("close reopened WAL: %v", err)
+				}
+			})
+			if err := reopened.drainSpool(); err != nil {
+				t.Fatalf("restart retried quarantined spool: %v", err)
+			}
+			entries, err = reopened.ReadUndelivered(ctx, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("restart imported rows = %d, want stable 1", len(entries))
+			}
+			preserved, err = os.ReadFile(artifactPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(preserved, corruptBytes) {
+				t.Fatalf("restart changed quarantined bytes: got %x want %x", preserved, corruptBytes)
+			}
+			deleted, err := reopened.CleanupSpoolQuarantine(ctx, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if deleted != 1 {
+				t.Fatalf("explicit quarantine cleanup deleted %d files, want 1", deleted)
+			}
+		})
+	}
+}
+
+func TestWALDrainContinuesWhenSpoolQuarantineMoveFails(t *testing.T) {
+	ctx := context.Background()
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "quarantine-move-failure.db"))
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	corruptPath := filepath.Join(w.spoolDir, "000-corrupt.batch")
+	var length [4]byte
+	binary.LittleEndian.PutUint32(length[:], 1)
+	corruptBytes := bytes.Join([][]byte{[]byte(spoolFileMagic), []byte(uuid.NewString()), length[:], []byte{0xff}}, nil)
+	if err := os.WriteFile(corruptPath, corruptBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("later-valid")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(validPath, filepath.Join(w.spoolDir, "999-valid.batch")); err != nil {
+		t.Fatal(err)
+	}
+	moveErr := errors.New("simulated quarantine move failure")
+	w.renameFile = func(source, destination string) error {
+		if source == corruptPath {
+			return moveErr
+		}
+		return os.Rename(source, destination)
+	}
+
+	if err := w.drainSpool(); !errors.Is(err, moveErr) {
+		t.Fatalf("drain error = %v, want %v", err, moveErr)
+	}
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("valid rows after quarantine move failure = %d, want 1", len(entries))
+	}
+	select {
+	case <-w.signalChan:
+	default:
+		t.Fatal("valid batch imported without signaling data")
+	}
+	if preserved, err := os.ReadFile(corruptPath); err != nil || !bytes.Equal(preserved, corruptBytes) {
+		t.Fatalf("active corrupt spool after failed move = %x, %v", preserved, err)
+	}
+}
+
 func TestWALSpoolUsesGenerationThatAssignsSequence(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "spool-generation.db")
@@ -1518,17 +1693,20 @@ func mustOpenWALWithoutWriter(t *testing.T, dbPath string) *WAL {
 		t.Fatal(err)
 	}
 	spoolDir := dbPath + ".spool"
-	if err := os.MkdirAll(spoolDir, 0o755); err != nil {
+	spoolQuarantineDir := filepath.Join(spoolDir, "quarantine")
+	if err := os.MkdirAll(spoolQuarantineDir, 0o755); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
 	return &WAL{
-		db:           db,
-		generationID: generationID,
-		doneChan:     make(chan struct{}),
-		signalChan:   make(chan struct{}, 1),
-		spoolDir:     spoolDir,
-		removeFile:   os.Remove,
+		db:                 db,
+		generationID:       generationID,
+		doneChan:           make(chan struct{}),
+		signalChan:         make(chan struct{}, 1),
+		spoolDir:           spoolDir,
+		spoolQuarantineDir: spoolQuarantineDir,
+		removeFile:         os.Remove,
+		renameFile:         os.Rename,
 	}
 }
 

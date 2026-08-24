@@ -34,8 +34,9 @@ const spoolImportCleanupBatchSize = 128
 const quarantineCleanupBatchSize = 128
 
 const (
-	spoolFileMagic = "AEROARC-SPOOL\x00\x01"
-	spoolIDLength  = 36
+	spoolFileMagic           = "AEROARC-SPOOL\x00\x01"
+	spoolIDLength            = 36
+	maxSpoolFramePayloadSize = 16 << 20
 )
 
 // Entry represents a single log entry in the WAL.
@@ -47,20 +48,22 @@ type Entry struct {
 
 // WAL implements a Write-Ahead Log using SQLite.
 type WAL struct {
-	db           *sql.DB
-	generationID string
-	doneChan     chan struct{}
-	writerDone   chan struct{}
-	batchChan    chan *agentv1.TelemetryFrame
-	signalChan   chan struct{}
-	batchSize    int64
-	batchTimeout time.Duration
-	spoolDir     string
-	spoolSeq     uint64
-	spoolMu      sync.Mutex
-	removeFile   func(string) error
-	closeOnce    sync.Once
-	closeErr     error
+	db                 *sql.DB
+	generationID       string
+	doneChan           chan struct{}
+	writerDone         chan struct{}
+	batchChan          chan *agentv1.TelemetryFrame
+	signalChan         chan struct{}
+	batchSize          int64
+	batchTimeout       time.Duration
+	spoolDir           string
+	spoolQuarantineDir string
+	spoolSeq           uint64
+	spoolMu            sync.Mutex
+	removeFile         func(string) error
+	renameFile         func(string, string) error
+	closeOnce          sync.Once
+	closeErr           error
 }
 
 // New creates or opens a WAL and starts a new durable append generation.
@@ -123,11 +126,13 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		batchTimeout: batchTimeout,
 		spoolDir:     path + ".spool",
 		removeFile:   os.Remove,
+		renameFile:   os.Rename,
 	}
+	wal.spoolQuarantineDir = filepath.Join(wal.spoolDir, "quarantine")
 
-	if err := os.MkdirAll(wal.spoolDir, 0o755); err != nil {
+	if err := os.MkdirAll(wal.spoolQuarantineDir, 0o755); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to create spool dir: %w", err)
+		return nil, fmt.Errorf("failed to create spool quarantine dir: %w", err)
 	}
 
 	// Start the background writer
@@ -688,8 +693,8 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to marshal frame for spool: %w", err)
 		}
-		if len(encoded) > int(^uint32(0)) {
-			return "", fmt.Errorf("spool frame too large: %d", len(encoded))
+		if len(encoded) > maxSpoolFramePayloadSize {
+			return "", fmt.Errorf("spool frame exceeds %d-byte safety limit: %d", maxSpoolFramePayloadSize, len(encoded))
 		}
 		payloads = append(payloads, encoded)
 	}
@@ -760,19 +765,12 @@ func (w *WAL) drainSpool() error {
 	if err != nil {
 		return fmt.Errorf("failed to read spool dir: %w", err)
 	}
-	if err := w.pruneOrphanedSpoolImports(context.Background(), entries); err != nil {
-		return err
-	}
-
-	if len(entries) == 0 {
-		return nil
-	}
-
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})
 
 	wrote := false
+	var drainErr error
 	defer func() {
 		if wrote {
 			select {
@@ -791,31 +789,95 @@ func (w *WAL) drainSpool() error {
 		path := filepath.Join(w.spoolDir, entry.Name())
 		spoolID, frames, err := readSpoolFile(path)
 		if err != nil {
-			return fmt.Errorf("failed to read spool file %s: %w", path, err)
+			quarantinePath, quarantineErr := w.quarantineSpoolFile(path)
+			if quarantineErr != nil {
+				drainErr = errors.Join(drainErr,
+					fmt.Errorf("read malformed spool file %s: %w", path, err),
+					fmt.Errorf("quarantine malformed spool file %s: %w", path, quarantineErr))
+				if quarantinePath != "" {
+					drainErr = errors.Join(drainErr, fmt.Errorf("malformed spool file moved to %s before quarantine sync failed", quarantinePath))
+				}
+			} else {
+				drainErr = errors.Join(drainErr, fmt.Errorf("quarantined malformed spool file %s at %s: %w", path, quarantinePath, err))
+			}
+			continue
 		}
 		if len(frames) == 0 {
 			if err := w.removeFile(path); err != nil {
-				return fmt.Errorf("failed to remove empty spool file: %w", err)
+				drainErr = errors.Join(drainErr, fmt.Errorf("failed to remove empty spool file %s: %w", path, err))
+				continue
 			}
 			if err := w.deleteSpoolImport(context.Background(), spoolID); err != nil {
-				return err
+				drainErr = errors.Join(drainErr, err)
 			}
 			continue
 		}
 		imported, err := w.appendSpoolBatch(context.Background(), spoolID, frames)
 		if err != nil {
-			return err
+			drainErr = errors.Join(drainErr, fmt.Errorf("import spool file %s: %w", path, err))
+			continue
 		}
 		wrote = wrote || imported
 		if err := w.removeFile(path); err != nil {
-			return fmt.Errorf("failed to remove spool file: %w", err)
+			drainErr = errors.Join(drainErr, fmt.Errorf("failed to remove spool file %s: %w", path, err))
+			continue
 		}
 		if err := w.deleteSpoolImport(context.Background(), spoolID); err != nil {
-			return err
+			drainErr = errors.Join(drainErr, err)
 		}
 	}
 
-	return nil
+	remainingEntries, err := os.ReadDir(w.spoolDir)
+	if err != nil {
+		drainErr = errors.Join(drainErr, fmt.Errorf("failed to reread spool dir for import cleanup: %w", err))
+	} else if err := w.pruneOrphanedSpoolImports(context.Background(), remainingEntries); err != nil {
+		drainErr = errors.Join(drainErr, err)
+	}
+
+	return drainErr
+}
+
+func (w *WAL) quarantineSpoolFile(path string) (string, error) {
+	if err := os.MkdirAll(w.spoolQuarantineDir, 0o755); err != nil {
+		return "", fmt.Errorf("create spool quarantine dir: %w", err)
+	}
+	if err := syncFile(path); err != nil {
+		return "", fmt.Errorf("sync malformed spool file before quarantine: %w", err)
+	}
+	destination := filepath.Join(w.spoolQuarantineDir,
+		fmt.Sprintf("%020d-%s-%s.corrupt", time.Now().UnixNano(), uuid.NewString(), filepath.Base(path)))
+	if err := w.renameFile(path, destination); err != nil {
+		return "", fmt.Errorf("move spool file to quarantine: %w", err)
+	}
+	if err := syncDir(w.spoolQuarantineDir); err != nil {
+		return destination, fmt.Errorf("sync spool quarantine dir: %w", err)
+	}
+	if err := syncDir(w.spoolDir); err != nil {
+		return destination, fmt.Errorf("sync active spool dir: %w", err)
+	}
+	return destination, nil
+}
+
+func syncFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	return file.Sync()
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = dir.Close()
+	}()
+	return dir.Sync()
 }
 
 func (w *WAL) deleteSpoolImport(ctx context.Context, spoolID string) error {
@@ -921,6 +983,9 @@ func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
 		length := binary.LittleEndian.Uint32(lenBuf[:])
 		if length == 0 {
 			continue
+		}
+		if length > maxSpoolFramePayloadSize {
+			return "", nil, fmt.Errorf("spool payload length %d exceeds %d-byte safety limit", length, maxSpoolFramePayloadSize)
 		}
 
 		payload := make([]byte, length)
@@ -1367,6 +1432,64 @@ func (w *WAL) CleanupQuarantined(ctx context.Context, retentionCount int) (int64
 			return totalDeleted, nil
 		}
 	}
+}
+
+// CleanupSpoolQuarantine explicitly deletes older malformed spool files while
+// retaining the requested number of newest artifacts. Normal spool draining
+// never removes quarantined files.
+//
+// Parameters:
+//   - ctx: stops cleanup between individual file removals when cancelled.
+//   - retentionCount: keeps this many newest artifacts; negative values are
+//     treated as zero.
+//
+// Returns:
+//   - filesDeleted: is the number of quarantine artifacts removed.
+//   - error: joins file removal and context failures after making
+//     as much progress as possible.
+func (w *WAL) CleanupSpoolQuarantine(ctx context.Context, retentionCount int) (int, error) {
+	if retentionCount < 0 {
+		retentionCount = 0
+	}
+
+	w.spoolMu.Lock()
+	defer w.spoolMu.Unlock()
+
+	entries, err := os.ReadDir(w.spoolQuarantineDir)
+	if err != nil {
+		return 0, fmt.Errorf("read spool quarantine dir: %w", err)
+	}
+	artifacts := make([]string, 0, len(entries))
+	var cleanupErr error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		artifacts = append(artifacts, entry.Name())
+	}
+	sort.Slice(artifacts, func(i, j int) bool {
+		return artifacts[i] > artifacts[j]
+	})
+
+	filesDeleted := 0
+	for _, name := range artifacts[min(retentionCount, len(artifacts)):] {
+		if err := ctx.Err(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			break
+		}
+		path := filepath.Join(w.spoolQuarantineDir, name)
+		if err := w.removeFile(path); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete spool quarantine artifact %s: %w", path, err))
+			continue
+		}
+		filesDeleted++
+	}
+	if filesDeleted > 0 {
+		if err := syncDir(w.spoolQuarantineDir); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("sync spool quarantine cleanup: %w", err))
+		}
+	}
+	return filesDeleted, cleanupErr
 }
 
 func (w *WAL) cleanupQuarantinedBatch(ctx context.Context, retentionCount int) (int64, int64, error) {
