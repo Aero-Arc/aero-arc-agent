@@ -34,6 +34,35 @@ func TestNextBackoff(t *testing.T) {
 	}
 }
 
+func TestAgentShutdownPassesDeadlineToWALClose(t *testing.T) {
+	a := &Agent{}
+	closeCalled := make(chan struct{})
+	a.closeWALFn = func(ctx context.Context) error {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("WAL close context has no deadline")
+		}
+		close(closeCalled)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := a.shutdown(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown() error = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-closeCalled:
+	default:
+		t.Fatal("shutdown did not invoke context-aware WAL close")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("shutdown ignored WAL deadline for %v", time.Since(started))
+	}
+}
+
 func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

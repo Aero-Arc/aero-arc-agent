@@ -46,6 +46,7 @@ type Agent struct {
 	openStreamFn  func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
 	ackLoopFn     func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
 	sleepWithBack func(ctx context.Context, d time.Duration) bool
+	closeWALFn    func(ctx context.Context) error
 
 	stateMu          sync.RWMutex
 	sessionID        string
@@ -199,9 +200,12 @@ func (a *Agent) Start(ctx context.Context) error {
 }
 
 func (a *Agent) shutdown(ctx context.Context) error {
+	var shutdownErr error
 	if a.conn != nil {
 		slog.Info("shutting down grpc connection")
-		a.conn.Close()
+		if err := a.conn.Close(); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close gRPC connection: %w", err))
+		}
 	}
 
 	slog.Info("shutting down mavlink node (best effort)")
@@ -210,9 +214,16 @@ func (a *Agent) shutdown(ctx context.Context) error {
 
 	a.closeMAVLinkBestEffort(mavlinkCloseCtx)
 
-	if a.wal != nil {
+	if a.closeWALFn != nil {
 		slog.Info("shutting down write-ahead log connection")
-		a.wal.Close()
+		if err := a.closeWALFn(ctx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close write-ahead log: %w", err))
+		}
+	} else if a.wal != nil {
+		slog.Info("shutting down write-ahead log connection")
+		if err := a.wal.CloseContext(ctx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close write-ahead log: %w", err))
+		}
 	}
 
 	done := make(chan struct{})
@@ -225,12 +236,13 @@ func (a *Agent) shutdown(ctx context.Context) error {
 	case <-done:
 	case <-ctx.Done():
 		slog.Warn("shutdown timed out waiting for goroutines to finish")
+		shutdownErr = errors.Join(shutdownErr, ctx.Err())
 	}
 
 	a.gateway = nil
 	a.conn = nil
 
-	return nil
+	return shutdownErr
 }
 
 func (a *Agent) closeMAVLinkBestEffort(ctx context.Context) {

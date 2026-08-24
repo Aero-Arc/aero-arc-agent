@@ -33,6 +33,8 @@ const spoolImportCleanupBatchSize = 128
 // Keep explicit quarantine cleanup transactions bounded on constrained disks.
 const quarantineCleanupBatchSize = 128
 
+const lifecycleShutdownGrace = 5 * time.Second
+
 const (
 	spoolFileMagic           = "AEROARC-SPOOL\x00\x01"
 	spoolIDLength            = 36
@@ -50,7 +52,8 @@ type Entry struct {
 type WAL struct {
 	db                 *sql.DB
 	generationID       string
-	doneChan           chan struct{}
+	closeWake          chan struct{}
+	closeDone          chan struct{}
 	writerDone         chan struct{}
 	batchChan          chan *agentv1.TelemetryFrame
 	signalChan         chan struct{}
@@ -60,9 +63,14 @@ type WAL struct {
 	spoolQuarantineDir string
 	spoolSeq           uint64
 	spoolMu            sync.Mutex
+	appendMu           sync.RWMutex
 	removeFile         func(string) error
 	renameFile         func(string, string) error
-	closeOnce          sync.Once
+	closeDB            func() error
+	closeRequestMu     sync.Mutex
+	closeContexts      []context.Context
+	finalizeOnce       sync.Once
+	closing            atomic.Bool
 	closeErr           error
 }
 
@@ -73,7 +81,8 @@ type WAL struct {
 // cloned database from reusing cursors allocated after its snapshot.
 //
 // Parameters:
-//   - ctx: bounds schema initialization and generation rotation.
+//   - ctx: bounds initialization and triggers a bounded durable writer shutdown
+//     when its lifecycle is cancelled.
 //   - path: identifies the SQLite database and its adjacent spill directory.
 //   - batchSize: controls asynchronous transaction size; non-positive values
 //     select the default.
@@ -118,7 +127,8 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 	wal := &WAL{
 		db:           db,
 		generationID: generationID,
-		doneChan:     make(chan struct{}),
+		closeWake:    make(chan struct{}, 1),
+		closeDone:    make(chan struct{}),
 		writerDone:   make(chan struct{}),
 		batchChan:    make(chan *agentv1.TelemetryFrame, batchSize*2), // Buffer a bit more than one batch
 		signalChan:   make(chan struct{}, 1),                          // Buffer 1 to prevent blocking
@@ -127,6 +137,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		spoolDir:     path + ".spool",
 		removeFile:   os.Remove,
 		renameFile:   os.Rename,
+		closeDB:      db.Close,
 	}
 	wal.spoolQuarantineDir = filepath.Join(wal.spoolDir, "quarantine")
 
@@ -581,26 +592,32 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply
 // AppendAsync queues a frame for writing.
 // This is non-blocking unless the buffer is completely full.
 func (w *WAL) AppendAsync(ctx context.Context, tFrame *agentv1.TelemetryFrame) error {
-	select {
-	case w.batchChan <- tFrame:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		// If buffer is full, we can choose to drop or block.
-		// For safety, let's block with a short timeout or just block until context.
-		// For now, let's block on the channel send to provide backpressure.
+	for {
+		w.appendMu.RLock()
+		if w.closing.Load() {
+			w.appendMu.RUnlock()
+			return errors.New("WAL is closing")
+		}
 		select {
 		case w.batchChan <- tFrame:
+			w.appendMu.RUnlock()
 			return nil
+		default:
+			w.appendMu.RUnlock()
+		}
+		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-time.After(time.Millisecond):
 		}
 	}
 }
 
-func (w *WAL) runBatchWriter(ctx context.Context) {
-	defer close(w.writerDone)
+func (w *WAL) runBatchWriter(lifecycleCtx context.Context) {
+	defer func() {
+		close(w.writerDone)
+		w.finalizeClose()
+	}()
 
 	var batch []*agentv1.TelemetryFrame
 	ticker := time.NewTicker(w.batchTimeout)
@@ -625,30 +642,63 @@ func (w *WAL) runBatchWriter(ctx context.Context) {
 
 	flushPending := false
 	retryDelay := 200 * time.Millisecond
-	shutdown := func(drain bool) {
-		if err := flush(); err != nil {
-			slog.Error("WAL Batch Spool Failed", "error", err)
+	shutdown := func(ctx context.Context, drain bool) bool {
+	collectQueued:
+		for {
+			select {
+			case frame := <-w.batchChan:
+				batch = append(batch, frame)
+			default:
+				break collectQueued
+			}
 		}
+		if _, err := w.spoolBatchFrames(ctx, batch); err != nil {
+			slog.Error("WAL Batch Spool Failed", "error", err)
+			return false
+		}
+		batch = nil
 		if drain {
-			if err := w.drainSpool(); err != nil {
+			if err := w.drainSpoolContext(ctx); err != nil {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
 		}
+		return true
 	}
 
+	lifecycleDone := lifecycleCtx.Done()
+	closePending := false
 	for {
+		if closeCtx, ok := w.takeCloseContext(); ok {
+			if shutdown(closeCtx, false) {
+				return
+			}
+			closePending = true
+			continue
+		}
+		if closePending {
+			<-w.closeWake
+			continue
+		}
 		if flushPending {
 			if err := flush(); err != nil {
 				slog.Error("WAL Batch Spool Failed", "error", err)
 				select {
 				case <-time.After(retryDelay):
 					continue
-				case <-ctx.Done():
-					shutdown(true)
-					return
-				case <-w.doneChan:
-					shutdown(false)
-					return
+				case <-w.closeWake:
+					continue
+				case <-lifecycleDone:
+					lifecycleDone = nil
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), lifecycleShutdownGrace)
+					w.requestClose(shutdownCtx)
+					go func() {
+						select {
+						case <-w.closeDone:
+						case <-shutdownCtx.Done():
+						}
+						cancel()
+					}()
+					continue
 				}
 			}
 
@@ -672,23 +722,69 @@ func (w *WAL) runBatchWriter(ctx context.Context) {
 			} else if err := w.drainSpool(); err != nil {
 				slog.Error("WAL Spool Drain Failed", "error", err)
 			}
-		case <-ctx.Done():
-			shutdown(true)
-			return
-		case <-w.doneChan:
-			shutdown(false)
-			return
+		case <-w.closeWake:
+			continue
+		case <-lifecycleDone:
+			lifecycleDone = nil
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), lifecycleShutdownGrace)
+			w.requestClose(shutdownCtx)
+			go func() {
+				select {
+				case <-w.closeDone:
+				case <-shutdownCtx.Done():
+				}
+				cancel()
+			}()
 		}
 	}
 }
 
+func (w *WAL) requestClose(ctx context.Context) {
+	w.appendMu.Lock()
+	w.closing.Store(true)
+	w.appendMu.Unlock()
+	w.closeRequestMu.Lock()
+	w.closeContexts = append(w.closeContexts, ctx)
+	w.closeRequestMu.Unlock()
+	select {
+	case w.closeWake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *WAL) takeCloseContext() (context.Context, bool) {
+	w.closeRequestMu.Lock()
+	defer w.closeRequestMu.Unlock()
+	if len(w.closeContexts) == 0 {
+		return nil, false
+	}
+	ctx := w.closeContexts[0]
+	w.closeContexts[0] = nil
+	w.closeContexts = w.closeContexts[1:]
+	return ctx, true
+}
+
+func (w *WAL) finalizeClose() {
+	w.finalizeOnce.Do(func() {
+		w.closeErr = w.closeDB()
+		close(w.closeDone)
+	})
+}
+
 func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
+	return w.spoolBatchFrames(context.Background(), frames)
+}
+
+func (w *WAL) spoolBatchFrames(ctx context.Context, frames []*agentv1.TelemetryFrame) (string, error) {
 	if len(frames) == 0 {
 		return "", nil
 	}
 
 	payloads := make([][]byte, 0, len(frames))
 	for _, frame := range frames {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		encoded, err := proto.Marshal(frame)
 		if err != nil {
 			return "", fmt.Errorf("failed to marshal frame for spool: %w", err)
@@ -709,6 +805,9 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 	path := filepath.Join(w.spoolDir, name)
 	tmpPath := path + ".tmp"
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("failed to create spool file: %w", err)
@@ -730,6 +829,9 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 		return "", fmt.Errorf("failed to write spool identity: %w", err)
 	}
 	for _, payload := range payloads {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		var lenBuf [4]byte
 		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(payload)))
 		if _, err := writer.Write(lenBuf[:]); err != nil {
@@ -749,7 +851,7 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 	if err := file.Close(); err != nil {
 		return "", fmt.Errorf("failed to close spool file: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := w.renameFile(tmpPath, path); err != nil {
 		return "", fmt.Errorf("failed to finalize spool file: %w", err)
 	}
 
@@ -758,9 +860,21 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 }
 
 func (w *WAL) drainSpool() error {
-	w.spoolMu.Lock()
+	return w.drainSpoolContext(context.Background())
+}
+
+func (w *WAL) drainSpoolContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := lockMutexContext(ctx, &w.spoolMu); err != nil {
+		return err
+	}
 	defer w.spoolMu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(w.spoolDir)
 	if err != nil {
 		return fmt.Errorf("failed to read spool dir: %w", err)
@@ -780,6 +894,10 @@ func (w *WAL) drainSpool() error {
 		}
 	}()
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			drainErr = errors.Join(drainErr, err)
+			break
+		}
 		if entry.IsDir() {
 			continue
 		}
@@ -807,12 +925,12 @@ func (w *WAL) drainSpool() error {
 				drainErr = errors.Join(drainErr, fmt.Errorf("failed to remove empty spool file %s: %w", path, err))
 				continue
 			}
-			if err := w.deleteSpoolImport(context.Background(), spoolID); err != nil {
+			if err := w.deleteSpoolImport(ctx, spoolID); err != nil {
 				drainErr = errors.Join(drainErr, err)
 			}
 			continue
 		}
-		imported, err := w.appendSpoolBatch(context.Background(), spoolID, frames)
+		imported, err := w.appendSpoolBatch(ctx, spoolID, frames)
 		if err != nil {
 			drainErr = errors.Join(drainErr, fmt.Errorf("import spool file %s: %w", path, err))
 			continue
@@ -822,7 +940,7 @@ func (w *WAL) drainSpool() error {
 			drainErr = errors.Join(drainErr, fmt.Errorf("failed to remove spool file %s: %w", path, err))
 			continue
 		}
-		if err := w.deleteSpoolImport(context.Background(), spoolID); err != nil {
+		if err := w.deleteSpoolImport(ctx, spoolID); err != nil {
 			drainErr = errors.Join(drainErr, err)
 		}
 	}
@@ -830,11 +948,22 @@ func (w *WAL) drainSpool() error {
 	remainingEntries, err := os.ReadDir(w.spoolDir)
 	if err != nil {
 		drainErr = errors.Join(drainErr, fmt.Errorf("failed to reread spool dir for import cleanup: %w", err))
-	} else if err := w.pruneOrphanedSpoolImports(context.Background(), remainingEntries); err != nil {
+	} else if err := w.pruneOrphanedSpoolImports(ctx, remainingEntries); err != nil {
 		drainErr = errors.Join(drainErr, err)
 	}
 
 	return drainErr
+}
+
+func lockMutexContext(ctx context.Context, mu *sync.Mutex) error {
+	for !mu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+	return nil
 }
 
 func (w *WAL) quarantineSpoolFile(path string) (string, error) {
@@ -1553,18 +1682,51 @@ func closeQuarantineRows(rows *sql.Rows, cause error) error {
 }
 
 // Close durably spools any in-memory asynchronous batch, stops and waits for
-// the background writer, and then closes the database. Existing spool files
-// are left for the next open to import under its new append generation.
+// the background writer, and then closes the database without a deadline.
+// Existing spool files are left for the next open to import under its new
+// append generation.
 //
 // Returns:
 //   - error: reports failure to close the underlying SQLite connection.
 func (w *WAL) Close() error {
-	w.closeOnce.Do(func() {
-		if w.writerDone != nil {
-			close(w.doneChan)
-			<-w.writerDone
-		}
-		w.closeErr = w.db.Close()
-	})
-	return w.closeErr
+	return w.CloseContext(context.Background())
+}
+
+// CloseContext requests a durable final spool, waits for the background
+// writer, and closes SQLite while respecting the caller's cancellation or
+// deadline. If the context expires first, CloseContext returns immediately;
+// SQLite remains open until the writer exits, so an active writer never races
+// a database close. If final spooling has not started, the writer retains its
+// in-memory batch and waits for a later Close or CloseContext call to retry;
+// if an uninterruptible filesystem operation is already running, it may safely
+// finish in the background. Close requests are idempotent and never close the
+// producer channel.
+//
+// Parameters:
+//   - ctx: bounds the final spool operations and this caller's wait.
+//
+// Returns:
+//   - error: reports context cancellation/deadline or the eventual SQLite
+//     close failure.
+func (w *WAL) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("close context is required")
+	}
+	select {
+	case <-w.closeDone:
+		return w.closeErr
+	default:
+	}
+	if w.writerDone == nil {
+		go w.finalizeClose()
+	} else {
+		w.requestClose(ctx)
+	}
+
+	select {
+	case <-w.closeDone:
+		return w.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

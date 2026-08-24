@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1663,6 +1665,290 @@ func TestWAL_ReadLimit(t *testing.T) {
 	}
 }
 
+func TestWALCloseContextDeadlineWhileDrainBlocked(t *testing.T) {
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "blocked-drain.db"))
+	w.writerDone = make(chan struct{})
+	w.batchTimeout = time.Hour
+	w.batchSize = 100
+	w.batchChan = make(chan *agentv1.TelemetryFrame, 200)
+	w.spoolMu.Lock()
+	go w.runBatchWriter(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := w.CloseContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext() error = %v, want deadline exceeded", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("CloseContext() ignored deadline for %v", time.Since(started))
+	}
+	if err := w.db.PingContext(context.Background()); err != nil {
+		t.Fatalf("database closed under blocked writer: %v", err)
+	}
+
+	w.spoolMu.Unlock()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWALCloseContextDeadlineDuringFinalFilesystemOperation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "blocked-filesystem.db")
+	w, err := New(ctx, dbPath, 100, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("durable-after-timeout")}); err != nil {
+		t.Fatal(err)
+	}
+	renameStarted := make(chan struct{})
+	releaseRename := make(chan struct{})
+	var startedOnce sync.Once
+	w.renameFile = func(source, destination string) error {
+		if strings.HasSuffix(source, ".tmp") {
+			startedOnce.Do(func() { close(renameStarted) })
+			<-releaseRename
+		}
+		return os.Rename(source, destination)
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- w.CloseContext(closeCtx)
+	}()
+	select {
+	case <-renameStarted:
+	case <-time.After(time.Second):
+		t.Fatal("final spool rename did not start")
+	}
+	select {
+	case err := <-closeResult:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("CloseContext() error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseContext did not return after filesystem deadline")
+	}
+	if err := w.db.PingContext(context.Background()); err != nil {
+		t.Fatalf("database closed while writer remained active: %v", err)
+	}
+	close(releaseRename)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dbPath + ".spool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchCount := 0
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".batch" {
+			batchCount++
+		}
+	}
+	if batchCount != 1 {
+		t.Fatalf("durable batches after timed-out close = %d, want 1", batchCount)
+	}
+}
+
+func TestWALCloseContextRetriesUnspooledBatchAfterExpiredRequest(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "retry-close.db")
+	w, err := New(ctx, dbPath, 100, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("retry-me")}); err != nil {
+		t.Fatal(err)
+	}
+	expiredCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.CloseContext(expiredCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expired CloseContext() error = %v, want canceled", err)
+	}
+	if err := w.AppendAsync(context.Background(), &agentv1.TelemetryFrame{}); err == nil {
+		t.Fatal("AppendAsync succeeded while a close retry was pending")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dbPath + ".spool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchCount := 0
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".batch" {
+			batchCount++
+		}
+	}
+	if batchCount != 1 {
+		t.Fatalf("retried close durable batches = %d, want 1", batchCount)
+	}
+}
+
+func TestWALCloseContextDeadlineDuringDatabaseClose(t *testing.T) {
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "blocked-database-close.db"))
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	underlyingClose := w.db.Close
+	w.closeDB = func() error {
+		close(closeStarted)
+		<-releaseClose
+		return underlyingClose()
+	}
+	w.finalizeOnce = sync.Once{}
+	w.closeDone = make(chan struct{})
+	w.writerDone = nil
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- w.CloseContext(ctx)
+	}()
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("database close did not start")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("CloseContext() error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseContext did not return while database close blocked")
+	}
+	close(releaseClose)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWALCloseIsIdempotentAcrossConcurrentCallers(t *testing.T) {
+	w, err := New(context.Background(), filepath.Join(t.TempDir(), "concurrent-close.db"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	underlyingClose := w.db.Close
+	var closeCalls atomic.Int64
+	w.closeDB = func() error {
+		closeCalls.Add(1)
+		return underlyingClose()
+	}
+
+	const callers = 32
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- w.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if closeCalls.Load() != 1 {
+		t.Fatalf("database close calls = %d, want 1", closeCalls.Load())
+	}
+	if err := w.AppendAsync(context.Background(), &agentv1.TelemetryFrame{}); err == nil {
+		t.Fatal("AppendAsync succeeded after close")
+	}
+}
+
+func TestWALConcurrentAppendAndClosePreservesAcceptedFrames(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "append-close-race.db")
+	w, err := New(context.Background(), dbPath, 100, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const appenders = 64
+	start := make(chan struct{})
+	var accepted atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < appenders; i++ {
+		wg.Add(1)
+		go func(value byte) {
+			defer wg.Done()
+			<-start
+			if err := w.AppendAsync(context.Background(), &agentv1.TelemetryFrame{RawMavlink: []byte{value}}); err == nil {
+				accepted.Add(1)
+			}
+		}(byte(i))
+	}
+	closeResult := make(chan error, 1)
+	go func() {
+		<-start
+		closeResult <- w.Close()
+	}()
+	close(start)
+	wg.Wait()
+	if err := <-closeResult; err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if err := reopened.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := reopened.ReadUndelivered(context.Background(), appenders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(entries)) != accepted.Load() {
+		t.Fatalf("durable accepted frames = %d, want %d", len(entries), accepted.Load())
+	}
+}
+
+func TestWALLifecycleCancellationTriggersDurableClose(t *testing.T) {
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	dbPath := filepath.Join(t.TempDir(), "lifecycle-close.db")
+	w, err := New(lifecycleCtx, dbPath, 100, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AppendAsync(context.Background(), &agentv1.TelemetryFrame{RawMavlink: []byte("lifecycle")}); err != nil {
+		t.Fatal(err)
+	}
+	cancelLifecycle()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dbPath + ".spool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchCount := 0
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".batch" {
+			batchCount++
+		}
+	}
+	if batchCount != 1 {
+		t.Fatalf("lifecycle cancellation durable batches = %d, want 1", batchCount)
+	}
+}
+
 func mustNewWAL(t *testing.T) *WAL {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
@@ -1701,12 +1987,14 @@ func mustOpenWALWithoutWriter(t *testing.T, dbPath string) *WAL {
 	return &WAL{
 		db:                 db,
 		generationID:       generationID,
-		doneChan:           make(chan struct{}),
+		closeWake:          make(chan struct{}, 1),
+		closeDone:          make(chan struct{}),
 		signalChan:         make(chan struct{}, 1),
 		spoolDir:           spoolDir,
 		spoolQuarantineDir: spoolQuarantineDir,
 		removeFile:         os.Remove,
 		renameFile:         os.Rename,
+		closeDB:            db.Close,
 	}
 }
 
