@@ -3,8 +3,10 @@ package wal
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +27,11 @@ import (
 // Keep legacy migration memory bounded on constrained companion computers.
 const legacyFrameMigrationBatchSize = 128
 
+const (
+	spoolFileMagic = "AEROARC-SPOOL\x00\x01"
+	spoolIDLength  = 36
+)
+
 // Entry represents a single log entry in the WAL.
 type Entry struct {
 	ID        int64
@@ -44,6 +51,7 @@ type WAL struct {
 	spoolDir     string
 	spoolSeq     uint64
 	spoolMu      sync.Mutex
+	removeFile   func(string) error
 }
 
 // New creates or opens a WAL and starts a new durable append generation.
@@ -104,6 +112,7 @@ func New(ctx context.Context, path string, batchSize int64, batchTimeout time.Du
 		batchSize:    batchSize,
 		batchTimeout: batchTimeout,
 		spoolDir:     path + ".spool",
+		removeFile:   os.Remove,
 	}
 
 	if err := os.MkdirAll(wal.spoolDir, 0o755); err != nil {
@@ -164,6 +173,10 @@ func initDB(db *sql.DB) error {
 		legacy_generation_id TEXT NOT NULL,
 		last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
 		completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
+	);
+	CREATE TABLE IF NOT EXISTS spool_imports (
+		spool_id TEXT PRIMARY KEY,
+		imported_at INTEGER NOT NULL
 	);
 	`
 	_, err := db.Exec(query)
@@ -600,8 +613,7 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 	for _, frame := range frames {
 		encoded, err := proto.Marshal(frame)
 		if err != nil {
-			slog.Warn("failed to marshal frame for spool, skipping", "error", err)
-			continue
+			return "", fmt.Errorf("failed to marshal frame for spool: %w", err)
 		}
 		if len(encoded) > int(^uint32(0)) {
 			return "", fmt.Errorf("spool frame too large: %d", len(encoded))
@@ -613,8 +625,9 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 		return "", nil
 	}
 
+	spoolID := uuid.NewString()
 	seq := atomic.AddUint64(&w.spoolSeq, 1)
-	name := fmt.Sprintf("%020d-%06d.batch", time.Now().UnixNano(), seq)
+	name := fmt.Sprintf("%020d-%06d-%s.batch", time.Now().UnixNano(), seq, spoolID)
 	path := filepath.Join(w.spoolDir, name)
 	tmpPath := path + ".tmp"
 
@@ -626,12 +639,18 @@ func (w *WAL) spoolBatch(frames []*agentv1.TelemetryFrame) (string, error) {
 	cleanup := true
 	defer func() {
 		if cleanup {
-			file.Close()
+			_ = file.Close()
 			_ = os.Remove(tmpPath)
 		}
 	}()
 
 	writer := bufio.NewWriter(file)
+	if _, err := writer.WriteString(spoolFileMagic); err != nil {
+		return "", fmt.Errorf("failed to write spool header magic: %w", err)
+	}
+	if _, err := writer.WriteString(spoolID); err != nil {
+		return "", fmt.Errorf("failed to write spool identity: %w", err)
+	}
 	for _, payload := range payloads {
 		var lenBuf [4]byte
 		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(payload)))
@@ -678,6 +697,14 @@ func (w *WAL) drainSpool() error {
 	})
 
 	wrote := false
+	defer func() {
+		if wrote {
+			select {
+			case w.signalChan <- struct{}{}:
+			default:
+			}
+		}
+	}()
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -686,41 +713,45 @@ func (w *WAL) drainSpool() error {
 			continue
 		}
 		path := filepath.Join(w.spoolDir, entry.Name())
-		frames, err := readSpoolFile(path)
+		spoolID, frames, err := readSpoolFile(path)
 		if err != nil {
 			return fmt.Errorf("failed to read spool file %s: %w", path, err)
 		}
 		if len(frames) == 0 {
-			if err := os.Remove(path); err != nil {
+			if err := w.removeFile(path); err != nil {
 				return fmt.Errorf("failed to remove empty spool file: %w", err)
 			}
 			continue
 		}
-		if _, err := w.AppendBatch(context.Background(), frames); err != nil {
+		imported, err := w.appendSpoolBatch(context.Background(), spoolID, frames)
+		if err != nil {
 			return err
 		}
-		if err := os.Remove(path); err != nil {
+		wrote = wrote || imported
+		if err := w.removeFile(path); err != nil {
 			return fmt.Errorf("failed to remove spool file: %w", err)
-		}
-		wrote = true
-	}
-
-	if wrote {
-		select {
-		case w.signalChan <- struct{}{}:
-		default:
 		}
 	}
 
 	return nil
 }
 
-func readSpoolFile(path string) ([]*agentv1.TelemetryFrame, error) {
+func readSpoolFile(path string) (string, []*agentv1.TelemetryFrame, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
+
+	spoolID, payloadOffset, err := readSpoolIdentity(file, path)
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := file.Seek(payloadOffset, io.SeekStart); err != nil {
+		return "", nil, fmt.Errorf("seek to spool payload: %w", err)
+	}
 
 	reader := bufio.NewReader(file)
 	var frames []*agentv1.TelemetryFrame
@@ -731,9 +762,9 @@ func readSpoolFile(path string) ([]*agentv1.TelemetryFrame, error) {
 				break
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil, fmt.Errorf("truncated spool record: %w", err)
+				return "", nil, fmt.Errorf("truncated spool record: %w", err)
 			}
-			return nil, err
+			return "", nil, err
 		}
 
 		length := binary.LittleEndian.Uint32(lenBuf[:])
@@ -743,18 +774,52 @@ func readSpoolFile(path string) ([]*agentv1.TelemetryFrame, error) {
 
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
-			return nil, fmt.Errorf("truncated spool payload: %w", err)
+			return "", nil, fmt.Errorf("truncated spool payload: %w", err)
 		}
 
 		var frame agentv1.TelemetryFrame
 		if err := proto.Unmarshal(payload, &frame); err != nil {
-			slog.Warn("failed to unmarshal spool frame, skipping", "error", err)
-			continue
+			return "", nil, fmt.Errorf("failed to unmarshal spool frame: %w", err)
 		}
 		frames = append(frames, &frame)
 	}
 
-	return frames, nil
+	return spoolID, frames, nil
+}
+
+func readSpoolIdentity(file *os.File, path string) (string, int64, error) {
+	headerSize := len(spoolFileMagic) + spoolIDLength
+	header := make([]byte, headerSize)
+	n, err := file.ReadAt(header, 0)
+	if n >= len(spoolFileMagic) && string(header[:len(spoolFileMagic)]) == spoolFileMagic {
+		if err != nil || n != headerSize {
+			return "", 0, fmt.Errorf("truncated spool identity header: read %d bytes, want %d", n, headerSize)
+		}
+		spoolID := string(header[len(spoolFileMagic):])
+		parsed, err := uuid.Parse(spoolID)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid spool identity %q: %w", spoolID, err)
+		}
+		return parsed.String(), int64(headerSize), nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", 0, fmt.Errorf("inspect spool identity header: %w", err)
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, fmt.Errorf("seek legacy spool file: %w", err)
+	}
+	hash := sha256.New()
+	if _, err := io.WriteString(hash, filepath.Base(path)); err != nil {
+		return "", 0, fmt.Errorf("hash legacy spool filename: %w", err)
+	}
+	if _, err := hash.Write([]byte{0}); err != nil {
+		return "", 0, fmt.Errorf("hash legacy spool separator: %w", err)
+	}
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", 0, fmt.Errorf("hash legacy spool payload: %w", err)
+	}
+	return "legacy:" + hex.EncodeToString(hash.Sum(nil)), 0, nil
 }
 
 // Append appends a raw telemetry frame payload to the log and returns its ID.
@@ -776,56 +841,82 @@ func (w *WAL) Append(ctx context.Context, tFrame *agentv1.TelemetryFrame) (int64
 
 // AppendBatch writes multiple frames in a single transaction.
 func (w *WAL) AppendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame) (int64, error) {
+	lastID, _, err := w.appendBatch(ctx, frames, "")
+	return lastID, err
+}
+
+func (w *WAL) appendSpoolBatch(ctx context.Context, spoolID string, frames []*agentv1.TelemetryFrame) (bool, error) {
+	if spoolID == "" {
+		return false, errors.New("spool identity is required")
+	}
+	_, imported, err := w.appendBatch(ctx, frames, spoolID)
+	return imported, err
+}
+
+func (w *WAL) appendBatch(ctx context.Context, frames []*agentv1.TelemetryFrame, spoolID string) (int64, bool, error) {
 	if len(frames) == 0 {
-		return 0, nil
+		return 0, false, nil
 	}
 
-	// start the transaction
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		return 0, false, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if spoolID != "" {
+		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO spool_imports(spool_id, imported_at) VALUES(?, ?)`, spoolID, time.Now().UnixNano())
+		if err != nil {
+			return 0, false, fmt.Errorf("record spool import %q: %w", spoolID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, false, fmt.Errorf("inspect spool import %q: %w", spoolID, err)
+		}
+		if rows == 0 {
+			return 0, false, nil
+		}
 	}
 
-	// defer rollback. If Commit() is called then RollBack is a no-op
-	defer tx.Rollback()
-
-	// prepare the statement
 	query := `INSERT INTO telemetry_frames (created_at, payload, delivery_status) VALUES (?, ?, ?)`
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("failed to prepare statement: %w", err)
+		return 0, false, fmt.Errorf("failed to prepare statement: %w", err)
 	}
-
-	defer stmt.Close()
+	defer func() {
+		_ = stmt.Close()
+	}()
 
 	var lastID int64
 	now := time.Now().UnixNano()
 
-	// loop and insert
 	for _, frame := range frames {
 		w.stampGeneration(frame)
 		encoded, err := proto.Marshal(frame)
 		if err != nil {
-			// Skip malformed frames instead of failing the whole batch
-			slog.Warn("failed to marshal frame, skipping", "error", err)
-			continue
+			return 0, false, fmt.Errorf("failed to marshal frame: %w", err)
 		}
 
-		// Execute against the *statement* (which is bound to the transaction)
 		res, err := stmt.ExecContext(ctx, now, encoded, DeliveryStatusWritten)
 		if err != nil {
-			return 0, fmt.Errorf("failed to insert frames: %w", err)
+			return 0, false, fmt.Errorf("failed to insert frames: %w", err)
 		}
-
-		lastID, _ = res.LastInsertId()
+		lastID, err = res.LastInsertId()
+		if err != nil {
+			return 0, false, fmt.Errorf("failed to inspect inserted frame: %w", err)
+		}
 	}
 
-	// commit
+	if err := stmt.Close(); err != nil {
+		return 0, false, fmt.Errorf("failed to close frame insert statement: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+		return 0, false, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return lastID, nil
+	return lastID, true, nil
 }
 
 func (w *WAL) stampGeneration(frame *agentv1.TelemetryFrame) {

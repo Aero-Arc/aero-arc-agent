@@ -1,11 +1,15 @@
 package wal
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -656,6 +660,204 @@ func TestWALSpoolUsesGenerationThatAssignsSequence(t *testing.T) {
 	}
 }
 
+func TestWALSpoolImportIsIdempotentAfterCleanupFailureAndRestart(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "spool-retry.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	firstGeneration := w.GenerationID()
+	spoolPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{
+		{RawMavlink: []byte("one")},
+		{RawMavlink: []byte("two")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupErr := errors.New("simulated cleanup failure")
+	w.removeFile = func(path string) error {
+		if path == spoolPath {
+			return cleanupErr
+		}
+		return os.Remove(path)
+	}
+	if err := w.drainSpool(); !errors.Is(err, cleanupErr) {
+		t.Fatalf("first drain error = %v, want %v", err, cleanupErr)
+	}
+	before, err := w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 2 {
+		t.Fatalf("rows after committed import = %d, want 2", len(before))
+	}
+	var importCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if importCount != 1 {
+		t.Fatalf("spool import markers = %d, want 1", importCount)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if reopened.GenerationID() == firstGeneration {
+		t.Fatalf("reopened WAL reused generation ID %q", firstGeneration)
+	}
+	if err := reopened.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(spoolPath); !os.IsNotExist(err) {
+		t.Fatalf("spool file after cleanup retry: %v", err)
+	}
+	after, err := reopened.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("rows after restart retry = %d, want %d", len(after), len(before))
+	}
+	for i := range before {
+		if after[i].ID != before[i].ID || !bytes.Equal(after[i].Payload, before[i].Payload) {
+			t.Fatalf("cursor %d changed after spool retry", i)
+		}
+		var frame agentv1.TelemetryFrame
+		if err := proto.Unmarshal(after[i].Payload, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.GetWalId() != firstGeneration {
+			t.Fatalf("frame %d WAL ID = %q, want original import generation %q", after[i].ID, frame.GetWalId(), firstGeneration)
+		}
+	}
+}
+
+func TestWALSpoolImportMarkerRollsBackWithFailedFrameInsert(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "spool-atomicity.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	spoolPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("retry-me")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `CREATE TRIGGER fail_spool_insert
+		BEFORE INSERT ON telemetry_frames BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.drainSpool(); err == nil {
+		t.Fatal("drain with failing insert succeeded")
+	}
+	var frameCount, importCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 0 || importCount != 0 {
+		t.Fatalf("failed import persisted frames=%d markers=%d, want 0,0", frameCount, importCount)
+	}
+	if _, err := os.Stat(spoolPath); err != nil {
+		t.Fatalf("spool file lost after failed import: %v", err)
+	}
+	if _, err := w.db.ExecContext(ctx, `DROP TRIGGER fail_spool_insert`); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM spool_imports`).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 1 || importCount != 1 {
+		t.Fatalf("recovered import persisted frames=%d markers=%d, want 1,1", frameCount, importCount)
+	}
+}
+
+func TestWALDrainsLegacySpoolFilesIdempotently(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy-spool.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	spoolPath := filepath.Join(w.spoolDir, "00000000000000000001-000001.batch")
+	frames := []*agentv1.TelemetryFrame{{RawMavlink: []byte("legacy-spool")}}
+	writeLegacySpoolFile(t, spoolPath, frames)
+	if err := w.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	var spoolID string
+	if err := w.db.QueryRowContext(ctx, `SELECT spool_id FROM spool_imports`).Scan(&spoolID); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(spoolID, "legacy:") {
+		t.Fatalf("legacy spool identity = %q", spoolID)
+	}
+	writeLegacySpoolFile(t, spoolPath, frames)
+	if err := w.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	var frameCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 1 {
+		t.Fatalf("legacy spool retry rows = %d, want 1", frameCount)
+	}
+}
+
+func TestWALSpoolIdentityDoesNotReuseProcessSequence(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "spool-identities.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+	frame := []*agentv1.TelemetryFrame{{RawMavlink: []byte("same")}}
+	firstPath, err := w.spoolBatch(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.spoolSeq = 0
+	secondPath, err := w.spoolBatch(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, _, err := readSpoolFile(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, _, err := readSpoolFile(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID == secondID {
+		t.Fatalf("recreated spool sequence reused identity %q", firstID)
+	}
+	if _, err := uuid.Parse(firstID); err != nil {
+		t.Fatalf("first spool identity %q is not a UUID: %v", firstID, err)
+	}
+	if _, err := uuid.Parse(secondID); err != nil {
+		t.Fatalf("second spool identity %q is not a UUID: %v", secondID, err)
+	}
+}
+
 func TestWAL_MarkDelivered_Idempotency(t *testing.T) {
 	w := mustNewWAL(t)
 	defer w.Close()
@@ -839,4 +1041,75 @@ func mustNewWAL(t *testing.T) *WAL {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}
 	return w
+}
+
+func mustOpenWALWithoutWriter(t *testing.T, dbPath string) *WAL {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configureDB(db); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := initDB(db); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	generationID, err := startGenerationID(context.Background(), db)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	spoolDir := dbPath + ".spool"
+	if err := os.MkdirAll(spoolDir, 0o755); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	return &WAL{
+		db:           db,
+		generationID: generationID,
+		doneChan:     make(chan struct{}),
+		signalChan:   make(chan struct{}, 1),
+		spoolDir:     spoolDir,
+		removeFile:   os.Remove,
+	}
+}
+
+func writeLegacySpoolFile(t *testing.T, path string, frames []*agentv1.TelemetryFrame) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := bufio.NewWriter(file)
+	for _, frame := range frames {
+		payload, err := proto.Marshal(frame)
+		if err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		var length [4]byte
+		binary.LittleEndian.PutUint32(length[:], uint32(len(payload)))
+		if _, err := writer.Write(length[:]); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(payload); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
