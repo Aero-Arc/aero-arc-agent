@@ -30,6 +30,9 @@ const legacyFrameMigrationBatchSize = 128
 // Keep durable marker reclamation transactions bounded as well.
 const spoolImportCleanupBatchSize = 128
 
+// Keep explicit quarantine cleanup transactions bounded on constrained disks.
+const quarantineCleanupBatchSize = 128
+
 const (
 	spoolFileMagic = "AEROARC-SPOOL\x00\x01"
 	spoolIDLength  = 36
@@ -181,6 +184,13 @@ func initDB(db *sql.DB) error {
 		last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
 		completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0, 1))
 	);
+	CREATE TABLE IF NOT EXISTS telemetry_frame_quarantine (
+		seq INTEGER PRIMARY KEY,
+		quarantined_at INTEGER NOT NULL,
+		reason TEXT NOT NULL,
+		original_delivery_status INTEGER NOT NULL,
+		FOREIGN KEY(seq) REFERENCES telemetry_frames(seq) ON DELETE CASCADE
+	);
 	CREATE TABLE IF NOT EXISTS spool_imports (
 		spool_id TEXT PRIMARY KEY,
 		imported_at INTEGER NOT NULL,
@@ -195,6 +205,8 @@ func initDB(db *sql.DB) error {
 	indexQuery := `
 	CREATE INDEX IF NOT EXISTS idx_telemetry_undelivered
 	ON telemetry_frames (delivery_status, seq);
+	CREATE INDEX IF NOT EXISTS idx_telemetry_frame_quarantine_newest
+	ON telemetry_frame_quarantine (quarantined_at DESC, seq DESC);
 	`
 	_, err = db.Exec(indexQuery)
 	if err != nil {
@@ -316,7 +328,8 @@ func loadLegacyMigrationState(ctx context.Context, tx *sql.Tx) (legacyMigrationS
 }
 
 // migrateLegacyFrameBatch commits at most one bounded payload batch together
-// with its cursor, allowing a later startup to resume without repeating it.
+// with its cursor. Valid frames are stamped, while malformed frames and their
+// diagnostic reason are atomically quarantined so later startups can resume.
 func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID string) (legacyMigrationState, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -341,11 +354,13 @@ func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID strin
 	}
 
 	type update struct {
-		seq     int64
-		payload []byte
+		seq                    int64
+		payload                []byte
+		quarantineReason       string
+		originalDeliveryStatus int
 	}
 
-	rows, err := tx.QueryContext(ctx, `SELECT seq, payload
+	rows, err := tx.QueryContext(ctx, `SELECT seq, payload, delivery_status
 		FROM telemetry_frames
 		WHERE seq > ?
 		ORDER BY seq
@@ -359,7 +374,8 @@ func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID strin
 	for rows.Next() {
 		var seq int64
 		var payload []byte
-		if err := rows.Scan(&seq, &payload); err != nil {
+		var deliveryStatus int
+		if err := rows.Scan(&seq, &payload, &deliveryStatus); err != nil {
 			return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("scan legacy WAL frame: %w", err))
 		}
 		scanned++
@@ -367,7 +383,12 @@ func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID strin
 
 		var frame agentv1.TelemetryFrame
 		if err := proto.Unmarshal(payload, &frame); err != nil {
-			return legacyMigrationState{}, closeLegacyRows(rows, fmt.Errorf("unmarshal legacy WAL frame %d: %w", seq, err))
+			updates = append(updates, update{
+				seq:                    seq,
+				quarantineReason:       fmt.Sprintf("legacy WAL identity migration protobuf decode failed: %v", err),
+				originalDeliveryStatus: deliveryStatus,
+			})
+			continue
 		}
 		if frame.GetWalId() != "" {
 			continue
@@ -387,6 +408,19 @@ func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID strin
 	}
 
 	for _, item := range updates {
+		if item.quarantineReason != "" {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO telemetry_frame_quarantine(
+				seq, quarantined_at, reason, original_delivery_status) VALUES(?, ?, ?, ?)
+				ON CONFLICT(seq) DO NOTHING`,
+				item.seq, time.Now().UnixNano(), item.quarantineReason, item.originalDeliveryStatus); err != nil {
+				return legacyMigrationState{}, fmt.Errorf("quarantine malformed legacy WAL frame %d: %w", item.seq, err)
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ?`,
+				DeliveryStatusQuarantined, item.seq); err != nil {
+				return legacyMigrationState{}, fmt.Errorf("mark malformed legacy WAL frame %d quarantined: %w", item.seq, err)
+			}
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, item.payload, item.seq); err != nil {
 			return legacyMigrationState{}, fmt.Errorf("stamp legacy WAL frame %d: %w", item.seq, err)
 		}
@@ -1042,7 +1076,17 @@ func (w *WAL) stampGeneration(frame *agentv1.TelemetryFrame) {
 	}
 }
 
-// ReadUndelivered reads up to limit undelivered entries from the log.
+// ReadUndelivered reads up to the requested number of written entries in
+// sequence order. Malformed legacy frames recorded in the durable quarantine
+// are excluded from delivery without deleting their original payloads.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the query.
+//   - limit: bounds returned entries and must be greater than zero.
+//
+// Returns:
+//   - entries: contains deliverable WAL records in ascending sequence order.
+//   - error: reports an invalid limit, SQLite failure, or context cancellation.
 func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("limit must be > 0")
@@ -1052,6 +1096,10 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	SELECT seq, created_at, payload
 	FROM telemetry_frames
 	WHERE delivery_status = ?
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
 	ORDER BY seq ASC
 	LIMIT ?
 	`
@@ -1077,12 +1125,17 @@ func (w *WAL) ReadUndelivered(ctx context.Context, limit int) ([]Entry, error) {
 	return entries, nil
 }
 
-// CountUndelivered returns the total number of undelivered entries.
+// CountUndelivered returns the number of written entries eligible for
+// delivery, excluding durable quarantine records.
 func (w *WAL) CountUndelivered(ctx context.Context) (int64, error) {
 	query := `
 	SELECT COUNT(1)
 	FROM telemetry_frames
 	WHERE delivery_status = ?
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
 	`
 	var count int64
 	if err := w.db.QueryRowContext(ctx, query, DeliveryStatusWritten).Scan(&count); err != nil {
@@ -1259,9 +1312,17 @@ func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 	query := `
 	DELETE FROM telemetry_frames 
 	WHERE delivery_status = ? 
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
 	AND seq NOT IN (
 		SELECT seq FROM telemetry_frames 
-		WHERE delivery_status = ? 
+		WHERE delivery_status = ?
+		AND NOT EXISTS (
+			SELECT 1 FROM telemetry_frame_quarantine
+			WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+		)
 		ORDER BY seq DESC 
 		LIMIT ?
 	)`
@@ -1274,6 +1335,98 @@ func (w *WAL) CleanupDelivered(ctx context.Context, retentionCount int) error {
 		return fmt.Errorf("cleanup spool imports: %w", err)
 	}
 	return nil
+}
+
+// CleanupQuarantined explicitly deletes older malformed legacy frames while
+// retaining the requested number of newest quarantine records. Quarantined
+// payloads are otherwise preserved indefinitely and CleanupDelivered never
+// removes them.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for each bounded transaction.
+//   - retentionCount: keeps this many newest quarantined rows; negative values
+//     are treated as zero.
+//
+// Returns:
+//   - rowsDeleted: is the number of quarantined telemetry payloads removed,
+//     including committed batches if a later batch fails.
+//   - error: reports bounded-batch transaction, SQLite, or context failures.
+func (w *WAL) CleanupQuarantined(ctx context.Context, retentionCount int) (int64, error) {
+	if retentionCount < 0 {
+		retentionCount = 0
+	}
+
+	var totalDeleted int64
+	for {
+		selected, deleted, err := w.cleanupQuarantinedBatch(ctx, retentionCount)
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += deleted
+		if selected < quarantineCleanupBatchSize {
+			return totalDeleted, nil
+		}
+	}
+}
+
+func (w *WAL) cleanupQuarantinedBatch(ctx context.Context, retentionCount int) (int64, int64, error) {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin quarantined frame cleanup: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	rows, err := tx.QueryContext(ctx, `SELECT telemetry_frame_quarantine.seq
+		FROM telemetry_frame_quarantine
+		JOIN telemetry_frames USING(seq)
+		ORDER BY quarantined_at DESC, telemetry_frame_quarantine.seq DESC
+		LIMIT ? OFFSET ?`, quarantineCleanupBatchSize, retentionCount)
+	if err != nil {
+		return 0, 0, fmt.Errorf("select quarantined telemetry cleanup batch: %w", err)
+	}
+	seqs := make([]int64, 0, quarantineCleanupBatchSize)
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			return 0, 0, closeQuarantineRows(rows, fmt.Errorf("scan quarantined telemetry cleanup batch: %w", err))
+		}
+		seqs = append(seqs, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, closeQuarantineRows(rows, fmt.Errorf("iterate quarantined telemetry cleanup batch: %w", err))
+	}
+	if err := closeQuarantineRows(rows, nil); err != nil {
+		return 0, 0, err
+	}
+
+	var rowsDeleted int64
+	for _, seq := range seqs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM telemetry_frame_quarantine WHERE seq = ?`, seq); err != nil {
+			return 0, 0, fmt.Errorf("delete quarantined frame %d diagnostics: %w", seq, err)
+		}
+		result, err := tx.ExecContext(ctx, `DELETE FROM telemetry_frames WHERE seq = ?`, seq)
+		if err != nil {
+			return 0, 0, fmt.Errorf("delete quarantined telemetry frame %d: %w", seq, err)
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil {
+			return 0, 0, fmt.Errorf("inspect quarantined telemetry frame %d cleanup: %w", seq, err)
+		}
+		rowsDeleted += deleted
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit quarantined frame cleanup: %w", err)
+	}
+	return int64(len(seqs)), rowsDeleted, nil
+}
+
+func closeQuarantineRows(rows *sql.Rows, cause error) error {
+	if err := rows.Close(); err != nil {
+		return errors.Join(cause, fmt.Errorf("close quarantined telemetry cleanup rows: %w", err))
+	}
+	return cause
 }
 
 // Close durably spools any in-memory asynchronous batch, stops and waits for

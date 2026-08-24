@@ -253,7 +253,7 @@ func TestWALGenerationRotationStampsLegacyFramesBeforeChangingGeneration(t *test
 	}
 }
 
-func TestWALGenerationMigrationCommitsBatchesAndResumesAfterFailure(t *testing.T) {
+func TestWALGenerationMigrationQuarantinesBeyondBatchBoundaryAndResumes(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "legacy-backlog.db")
 	w, err := New(ctx, dbPath, 0, 0)
@@ -284,20 +284,33 @@ func TestWALGenerationMigrationCommitsBatchesAndResumesAfterFailure(t *testing.T
 		t.Fatal(err)
 	}
 
-	if _, err := New(ctx, dbPath, 0, 0); err == nil {
-		t.Fatal("migration with corrupt frame succeeded, want error")
-	}
-
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var generationAfterFailure string
-	if err := db.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&generationAfterFailure); err != nil {
+	if err := configureDB(db); err != nil {
 		t.Fatal(err)
 	}
-	if generationAfterFailure != previousGeneration {
-		t.Fatalf("generation after rollback = %q, want %q", generationAfterFailure, previousGeneration)
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadOrCreateLegacyMigration(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = migrateLegacyFrameBatch(ctx, db, state.generationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.lastSeq != legacyFrameMigrationBatchSize || state.completed {
+		t.Fatalf("first migration batch state = (%d, %v), want (%d, false)", state.lastSeq, state.completed, legacyFrameMigrationBatchSize)
+	}
+	var generationDuringMigration string
+	if err := db.QueryRowContext(ctx, `SELECT generation_id FROM wal_metadata WHERE id = 1`).Scan(&generationDuringMigration); err != nil {
+		t.Fatal(err)
+	}
+	if generationDuringMigration != previousGeneration {
+		t.Fatalf("generation during migration = %q, want %q", generationDuringMigration, previousGeneration)
 	}
 	var migrationGeneration string
 	var lastSeq, completed int64
@@ -320,19 +333,23 @@ func TestWALGenerationMigrationCommitsBatchesAndResumesAfterFailure(t *testing.T
 	if firstFrame.GetWalId() != previousGeneration {
 		t.Fatalf("committed first-batch WAL ID = %q, want %q", firstFrame.GetWalId(), previousGeneration)
 	}
-	var rolledBackPayload []byte
-	if err := db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = ?`, legacyFrameMigrationBatchSize+1).Scan(&rolledBackPayload); err != nil {
+	var notYetMigratedPayload []byte
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = ?`, legacyFrameMigrationBatchSize+1).Scan(&notYetMigratedPayload); err != nil {
 		t.Fatal(err)
 	}
-	var rolledBackFrame agentv1.TelemetryFrame
-	if err := proto.Unmarshal(rolledBackPayload, &rolledBackFrame); err != nil {
+	var notYetMigratedFrame agentv1.TelemetryFrame
+	if err := proto.Unmarshal(notYetMigratedPayload, &notYetMigratedFrame); err != nil {
 		t.Fatal(err)
 	}
-	if rolledBackFrame.GetWalId() != "" {
-		t.Fatalf("failed second batch retained WAL ID %q, want rollback", rolledBackFrame.GetWalId())
+	if notYetMigratedFrame.GetWalId() != "" {
+		t.Fatalf("uncommitted next-batch frame retained WAL ID %q", notYetMigratedFrame.GetWalId())
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = ?`, legacyPayload, frameCount); err != nil {
+	var corruptPayload []byte
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = ?`, frameCount).Scan(&corruptPayload); err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Equal(corruptPayload, []byte{0xff}) {
+		t.Fatalf("corrupt payload changed before resume: %x", corruptPayload)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -351,8 +368,8 @@ func TestWALGenerationMigrationCommitsBatchesAndResumesAfterFailure(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != frameCount {
-		t.Fatalf("migrated entries = %d, want %d", len(entries), frameCount)
+	if len(entries) != frameCount-1 {
+		t.Fatalf("migrated entries = %d, want %d valid rows", len(entries), frameCount-1)
 	}
 	if err := migrated.db.QueryRowContext(ctx, `SELECT legacy_generation_id, last_seq, completed
 		FROM wal_identity_migration WHERE id = 1`).Scan(&migrationGeneration, &lastSeq, &completed); err != nil {
@@ -370,6 +387,295 @@ func TestWALGenerationMigrationCommitsBatchesAndResumesAfterFailure(t *testing.T
 		if frame.GetWalId() != previousGeneration {
 			t.Fatalf("frame %d WAL ID = %q, want %q", entry.ID, frame.GetWalId(), previousGeneration)
 		}
+	}
+	var quarantinedPayload []byte
+	var quarantineReason string
+	var originalStatus, currentStatus int
+	if err := migrated.db.QueryRowContext(ctx, `SELECT telemetry_frames.payload,
+		telemetry_frame_quarantine.reason, telemetry_frame_quarantine.original_delivery_status,
+		telemetry_frames.delivery_status
+		FROM telemetry_frame_quarantine
+		JOIN telemetry_frames USING(seq)
+		WHERE seq = ?`, legacyFrameMigrationBatchSize+2).Scan(&quarantinedPayload, &quarantineReason, &originalStatus, &currentStatus); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(quarantinedPayload, []byte{0xff}) {
+		t.Fatalf("quarantined payload = %x, want ff", quarantinedPayload)
+	}
+	if !strings.Contains(quarantineReason, "protobuf decode failed") || originalStatus != int(DeliveryStatusWritten) || currentStatus != int(DeliveryStatusQuarantined) {
+		t.Fatalf("quarantine diagnostic = (%q, original=%d, current=%d)", quarantineReason, originalStatus, currentStatus)
+	}
+}
+
+func TestWALGenerationMigrationQuarantinesMalformedRowsAcrossBatch(t *testing.T) {
+	tests := []struct {
+		name           string
+		corruptSeq     int
+		originalStatus DeliveryStatus
+	}{
+		{name: "before boundary", corruptSeq: 1, originalStatus: DeliveryStatusWritten},
+		{name: "within batch", corruptSeq: legacyFrameMigrationBatchSize / 2, originalStatus: DeliveryStatusDelivered},
+		{name: "at boundary", corruptSeq: legacyFrameMigrationBatchSize, originalStatus: DeliveryStatusWritten},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "malformed-legacy.db")
+			w, err := New(ctx, dbPath, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacyGeneration := w.GenerationID()
+			for i := 0; i < legacyFrameMigrationBatchSize; i++ {
+				if _, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte{byte(i)}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			legacyPayload, err := proto.Marshal(&agentv1.TelemetryFrame{RawMavlink: []byte("legacy")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ?`, legacyPayload); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames
+				SET payload = ?, delivery_status = ? WHERE seq = ?`, []byte{0xff}, test.originalStatus, test.corruptSeq); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_identity_migration`); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			migrated, err := New(ctx, dbPath, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := migrated.Close(); err != nil {
+					t.Errorf("close migrated WAL: %v", err)
+				}
+			})
+			entries, err := migrated.ReadUndelivered(ctx, legacyFrameMigrationBatchSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != legacyFrameMigrationBatchSize-1 {
+				t.Fatalf("deliverable frames = %d, want %d", len(entries), legacyFrameMigrationBatchSize-1)
+			}
+			count, err := migrated.CountUndelivered(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != int64(len(entries)) {
+				t.Fatalf("undelivered count = %d, want %d", count, len(entries))
+			}
+			for _, entry := range entries {
+				var frame agentv1.TelemetryFrame
+				if err := proto.Unmarshal(entry.Payload, &frame); err != nil {
+					t.Fatal(err)
+				}
+				if frame.GetWalId() != legacyGeneration {
+					t.Fatalf("valid frame %d WAL ID = %q, want %q", entry.ID, frame.GetWalId(), legacyGeneration)
+				}
+				if _, err := migrated.MarkDelivered(ctx, uint64(entry.ID)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var payload []byte
+			var reason string
+			var originalStatus, currentStatus int
+			if err := migrated.db.QueryRowContext(ctx, `SELECT telemetry_frames.payload,
+				telemetry_frame_quarantine.reason, telemetry_frame_quarantine.original_delivery_status,
+				telemetry_frames.delivery_status
+				FROM telemetry_frame_quarantine JOIN telemetry_frames USING(seq)
+				WHERE seq = ?`, test.corruptSeq).Scan(&payload, &reason, &originalStatus, &currentStatus); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(payload, []byte{0xff}) {
+				t.Fatalf("quarantined payload = %x, want ff", payload)
+			}
+			if !strings.Contains(reason, "protobuf decode failed") || originalStatus != int(test.originalStatus) || currentStatus != int(DeliveryStatusQuarantined) {
+				t.Fatalf("quarantine diagnostic = (%q, original=%d, current=%d), want original %d and quarantine status", reason, originalStatus, currentStatus, test.originalStatus)
+			}
+			var lastSeq, completed int64
+			if err := migrated.db.QueryRowContext(ctx, `SELECT last_seq, completed
+				FROM wal_identity_migration WHERE id = 1`).Scan(&lastSeq, &completed); err != nil {
+				t.Fatal(err)
+			}
+			if lastSeq != legacyFrameMigrationBatchSize || completed != 1 {
+				t.Fatalf("migration completion = (%d, %d), want (%d, 1)", lastSeq, completed, legacyFrameMigrationBatchSize)
+			}
+
+			if err := migrated.CleanupDelivered(ctx, 0); err != nil {
+				t.Fatal(err)
+			}
+			var remaining int
+			if err := migrated.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&remaining); err != nil {
+				t.Fatal(err)
+			}
+			if remaining != 1 {
+				t.Fatalf("rows after delivered cleanup = %d, want only quarantined row", remaining)
+			}
+			deleted, err := migrated.CleanupQuarantined(ctx, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if deleted != 1 {
+				t.Fatalf("explicit quarantine cleanup deleted %d rows, want 1", deleted)
+			}
+		})
+	}
+}
+
+func TestWALGenerationMigrationQuarantineAndProgressRollbackTogether(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "quarantine-rollback.db")
+	w, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyGeneration := w.GenerationID()
+	legacyPayload, err := proto.Marshal(&agentv1.TelemetryFrame{RawMavlink: []byte("valid")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(ctx, &agentv1.TelemetryFrame{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(ctx, &agentv1.TelemetryFrame{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ?`, legacyPayload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET payload = ? WHERE seq = 2`, []byte{0xff}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_identity_migration`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.db.ExecContext(ctx, `CREATE TRIGGER fail_quarantine
+		BEFORE INSERT ON telemetry_frame_quarantine BEGIN SELECT RAISE(ABORT, 'forced quarantine failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := New(ctx, dbPath, 0, 0); err == nil || !strings.Contains(err.Error(), "forced quarantine failure") {
+		t.Fatalf("migration error = %v, want forced quarantine failure", err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configureDB(db); err != nil {
+		t.Fatal(err)
+	}
+	var lastSeq, completed, quarantineCount int
+	if err := db.QueryRowContext(ctx, `SELECT last_seq, completed FROM wal_identity_migration WHERE id = 1`).Scan(&lastSeq, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if lastSeq != 0 || completed != 0 {
+		t.Fatalf("rolled-back migration state = (%d, %d), want (0, 0)", lastSeq, completed)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frame_quarantine`).Scan(&quarantineCount); err != nil {
+		t.Fatal(err)
+	}
+	if quarantineCount != 0 {
+		t.Fatalf("rolled-back quarantine count = %d, want 0", quarantineCount)
+	}
+	var validPayload []byte
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM telemetry_frames WHERE seq = 1`).Scan(&validPayload); err != nil {
+		t.Fatal(err)
+	}
+	var validFrame agentv1.TelemetryFrame
+	if err := proto.Unmarshal(validPayload, &validFrame); err != nil {
+		t.Fatal(err)
+	}
+	if validFrame.GetWalId() != "" {
+		t.Fatalf("rolled-back valid frame WAL ID = %q, want empty", validFrame.GetWalId())
+	}
+	if _, err := db.ExecContext(ctx, `DROP TRIGGER fail_quarantine`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := New(ctx, dbPath, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Close(); err != nil {
+			t.Errorf("close recovered WAL: %v", err)
+		}
+	})
+	entries, err := recovered.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("recovered deliverable frames = %d, want 1", len(entries))
+	}
+	if err := proto.Unmarshal(entries[0].Payload, &validFrame); err != nil {
+		t.Fatal(err)
+	}
+	if validFrame.GetWalId() != legacyGeneration {
+		t.Fatalf("recovered valid frame WAL ID = %q, want %q", validFrame.GetWalId(), legacyGeneration)
+	}
+}
+
+func TestWALCleanupQuarantinedRetainsNewestAcrossBoundedBatches(t *testing.T) {
+	ctx := context.Background()
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "quarantine-cleanup.db"))
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+
+	frameCount := quarantineCleanupBatchSize*2 + 1
+	for i := 1; i <= frameCount; i++ {
+		result, err := w.db.ExecContext(ctx, `INSERT INTO telemetry_frames(
+			created_at, payload, delivery_status) VALUES(?, ?, ?)`, i, []byte{0xff}, DeliveryStatusQuarantined)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.db.ExecContext(ctx, `INSERT INTO telemetry_frame_quarantine(
+			seq, quarantined_at, reason, original_delivery_status) VALUES(?, ?, ?, ?)`,
+			seq, i, "test corruption", DeliveryStatusWritten); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deleted, err := w.CleanupQuarantined(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != int64(frameCount-1) {
+		t.Fatalf("deleted quarantined frames = %d, want %d", deleted, frameCount-1)
+	}
+	var frameRows, diagnosticRows int
+	var retainedSeq int64
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*), MAX(seq) FROM telemetry_frames`).Scan(&frameRows, &retainedSeq); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frame_quarantine`).Scan(&diagnosticRows); err != nil {
+		t.Fatal(err)
+	}
+	if frameRows != 1 || diagnosticRows != 1 || retainedSeq != int64(frameCount) {
+		t.Fatalf("retained frames=%d diagnostics=%d seq=%d, want 1,1,%d", frameRows, diagnosticRows, retainedSeq, frameCount)
 	}
 }
 
