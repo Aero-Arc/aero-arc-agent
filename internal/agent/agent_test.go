@@ -409,14 +409,25 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The same durable command is acknowledged without replacing its original value.
-	set.Context.FlightId = "incorrect-retry-value"
-	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
+	// Reusing a durable command ID with a different payload is rejected and
+	// cannot replace the original context.
+	conflict := proto.Clone(set).(*agentv1.SetOperationContextCommand)
+	conflict.Context.FlightId = "incorrect-retry-value"
+	if err := a.handleSetOperationContext(ctx, stream, conflict); err != nil {
 		t.Fatal(err)
 	}
 	ack := sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("conflicting ack = %+v", ack)
+	}
+
+	// An exact retry remains a successful no-op.
+	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
 	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED || ack.GetActiveContext().GetFlightId() != "flight-1" {
-		t.Fatalf("duplicate ack = %+v", ack)
+		t.Fatalf("idempotent ack = %+v", ack)
 	}
 
 	// A malformed clear is rejected, correlated to its command, and leaves the active context intact.

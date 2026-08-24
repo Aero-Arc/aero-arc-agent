@@ -146,6 +146,37 @@ func TestInitDBAddsSpoolImportCleanupTokenToExistingSchema(t *testing.T) {
 	}
 }
 
+func TestInitDBAddsOperationCommandFingerprintsToExistingSchema(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "schema.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close schema database: %v", err)
+		}
+	})
+	if _, err := db.Exec(`CREATE TABLE operation_context_commands (
+		command_id TEXT PRIMARY KEY,
+		processed_at INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO operation_context_commands(command_id, processed_at) VALUES('legacy', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	var kind, fingerprint string
+	if err := db.QueryRow(`SELECT command_kind, payload_fingerprint FROM operation_context_commands WHERE command_id = 'legacy'`).Scan(&kind, &fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "" || fingerprint != "" {
+		t.Fatalf("legacy fingerprint = (%q, %q), want empty", kind, fingerprint)
+	}
+}
+
 func TestWALGenerationRotationPreventsRestoredSequenceReuse(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -1989,8 +2020,12 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 		t.Fatalf("SetOperationContext() = %v, %v", applied, err)
 	}
 	applied, err = w.SetOperationContext(ctx, "set-1", OperationContext{FlightID: "wrong"})
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("conflicting SetOperationContext() = %v, %v", applied, err)
+	}
+	applied, err = w.SetOperationContext(ctx, "set-1", want)
 	if err != nil || applied {
-		t.Fatalf("duplicate SetOperationContext() = %v, %v", applied, err)
+		t.Fatalf("idempotent SetOperationContext() = %v, %v", applied, err)
 	}
 	got, ok, err := w.LoadOperationContext(ctx)
 	if err != nil || !ok || got != want {
@@ -2009,6 +2044,14 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 	if err != nil || !ok || got != want {
 		t.Fatalf("context after reopen = %#v, %v, %v; want %#v", got, ok, err, want)
 	}
+	applied, err = w.SetOperationContext(ctx, "set-1", want)
+	if err != nil || applied {
+		t.Fatalf("durable idempotent set after reopen = %v, %v", applied, err)
+	}
+	applied, err = w.ClearOperationContext(ctx, "set-1", want.FlightID)
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("cross-kind command ID reuse = %v, %v", applied, err)
+	}
 
 	applied, err = w.ClearOperationContext(ctx, "clear-empty", "")
 	if err == nil || applied {
@@ -2021,6 +2064,10 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 	applied, err = w.ClearOperationContext(ctx, "clear-old", "another-flight")
 	if err != nil || !applied {
 		t.Fatalf("conditional clear = %v, %v", applied, err)
+	}
+	applied, err = w.ClearOperationContext(ctx, "clear-old", want.FlightID)
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("conflicting conditional clear = %v, %v", applied, err)
 	}
 	if got, ok, err = w.LoadOperationContext(ctx); err != nil || !ok || got != want {
 		t.Fatalf("context after mismatched clear = %#v, %v, %v", got, ok, err)

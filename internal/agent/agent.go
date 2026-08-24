@@ -569,6 +569,9 @@ func (a *Agent) handleSetOperationContext(ctx context.Context, stream grpc.BidiS
 	value := wal.OperationContext{FlightID: command.Context.FlightId, IntentID: command.Context.IntentId, IntentVersion: command.Context.IntentVersion}
 	applied, err := a.wal.SetOperationContext(ctx, command.CommandId, value)
 	if err != nil {
+		if errors.Is(err, wal.ErrOperationCommandConflict) {
+			return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_REJECTED, err.Error())
+		}
 		return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_TEMPORARY_ERROR, err.Error())
 	}
 	status := agentv1.OperationContextCommandAck_STATUS_APPLIED
@@ -602,6 +605,9 @@ func (a *Agent) handleClearOperationContext(ctx context.Context, stream grpc.Bid
 	}
 	applied, err := a.wal.ClearOperationContext(ctx, command.CommandId, command.FlightId)
 	if err != nil {
+		if errors.Is(err, wal.ErrOperationCommandConflict) {
+			return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_REJECTED, err.Error())
+		}
 		return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_TEMPORARY_ERROR, err.Error())
 	}
 	active, ok, err := a.wal.LoadOperationContext(ctx)

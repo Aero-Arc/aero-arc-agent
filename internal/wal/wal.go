@@ -35,6 +35,10 @@ const quarantineCleanupBatchSize = 128
 
 const lifecycleShutdownGrace = 5 * time.Second
 
+// ErrOperationCommandConflict reports reuse of a durable operation command ID
+// with a different command kind or payload.
+var ErrOperationCommandConflict = errors.New("operation command ID reused with a different payload")
+
 const (
 	spoolFileMagic           = "AEROARC-SPOOL\x00\x01"
 	spoolIDLength            = 36
@@ -197,7 +201,9 @@ func initDB(db *sql.DB) error {
 	);
 	CREATE TABLE IF NOT EXISTS operation_context_commands (
 		command_id TEXT PRIMARY KEY,
-		processed_at INTEGER NOT NULL
+		processed_at INTEGER NOT NULL,
+		command_kind TEXT NOT NULL,
+		payload_fingerprint TEXT NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS wal_metadata (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -240,7 +246,27 @@ func initDB(db *sql.DB) error {
 	if err := ensureSpoolImportSeenToken(db); err != nil {
 		return err
 	}
+	if err := ensureOperationCommandFingerprint(db); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func ensureOperationCommandFingerprint(db *sql.DB) error {
+	columns := []string{"command_kind", "payload_fingerprint"}
+	for _, column := range columns {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('operation_context_commands') WHERE name = ?`, column).Scan(&count); err != nil {
+			return fmt.Errorf("inspect operation command schema: %w", err)
+		}
+		if count != 0 {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE operation_context_commands ADD COLUMN ` + column + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add operation command %s: %w", column, err)
+		}
+	}
 	return nil
 }
 
@@ -568,10 +594,12 @@ func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool,
 	return value, true, nil
 }
 
-// SetOperationContext atomically applies a command once. Repeated command IDs
-// are successful no-ops so command acknowledgements can safely be retried.
+// SetOperationContext atomically applies a command once. Repeating the same ID
+// and payload is a successful no-op; reusing an ID with a different command or
+// payload returns ErrOperationCommandConflict.
 func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value OperationContext) (bool, error) {
-	return w.applyOperationCommand(ctx, commandID, func(tx *sql.Tx) error {
+	fingerprint := operationCommandFingerprint("set", value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
+	return w.applyOperationCommand(ctx, commandID, "set", fingerprint, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at)
 			VALUES(1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET flight_id=excluded.flight_id,
 			intent_id=excluded.intent_id, intent_version=excluded.intent_version, updated_at=excluded.updated_at`,
@@ -580,7 +608,9 @@ func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value O
 	})
 }
 
-// ClearOperationContext atomically clears the active context once.
+// ClearOperationContext atomically clears the active context once. Exact
+// retries are successful no-ops, while conflicting ID reuse returns
+// ErrOperationCommandConflict.
 func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID string) (bool, error) {
 	if commandID == "" {
 		return false, errors.New("operation command ID is required")
@@ -589,13 +619,14 @@ func (w *WAL) ClearOperationContext(ctx context.Context, commandID, flightID str
 		return false, errors.New("flight ID is required")
 	}
 
-	return w.applyOperationCommand(ctx, commandID, func(tx *sql.Tx) error {
+	fingerprint := operationCommandFingerprint("clear", flightID)
+	return w.applyOperationCommand(ctx, commandID, "clear", fingerprint, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `DELETE FROM operation_context WHERE id = 1 AND flight_id = ?`, flightID)
 		return err
 	})
 }
 
-func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply func(*sql.Tx) error) (bool, error) {
+func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, fingerprint string, apply func(*sql.Tx) error) (bool, error) {
 	if commandID == "" {
 		return false, errors.New("operation command ID is required")
 	}
@@ -605,7 +636,7 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO operation_context_commands(command_id, processed_at) VALUES(?, ?)`, commandID, time.Now().UnixNano())
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO operation_context_commands(command_id, processed_at, command_kind, payload_fingerprint) VALUES(?, ?, ?, ?)`, commandID, time.Now().UnixNano(), kind, fingerprint)
 	if err != nil {
 		return false, fmt.Errorf("record operation command: %w", err)
 	}
@@ -614,6 +645,13 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply
 		return false, fmt.Errorf("inspect operation command: %w", err)
 	}
 	if rows == 0 {
+		var storedKind, storedFingerprint string
+		if err := tx.QueryRowContext(ctx, `SELECT command_kind, payload_fingerprint FROM operation_context_commands WHERE command_id = ?`, commandID).Scan(&storedKind, &storedFingerprint); err != nil {
+			return false, fmt.Errorf("load existing operation command: %w", err)
+		}
+		if storedKind != kind || storedFingerprint != fingerprint {
+			return false, ErrOperationCommandConflict
+		}
 		return false, nil
 	}
 	if err := apply(tx); err != nil {
@@ -623,6 +661,17 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID string, apply
 		return false, fmt.Errorf("commit operation command: %w", err)
 	}
 	return true, nil
+}
+
+func operationCommandFingerprint(parts ...string) string {
+	hash := sha256.New()
+	var size [8]byte
+	for _, part := range parts {
+		binary.BigEndian.PutUint64(size[:], uint64(len(part)))
+		_, _ = hash.Write(size[:])
+		_, _ = hash.Write([]byte(part))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 // AppendAsync validates and queues a private copy of a frame for durable
