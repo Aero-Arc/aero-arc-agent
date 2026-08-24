@@ -67,9 +67,11 @@ type Agent struct {
 	aircraftCommandMu         sync.Mutex
 	aircraftCommandActive     bool
 	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
+	appendTelemetryFrame      func(context.Context, *agentv1.TelemetryFrame) error
 
-	ingestCount atomic.Uint64
-	sendCount   atomic.Uint64
+	ingestCount        atomic.Uint64
+	sendCount          atomic.Uint64
+	telemetryDropCount atomic.Uint64
 }
 
 // NewAgent constructs an Agent and its MAVLink endpoint from runtime options.
@@ -305,7 +307,30 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	}
 
 	slog.LogAttrs(ctx, slog.LevelInfo, "mavlink_node_initialized")
-	events := a.node.Events()
+	return a.runMAVLinkEvents(ctx, a.node.Events())
+}
+
+// runMAVLinkEvents keeps command evidence on the event-reader path while a
+// separate worker handles potentially blocking telemetry persistence. The
+// queue is deliberately bounded: under sustained disk overload, newly
+// observed telemetry is counted and dropped rather than allowing an unbounded
+// heap or preventing COMMAND_ACK and heartbeat state from being observed.
+func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Event) error {
+	queueSize := 1000
+	if a.options != nil && a.options.EventQueueSize > 0 {
+		queueSize = a.options.EventQueueSize
+	}
+	telemetryQueue := make(chan *agentv1.TelemetryFrame, queueSize)
+	persistCtx, cancelPersist := context.WithCancel(ctx)
+	persistDone := make(chan struct{})
+	go func() {
+		defer close(persistDone)
+		a.runTelemetryPersistence(persistCtx, telemetryQueue)
+	}()
+	defer func() {
+		cancelPersist()
+		<-persistDone
+	}()
 
 	for {
 		select {
@@ -318,6 +343,8 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 			}
 
 			if frameEvt, ok := evt.(*gomavlib.EventFrame); ok {
+				// Control evidence must be observed before any telemetry work. WAL
+				// backpressure must never make a valid aircraft ACK time out.
 				a.observeMAVLinkFrame(frameEvt)
 				slog.LogAttrs(
 					ctx, slog.LevelDebug,
@@ -325,14 +352,27 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 					slog.String("frame-message", fmt.Sprintf("%+v", frameEvt.Message())),
 				)
 
-				// Process frame asynchronously via WAL batcher
-				if err := a.processFrame(ctx, frameEvt); err != nil {
+				tFrame, err := a.buildTelemetryFrame(frameEvt)
+				if err != nil {
 					slog.LogAttrs(
 						ctx, slog.LevelError,
 						"failed_to_process_frame",
 						slog.String("error", err.Error()),
 					)
 					continue
+				}
+				select {
+				case telemetryQueue <- tFrame:
+				default:
+					dropped := a.telemetryDropCount.Add(1)
+					// Log the first drop and then exponentially to keep an
+					// overload from becoming a second source of backpressure.
+					if dropped == 1 || dropped&(dropped-1) == 0 {
+						slog.LogAttrs(ctx, slog.LevelError, "telemetry_persistence_queue_full",
+							slog.Uint64("dropped_total", dropped),
+							slog.Int("queue_capacity", queueSize),
+						)
+					}
 				}
 			}
 
@@ -360,12 +400,45 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	}
 }
 
-// processFrame marshals the MAVLink frame and queues it for WAL ingestion.
-func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) error {
+func (a *Agent) runTelemetryPersistence(ctx context.Context, frames <-chan *agentv1.TelemetryFrame) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame := <-frames:
+			if err := a.persistTelemetryFrame(ctx, frame); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				slog.LogAttrs(ctx, slog.LevelError, "failed_to_persist_frame", slog.String("error", err.Error()))
+			}
+		}
+	}
+}
+
+func (a *Agent) persistTelemetryFrame(ctx context.Context, frame *agentv1.TelemetryFrame) error {
+	var err error
+	if a.appendTelemetryFrame != nil {
+		err = a.appendTelemetryFrame(ctx, frame)
+	} else if a.wal == nil {
+		err = errors.New("WAL is unavailable")
+	} else {
+		err = a.wal.AppendAsync(ctx, frame)
+	}
+	if err != nil {
+		return fmt.Errorf("wal append async failed: %w", err)
+	}
+	a.ingestCount.Add(1)
+	return nil
+}
+
+// buildTelemetryFrame copies one MAVLink event into its durable wire model.
+// It intentionally performs no I/O so the event-reader cannot stall on disk.
+func (a *Agent) buildTelemetryFrame(frame *gomavlib.EventFrame) (*agentv1.TelemetryFrame, error) {
 	msg := frame.Message()
 	payload, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("failed to marshal frame message: %w", err)
+		return nil, fmt.Errorf("failed to marshal frame message: %w", err)
 	}
 
 	msgName := fmt.Sprintf("%T", msg)
@@ -382,14 +455,7 @@ func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) er
 		AgentId:      identity.Resolve().FinalID,
 	}
 	a.stampFrameContext(tFrame)
-
-	// Write to WAL asynchronously
-	if err := a.wal.AppendAsync(ctx, tFrame); err != nil {
-		return fmt.Errorf("wal append async failed: %w", err)
-	}
-	a.ingestCount.Add(1)
-
-	return nil
+	return tFrame, nil
 }
 
 func (a *Agent) stampFrameContext(frame *agentv1.TelemetryFrame) {
@@ -540,19 +606,31 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 // runStreamLoop handles the receive side of the telemetry stream. Outbound
 // sends will be wired in a later iteration once the queue is implemented.
 func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	commandCtx, cancelCommands := context.WithCancel(ctx)
+	var commandWG sync.WaitGroup
+	commandErrors := make(chan error, 1)
+	defer func() {
+		cancelCommands()
+		commandWG.Wait()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-commandErrors:
+			return err
 		default:
 			message, err := stream.Recv()
 			if err != nil {
 				return err
 			}
 
-			err = a.handleRelayMessage(ctx, stream, message)
+			if command := message.GetAircraftCommand(); command != nil {
+				err = a.dispatchAircraftCommand(commandCtx, stream, command, &commandWG, commandErrors)
+			} else {
+				err = a.handleRelayMessage(ctx, stream, message)
+			}
 			if err != nil {
-				// TODO: Handle error? Should we retry? Definitely shouldn't just exit.
 				return err
 			}
 		}

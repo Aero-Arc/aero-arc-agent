@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -44,6 +45,13 @@ type pendingMAVLinkCommand struct {
 	enqueueComplete    bool
 	acks               chan mavlinkCommandAck
 	armedStateChange   chan bool
+}
+
+type preparedAircraftCommand struct {
+	command      *agentv1.AircraftCommand
+	result       *agentv1.AircraftCommandResult
+	param1       float32
+	desiredArmed bool
 }
 
 func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
@@ -134,6 +142,47 @@ func (a *Agent) handleAircraftCommand(
 ) error {
 	startedAt := time.Now()
 	result := a.executeAircraftCommand(ctx, command)
+	return a.sendAircraftCommandResult(ctx, stream, command, result, startedAt)
+}
+
+func (a *Agent) dispatchAircraftCommand(
+	ctx context.Context,
+	stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage],
+	command *agentv1.AircraftCommand,
+	wg *sync.WaitGroup,
+	errors chan<- error,
+) error {
+	startedAt := time.Now()
+	prepared, immediate := prepareAircraftCommand(command)
+	if immediate != nil {
+		return a.sendAircraftCommandResult(ctx, stream, command, immediate, startedAt)
+	}
+	if !a.tryBeginAircraftCommand() {
+		return a.sendAircraftCommandResult(ctx, stream, command, aircraftCommandBusyResult(prepared.result), startedAt)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		result := a.executePreparedAircraftCommand(ctx, prepared)
+		a.endAircraftCommand()
+		if err := a.sendAircraftCommandResult(ctx, stream, command, result, startedAt); err != nil {
+			select {
+			case errors <- err:
+			default:
+			}
+		}
+	}()
+	return nil
+}
+
+func (a *Agent) sendAircraftCommandResult(
+	ctx context.Context,
+	stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage],
+	command *agentv1.AircraftCommand,
+	result *agentv1.AircraftCommandResult,
+	startedAt time.Time,
+) error {
 	slog.LogAttrs(ctx, slog.LevelInfo, "command_completed",
 		slog.String("command_id", result.GetCommandId()),
 		slog.String("aircraft_id", result.GetAircraftId()),
@@ -150,6 +199,18 @@ func (a *Agent) handleAircraftCommand(
 }
 
 func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.AircraftCommand) *agentv1.AircraftCommandResult {
+	prepared, immediate := prepareAircraftCommand(command)
+	if immediate != nil {
+		return immediate
+	}
+	if !a.tryBeginAircraftCommand() {
+		return aircraftCommandBusyResult(prepared.result)
+	}
+	defer a.endAircraftCommand()
+	return a.executePreparedAircraftCommand(ctx, prepared)
+}
+
+func prepareAircraftCommand(command *agentv1.AircraftCommand) (*preparedAircraftCommand, *agentv1.AircraftCommandResult) {
 	result := &agentv1.AircraftCommandResult{}
 	if command != nil {
 		result.CommandId = command.GetCommandId()
@@ -158,7 +219,7 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	if command == nil || strings.TrimSpace(command.GetCommandId()) == "" || strings.TrimSpace(command.GetAircraftId()) == "" {
 		result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
 		result.Message = "command_id and aircraft_id are required"
-		return result
+		return nil, result
 	}
 
 	param1 := float32(0)
@@ -171,27 +232,42 @@ func (a *Agent) executeAircraftCommand(ctx context.Context, command *agentv1.Air
 	case agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_UNSPECIFIED:
 		result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
 		result.Message = "command type must be ARM or DISARM"
-		return result
+		return nil, result
 	default:
 		result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
 		result.Message = fmt.Sprintf("unsupported aircraft command type %s", command.GetType())
-		return result
+		return nil, result
 	}
+	return &preparedAircraftCommand{command: command, result: result, param1: param1, desiredArmed: desiredArmed}, nil
+}
 
+func (a *Agent) tryBeginAircraftCommand() bool {
 	a.aircraftCommandMu.Lock()
+	defer a.aircraftCommandMu.Unlock()
 	if a.aircraftCommandActive {
-		a.aircraftCommandMu.Unlock()
-		result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
-		result.Message = "another ARM or DISARM command is already in progress"
-		return result
+		return false
 	}
 	a.aircraftCommandActive = true
+	return true
+}
+
+func (a *Agent) endAircraftCommand() {
+	a.aircraftCommandMu.Lock()
+	a.aircraftCommandActive = false
 	a.aircraftCommandMu.Unlock()
-	defer func() {
-		a.aircraftCommandMu.Lock()
-		a.aircraftCommandActive = false
-		a.aircraftCommandMu.Unlock()
-	}()
+}
+
+func aircraftCommandBusyResult(result *agentv1.AircraftCommandResult) *agentv1.AircraftCommandResult {
+	result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
+	result.Message = "another ARM or DISARM command is already in progress"
+	return result
+}
+
+func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *preparedAircraftCommand) *agentv1.AircraftCommandResult {
+	command := prepared.command
+	result := prepared.result
+	param1 := prepared.param1
+	desiredArmed := prepared.desiredArmed
 
 	a.mavlinkMu.Lock()
 	target := a.mavlinkTarget

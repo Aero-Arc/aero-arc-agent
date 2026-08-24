@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,96 @@ import (
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 )
+
+func TestRunAckLoopRejectsConcurrentAircraftCommandWithoutDelayingReceive(t *testing.T) {
+	channel := &gomavlib.Channel{}
+	commandStarted := make(chan struct{})
+	allResultsSent := make(chan struct{})
+	results := make(chan *agentv1.AircraftCommandResult, 2)
+	var writes atomic.Int32
+	var sends atomic.Int32
+	agent := &Agent{
+		options:       &AgentOptions{AircraftCommandTimeout: time.Second},
+		mavlinkTarget: &mavlinkTarget{channel: channel, systemID: 1, componentID: 1},
+	}
+	agent.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error {
+		if writes.Add(1) == 1 {
+			close(commandStarted)
+		}
+		return nil
+	}
+
+	commands := []*agentv1.RelayStreamMessage{
+		{Payload: &agentv1.RelayStreamMessage_AircraftCommand{AircraftCommand: &agentv1.AircraftCommand{
+			CommandId: "arm-1", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_ARM,
+		}}},
+		{Payload: &agentv1.RelayStreamMessage_AircraftCommand{AircraftCommand: &agentv1.AircraftCommand{
+			CommandId: "disarm-2", AircraftId: "aircraft-1",
+			Type: agentv1.AircraftCommandType_AIRCRAFT_COMMAND_TYPE_DISARM,
+		}}},
+	}
+	var receives atomic.Int32
+	stream := &mockStream{
+		recvFunc: func() (*agentv1.RelayStreamMessage, error) {
+			call := receives.Add(1)
+			if call <= int32(len(commands)) {
+				if call == 2 {
+					<-commandStarted
+				}
+				return commands[call-1], nil
+			}
+			<-allResultsSent
+			return nil, io.EOF
+		},
+		sendFunc: func(message *agentv1.AgentStreamMessage) error {
+			results <- message.GetAircraftCommandResult()
+			if sends.Add(1) == 2 {
+				close(allResultsSent)
+			}
+			return nil
+		},
+	}
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- agent.runAckLoop(context.Background(), stream) }()
+
+	select {
+	case result := <-results:
+		if result.GetCommandId() != "disarm-2" || result.GetStatus() != agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED ||
+			!strings.Contains(result.GetMessage(), "already in progress") {
+			t.Fatalf("second command result = %+v", result)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("second command was not received and rejected while the first was pending")
+	}
+	if writes.Load() != 1 {
+		t.Fatalf("MAVLink writes before first completion = %d, want 1", writes.Load())
+	}
+	agent.observeMAVLinkCommandAck(channel, 1, 1, &common.MessageCommandAck{
+		Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+		Result:  common.MAV_RESULT_ACCEPTED,
+	})
+
+	select {
+	case result := <-results:
+		if result.GetCommandId() != "arm-1" || result.GetStatus() != agentv1.AircraftCommandResult_STATUS_ACCEPTED {
+			t.Fatalf("first command result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first command did not complete after ACK")
+	}
+	select {
+	case err := <-loopDone:
+		if err != io.EOF {
+			t.Fatalf("runAckLoop error = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runAckLoop did not stop")
+	}
+	if writes.Load() != 1 {
+		t.Fatalf("MAVLink writes = %d, want only the first command", writes.Load())
+	}
+}
 
 func TestAircraftCommandTranslatesArmAndDisarmToMAVLink(t *testing.T) {
 	tests := []struct {

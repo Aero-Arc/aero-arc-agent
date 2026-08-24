@@ -10,12 +10,84 @@ import (
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"github.com/bluenviron/gomavlib/v3"
+	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/bluenviron/gomavlib/v3/pkg/frame"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestMAVLinkControlEvidenceBypassesBlockedTelemetryPersistence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	channel := &gomavlib.Channel{}
+	pending := &pendingMAVLinkCommand{
+		channel: channel, systemID: 1, componentID: 1,
+		command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+		acks:    make(chan mavlinkCommandAck, 1),
+	}
+	persistStarted := make(chan struct{})
+	a := &Agent{
+		options:               &AgentOptions{EventQueueSize: 1},
+		pendingMAVLinkCommand: pending,
+		aircraftAckAmbiguous:  false,
+		appendTelemetryFrame: func(ctx context.Context, _ *agentv1.TelemetryFrame) error {
+			select {
+			case <-persistStarted:
+			default:
+				close(persistStarted)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	events := make(chan gomavlib.Event, 4)
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- a.runMAVLinkEvents(ctx, events) }()
+
+	heartbeat := func() gomavlib.Event {
+		return &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{
+			SystemID: 1, ComponentID: 1,
+			Message: &common.MessageHeartbeat{Type: common.MAV_TYPE_QUADROTOR},
+		}}
+	}
+	events <- heartbeat()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry persistence did not block")
+	}
+	// Fill the bounded persistence queue and force an observable overload.
+	events <- heartbeat()
+	events <- heartbeat()
+	events <- &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{
+		SystemID: 1, ComponentID: 1,
+		Message: &common.MessageCommandAck{
+			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:  common.MAV_RESULT_ACCEPTED,
+		},
+	}}
+
+	select {
+	case ack := <-pending.acks:
+		if ack.result != common.MAV_RESULT_ACCEPTED {
+			t.Fatalf("ACK result = %v", ack.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("COMMAND_ACK was blocked behind telemetry persistence")
+	}
+	if a.telemetryDropCount.Load() == 0 {
+		t.Fatal("bounded persistence overload was not accounted")
+	}
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("MAVLink event loop did not stop")
+	}
+}
 
 func TestNextBackoff(t *testing.T) {
 	tests := []struct {
