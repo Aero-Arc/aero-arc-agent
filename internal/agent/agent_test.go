@@ -641,9 +641,28 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 		t.Fatalf("idempotent ack = %+v", ack)
 	}
 
+	// Legacy empty clears and contradictory authoritative clears are rejected;
+	// omission must never gain unconditional-clear semantics on the wire.
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "legacy-empty"}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("legacy empty-clear ack = %+v", ack)
+	}
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{
+		CommandId: "invalid-authoritative", FlightId: "flight-1", Authoritative: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("contradictory authoritative-clear ack = %+v", ack)
+	}
+
 	// An authoritative empty clear supports control-plane reconciliation when
 	// the API has no active flight ID to replay.
-	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty"}); err != nil {
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty", Authoritative: true}); err != nil {
 		t.Fatal(err)
 	}
 	ack = sent[len(sent)-1].GetOperationContextCommandAck()
@@ -661,7 +680,7 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 	if err := a.handleSetOperationContext(ctx, stream, setAfterReconciliation); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty"}); err != nil {
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty", Authoritative: true}); err != nil {
 		t.Fatal(err)
 	}
 	ack = sent[len(sent)-1].GetOperationContextCommandAck()
