@@ -1275,6 +1275,186 @@ func TestWALSpoolImportIsIdempotentAfterCleanupFailureAndRestart(t *testing.T) {
 	}
 }
 
+func TestWALSpoolImportMarkerDeletionFollowsDurableUnlink(t *testing.T) {
+	ctx := context.Background()
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "spool-unlink-order.db"))
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+
+	spoolPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("ordered")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolID, _, err := readSpoolFile(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	markerPresentAtUnlinkSync := false
+	w.syncDir = func(path string) error {
+		if path == w.spoolDir && !markerPresentAtUnlinkSync {
+			var count int
+			if err := w.db.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM spool_imports WHERE spool_id = ?`, spoolID).Scan(&count); err != nil {
+				return err
+			}
+			markerPresentAtUnlinkSync = count == 1
+		}
+		return syncDirectory(path)
+	}
+
+	if err := w.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	if !markerPresentAtUnlinkSync {
+		t.Fatal("spool import marker was not retained through the unlink directory sync")
+	}
+	var importCount int
+	if err := w.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM spool_imports WHERE spool_id = ?`, spoolID).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if importCount != 0 {
+		t.Fatalf("spool import markers after durable unlink = %d, want 0", importCount)
+	}
+}
+
+func TestWALSpoolImportMarkerSurvivesUnlinkSyncFailureAndResurrection(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "spool-unlink-sync-retry.db")
+	w := mustOpenWALWithoutWriter(t, dbPath)
+	spoolPath, err := w.spoolBatch([]*agentv1.TelemetryFrame{{RawMavlink: []byte("once")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolBytes, err := os.ReadFile(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoolID, _, err := readSpoolFile(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	syncErr := errors.New("simulated spool directory sync failure")
+	w.syncDir = func(path string) error {
+		if path == w.spoolDir {
+			return syncErr
+		}
+		return syncDirectory(path)
+	}
+	if err := w.drainSpool(); !errors.Is(err, syncErr) {
+		t.Fatalf("drain error = %v, want %v", err, syncErr)
+	}
+	if _, err := os.Stat(spoolPath); !os.IsNotExist(err) {
+		t.Fatalf("spool path after successful unlink = %v, want not exist", err)
+	}
+	var frameCount, importCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM spool_imports WHERE spool_id = ?`, spoolID).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 1 || importCount != 1 {
+		t.Fatalf("after unlink sync failure frames=%d markers=%d, want 1,1", frameCount, importCount)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model filesystem recovery resurrecting the unlink whose directory entry
+	// was never durably synced before the process stopped.
+	if err := os.WriteFile(spoolPath, spoolBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened := mustOpenWALWithoutWriter(t, dbPath)
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened WAL: %v", err)
+		}
+	})
+	if err := reopened.drainSpool(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM telemetry_frames`).Scan(&frameCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM spool_imports WHERE spool_id = ?`, spoolID).Scan(&importCount); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 1 || importCount != 0 {
+		t.Fatalf("after resurrected spool retry frames=%d markers=%d, want 1,0", frameCount, importCount)
+	}
+}
+
+func TestWALFinalizedSpoolSyncRetryDoesNotCreateDuplicate(t *testing.T) {
+	ctx := context.Background()
+	w := mustOpenWALWithoutWriter(t, filepath.Join(t.TempDir(), "spool-finalize-sync.db"))
+	w.batchChan = make(chan *agentv1.TelemetryFrame, 2)
+	w.writerDone = make(chan struct{})
+	w.batchSize = 1
+	w.batchTimeout = time.Hour
+
+	var renameCalls atomic.Int32
+	w.renameFile = func(oldPath, newPath string) error {
+		renameCalls.Add(1)
+		return os.Rename(oldPath, newPath)
+	}
+	var syncsWithBatch atomic.Int32
+	syncErr := errors.New("simulated finalized spool directory sync failure")
+	w.syncDir = func(path string) error {
+		if path == w.spoolDir {
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				if !entry.IsDir() && filepath.Ext(entry.Name()) == ".batch" {
+					if syncsWithBatch.Add(1) == 1 {
+						return syncErr
+					}
+					break
+				}
+			}
+		}
+		return syncDirectory(path)
+	}
+	go w.runBatchWriter(ctx)
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
+
+	if err := w.AppendAsync(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("single-spool")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.signalChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for spool directory sync retry")
+	}
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("persisted entries after finalized spool retry = %d, want 1", len(entries))
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("final spool renames = %d, want 1", got)
+	}
+	if got := syncsWithBatch.Load(); got < 2 {
+		t.Fatalf("spool directory sync attempts with final batch = %d, want at least 2", got)
+	}
+}
+
 func TestWALSpoolImportMarkerRollsBackWithFailedFrameInsert(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "spool-atomicity.db")
@@ -2006,6 +2186,7 @@ func mustOpenWALWithoutWriter(t *testing.T, dbPath string) *WAL {
 		spoolQuarantineDir: spoolQuarantineDir,
 		removeFile:         os.Remove,
 		renameFile:         os.Rename,
+		syncDir:            syncDirectory,
 		closeDB:            db.Close,
 	}
 }
