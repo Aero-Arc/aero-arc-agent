@@ -928,7 +928,11 @@ func TestWAL_SpoolAndDrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}
-	defer w.Close()
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	})
 	ctx := context.Background()
 
 	frames := []*agentv1.TelemetryFrame{
