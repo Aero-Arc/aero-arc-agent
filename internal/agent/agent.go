@@ -23,6 +23,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	defaultTelemetryPersistenceDrainTimeout = 5 * time.Second
+	walShutdownReserve                      = 10 * time.Second
+	agentShutdownTimeout                    = defaultTelemetryPersistenceDrainTimeout + walShutdownReserve
+)
+
 type Agent struct {
 	node *gomavlib.Node
 	wal  *wal.WAL
@@ -48,14 +54,35 @@ type Agent struct {
 	sleepWithBack  func(ctx context.Context, d time.Duration) bool
 	closeWALFn     func(ctx context.Context) error
 	closeMAVLinkFn func(ctx context.Context)
+	mavlinkDone    chan struct{}
+	cancelWAL      context.CancelFunc
 
 	stateMu          sync.RWMutex
 	sessionID        string
 	operationContext *wal.OperationContext
 	sendMu           sync.Mutex
 
-	ingestCount atomic.Uint64
-	sendCount   atomic.Uint64
+	mavlinkMu             sync.Mutex
+	mavlinkTarget         *mavlinkTarget
+	mavlinkHeartbeatSeq   uint64
+	pendingMAVLinkCommand *pendingMAVLinkCommand
+	aircraftAckAmbiguous  bool
+	// aircraftAckAmbiguousSince starts a transport-quiescence epoch at the
+	// first continuously processed target-channel event after matching ACK
+	// activity or an uncertain command outcome. A full command-timeout interval
+	// of event-reader progress safely returns later commands to direct ACK
+	// correlation; elapsed wall time while the reader is paused does not count.
+	aircraftAckAmbiguousSince time.Time
+	aircraftAckLastProgressAt time.Time
+	aircraftCommandMu         sync.Mutex
+	aircraftCommandActive     bool
+	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
+	appendTelemetryFrame      func(context.Context, *agentv1.TelemetryFrame) error
+	telemetryDrainTimeout     time.Duration
+
+	ingestCount        atomic.Uint64
+	sendCount          atomic.Uint64
+	telemetryDropCount atomic.Uint64
 }
 
 // NewAgent constructs an Agent and its MAVLink endpoint from runtime options.
@@ -85,11 +112,22 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 					Baud:   options.SerialBaud,
 				},
 			},
-			Dialect: common.Dialect,
+			OutVersion:     gomavlib.V2,
+			OutSystemID:    mavlinkSourceSystemID,
+			OutComponentID: mavlinkSourceComponentID,
+			Dialect:        common.Dialect,
 		},
 		options:        options,
 		backoffInitial: options.BackoffInitial,
 		backoffMax:     options.BackoffMax,
+		// A COMMAND_ACK buffered before a process restart is indistinguishable
+		// from the first new ARM/DISARM acknowledgement. Start fenced; the first
+		// target heartbeat begins a full ACK-quiescence epoch before direct
+		// correlation is enabled again.
+		aircraftAckAmbiguous: true,
+	}
+	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, command *common.MessageCommandLong) error {
+		return a.node.WriteMessageTo(channel, command)
 	}
 
 	if options.Debug {
@@ -100,9 +138,10 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 					Address: "0.0.0.0:14550",
 				},
 			},
-			OutVersion:  gomavlib.V2,
-			OutSystemID: 1,
-			Dialect:     common.Dialect,
+			OutVersion:     gomavlib.V2,
+			OutSystemID:    mavlinkSourceSystemID,
+			OutComponentID: mavlinkSourceComponentID,
+			Dialect:        common.Dialect,
 		}
 	}
 
@@ -124,8 +163,9 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 
 	// Ensure resources are cleaned up on exit.
 	defer func() {
-		// Use a fresh context for shutdown since 'ctx' might be cancelled.
-		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		// Use a fresh phase budget since 'ctx' is cancelled. The bounded pre-WAL
+		// drain cannot consume the time reserved for WAL spooling and closure.
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), agentShutdownTimeout)
 		defer cancelShutdown()
 		if err := a.shutdown(shutdownCtx); err != nil {
 			startErr = errors.Join(startErr, fmt.Errorf("agent shutdown: %w", err))
@@ -136,18 +176,9 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 	identity := identity.Resolve()
 	slog.LogAttrs(ctx, slog.LevelInfo, "agent_identity", slog.String("identity", identity.FinalID))
 
-	// Initialize WAL
-	w, err := wal.New(ctx, a.options.WALPath, a.options.WALBatchSize, a.options.WALFlushTimeout)
-	if err != nil {
-		return fmt.Errorf("failed to initialize WAL: %w", err)
-	}
-	a.wal = w
-	if operationContext, ok, err := w.LoadOperationContext(ctx); err != nil {
+	if err := a.initializeWAL(ctx); err != nil {
 		return err
-	} else if ok {
-		a.operationContext = &operationContext
 	}
-	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
 
 	a.wg.Add(1)
 	go func(ctx context.Context) {
@@ -182,9 +213,11 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 	}(ctx)
 
 	// Run MAVLink loop
+	a.mavlinkDone = make(chan struct{})
 	a.wg.Add(1)
 	go func(ctx context.Context) {
 		defer a.wg.Done()
+		defer close(a.mavlinkDone)
 		a.runMAVLink(ctx)
 	}(ctx)
 
@@ -203,10 +236,23 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 
 func (a *Agent) shutdown(ctx context.Context) error {
 	var shutdownErr error
+	if a.cancelWAL != nil {
+		defer a.cancelWAL()
+	}
 	if a.conn != nil {
 		slog.Info("shutting down grpc connection")
 		if err := a.conn.Close(); err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close gRPC connection: %w", err))
+		}
+	}
+
+	// Let the MAVLink reader close and drain its bounded pre-WAL queue before
+	// closing the WAL. Parent cancellation stops new ingest; runMAVLinkEvents
+	// bounds the actual drain and accounts for anything it cannot append.
+	if a.mavlinkDone != nil {
+		select {
+		case <-a.mavlinkDone:
+		case <-ctx.Done():
 		}
 	}
 
@@ -250,6 +296,31 @@ func (a *Agent) shutdown(ctx context.Context) error {
 	return shutdownErr
 }
 
+// initializeWAL gives the durable writer a lifecycle independent of the Agent
+// run context. Agent cancellation first stops MAVLink ingest and drains the
+// bounded pre-WAL queue; shutdown then closes the WAL explicitly. Passing the
+// run context directly to wal.New would start WAL closure before that drain.
+func (a *Agent) initializeWAL(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	walCtx, cancelWAL := context.WithCancel(context.Background())
+	w, err := wal.NewWithLifecycle(ctx, walCtx, a.options.WALPath, a.options.WALBatchSize, a.options.WALFlushTimeout)
+	if err != nil {
+		cancelWAL()
+		return fmt.Errorf("failed to initialize WAL: %w", err)
+	}
+	a.wal = w
+	a.cancelWAL = cancelWAL
+	if operationContext, ok, err := w.LoadOperationContext(ctx); err != nil {
+		return err
+	} else if ok {
+		a.operationContext = &operationContext
+	}
+	slog.LogAttrs(ctx, slog.LevelInfo, "wal_initialized", slog.String("path", a.options.WALPath))
+	return nil
+}
+
 func (a *Agent) closeMAVLinkBestEffort(ctx context.Context) {
 	if a.node == nil {
 		slog.Info("mavlink node already shutdown or closed")
@@ -279,7 +350,40 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	}
 
 	slog.LogAttrs(ctx, slog.LevelInfo, "mavlink_node_initialized")
-	events := a.node.Events()
+	return a.runMAVLinkEvents(ctx, a.node.Events())
+}
+
+// runMAVLinkEvents keeps command evidence on the event-reader path while a
+// separate worker handles potentially blocking telemetry persistence. The
+// queue is deliberately bounded: under sustained disk overload, newly
+// observed telemetry is counted and dropped rather than allowing an unbounded
+// heap or preventing COMMAND_ACK and heartbeat state from being observed.
+func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Event) error {
+	queueSize := 1000
+	if a.options != nil && a.options.EventQueueSize > 0 {
+		queueSize = a.options.EventQueueSize
+	}
+	telemetryQueue := make(chan *agentv1.TelemetryFrame, queueSize)
+	// Persistence owns a bounded graceful-drain context independent of the
+	// event-reader context. Start.shutdown waits for this worker before closing
+	// the WAL, allowing already-queued telemetry to reach its durable queue.
+	persistCtx, cancelPersist := context.WithCancel(context.Background())
+	persistDone := make(chan struct{})
+	go func() {
+		defer close(persistDone)
+		a.runTelemetryPersistence(persistCtx, telemetryQueue)
+	}()
+	defer func() {
+		close(telemetryQueue)
+		drainTimeout := defaultTelemetryPersistenceDrainTimeout
+		if a.telemetryDrainTimeout > 0 {
+			drainTimeout = a.telemetryDrainTimeout
+		}
+		forceStop := time.AfterFunc(drainTimeout, cancelPersist)
+		<-persistDone
+		forceStop.Stop()
+		cancelPersist()
+	}()
 
 	for {
 		select {
@@ -292,20 +396,36 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 			}
 
 			if frameEvt, ok := evt.(*gomavlib.EventFrame); ok {
+				// Control evidence must be observed before any telemetry work. WAL
+				// backpressure must never make a valid aircraft ACK time out.
+				a.observeMAVLinkFrame(frameEvt)
 				slog.LogAttrs(
 					ctx, slog.LevelDebug,
 					"mavlink_frame_received",
 					slog.String("frame-message", fmt.Sprintf("%+v", frameEvt.Message())),
 				)
 
-				// Process frame asynchronously via WAL batcher
-				if err := a.processFrame(ctx, frameEvt); err != nil {
+				tFrame, err := a.buildTelemetryFrame(frameEvt)
+				if err != nil {
 					slog.LogAttrs(
 						ctx, slog.LevelError,
 						"failed_to_process_frame",
 						slog.String("error", err.Error()),
 					)
 					continue
+				}
+				select {
+				case telemetryQueue <- tFrame:
+				default:
+					dropped := a.telemetryDropCount.Add(1)
+					// Log the first drop and then exponentially to keep an
+					// overload from becoming a second source of backpressure.
+					if dropped == 1 || dropped&(dropped-1) == 0 {
+						slog.LogAttrs(ctx, slog.LevelError, "telemetry_persistence_queue_full",
+							slog.Uint64("dropped_total", dropped),
+							slog.Int("queue_capacity", queueSize),
+						)
+					}
 				}
 			}
 
@@ -319,7 +439,8 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 				continue
 			}
 
-			if _, ok := evt.(*gomavlib.EventChannelClose); ok {
+			if closeEvent, ok := evt.(*gomavlib.EventChannelClose); ok {
+				a.clearMAVLinkTarget(closeEvent.Channel)
 				slog.LogAttrs(
 					ctx, slog.LevelInfo,
 					"mavlink_channel_close",
@@ -332,12 +453,54 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 	}
 }
 
-// processFrame marshals the MAVLink frame and queues it for WAL ingestion.
-func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) error {
+func (a *Agent) runTelemetryPersistence(ctx context.Context, frames <-chan *agentv1.TelemetryFrame) {
+	for frame := range frames {
+		if err := a.persistTelemetryFrame(ctx, frame); err != nil {
+			if ctx.Err() != nil {
+				droppedNow := uint64(1)
+				for range frames {
+					droppedNow++
+				}
+				dropped := a.telemetryDropCount.Add(droppedNow)
+				slog.LogAttrs(context.Background(), slog.LevelError, "telemetry_persistence_drain_expired",
+					slog.String("error", err.Error()),
+					slog.Uint64("dropped_count", droppedNow),
+					slog.Uint64("dropped_total", dropped),
+				)
+				return
+			}
+			dropped := a.telemetryDropCount.Add(1)
+			slog.LogAttrs(context.Background(), slog.LevelError, "failed_to_persist_frame",
+				slog.String("error", err.Error()),
+				slog.Uint64("dropped_total", dropped),
+			)
+		}
+	}
+}
+
+func (a *Agent) persistTelemetryFrame(ctx context.Context, frame *agentv1.TelemetryFrame) error {
+	var err error
+	if a.appendTelemetryFrame != nil {
+		err = a.appendTelemetryFrame(ctx, frame)
+	} else if a.wal == nil {
+		err = errors.New("WAL is unavailable")
+	} else {
+		err = a.wal.AppendAsync(ctx, frame)
+	}
+	if err != nil {
+		return fmt.Errorf("wal append async failed: %w", err)
+	}
+	a.ingestCount.Add(1)
+	return nil
+}
+
+// buildTelemetryFrame copies one MAVLink event into its durable wire model.
+// It intentionally performs no I/O so the event-reader cannot stall on disk.
+func (a *Agent) buildTelemetryFrame(frame *gomavlib.EventFrame) (*agentv1.TelemetryFrame, error) {
 	msg := frame.Message()
 	payload, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("failed to marshal frame message: %w", err)
+		return nil, fmt.Errorf("failed to marshal frame message: %w", err)
 	}
 
 	msgName := fmt.Sprintf("%T", msg)
@@ -354,14 +517,7 @@ func (a *Agent) processFrame(ctx context.Context, frame *gomavlib.EventFrame) er
 		AgentId:      identity.Resolve().FinalID,
 	}
 	a.stampFrameContext(tFrame)
-
-	// Write to WAL asynchronously
-	if err := a.wal.AppendAsync(ctx, tFrame); err != nil {
-		return fmt.Errorf("wal append async failed: %w", err)
-	}
-	a.ingestCount.Add(1)
-
-	return nil
+	return tFrame, nil
 }
 
 func (a *Agent) stampFrameContext(frame *agentv1.TelemetryFrame) {
@@ -512,19 +668,31 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 // runStreamLoop handles the receive side of the telemetry stream. Outbound
 // sends will be wired in a later iteration once the queue is implemented.
 func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	commandCtx, cancelCommands := context.WithCancel(ctx)
+	var commandWG sync.WaitGroup
+	commandErrors := make(chan error, 1)
+	defer func() {
+		cancelCommands()
+		commandWG.Wait()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-commandErrors:
+			return err
 		default:
 			message, err := stream.Recv()
 			if err != nil {
 				return err
 			}
 
-			err = a.handleRelayMessage(ctx, stream, message)
+			if command := message.GetAircraftCommand(); command != nil {
+				err = a.dispatchAircraftCommand(commandCtx, stream, command, &commandWG, commandErrors)
+			} else {
+				err = a.handleRelayMessage(ctx, stream, message)
+			}
 			if err != nil {
-				// TODO: Handle error? Should we retry? Definitely shouldn't just exit.
 				return err
 			}
 		}
@@ -539,6 +707,8 @@ func (a *Agent) handleRelayMessage(ctx context.Context, stream grpc.BidiStreamin
 		return a.handleSetOperationContext(ctx, stream, payload.SetOperationContext)
 	case *agentv1.RelayStreamMessage_ClearOperationContext:
 		return a.handleClearOperationContext(ctx, stream, payload.ClearOperationContext)
+	case *agentv1.RelayStreamMessage_AircraftCommand:
+		return a.handleAircraftCommand(ctx, stream, payload.AircraftCommand)
 	default:
 		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "relay stream message has no supported payload")
 	}
@@ -551,6 +721,9 @@ func (a *Agent) handleSetOperationContext(ctx context.Context, stream grpc.BidiS
 	value := wal.OperationContext{FlightID: command.Context.FlightId, IntentID: command.Context.IntentId, IntentVersion: command.Context.IntentVersion}
 	applied, err := a.wal.SetOperationContext(ctx, command.CommandId, value)
 	if err != nil {
+		if errors.Is(err, wal.ErrOperationCommandConflict) {
+			return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_REJECTED, err.Error())
+		}
 		return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_TEMPORARY_ERROR, err.Error())
 	}
 	status := agentv1.OperationContextCommandAck_STATUS_APPLIED
@@ -579,11 +752,18 @@ func (a *Agent) handleClearOperationContext(ctx context.Context, stream grpc.Bid
 	if command.GetCommandId() == "" {
 		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "command_id is required")
 	}
-	if command.GetFlightId() == "" {
-		return a.sendOperationContextAck(stream, command.GetCommandId(), agentv1.OperationContextCommandAck_STATUS_REJECTED, "flight id is required")
+	if command.GetAuthoritative() {
+		if command.GetFlightId() != "" {
+			return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_REJECTED, "authoritative clear requires an empty flight_id")
+		}
+	} else if command.GetFlightId() == "" {
+		return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_REJECTED, "conditional clear requires a flight_id")
 	}
 	applied, err := a.wal.ClearOperationContext(ctx, command.CommandId, command.FlightId)
 	if err != nil {
+		if errors.Is(err, wal.ErrOperationCommandConflict) {
+			return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_REJECTED, err.Error())
+		}
 		return a.sendOperationContextAck(stream, command.CommandId, agentv1.OperationContextCommandAck_STATUS_TEMPORARY_ERROR, err.Error())
 	}
 	active, ok, err := a.wal.LoadOperationContext(ctx)

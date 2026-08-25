@@ -146,6 +146,85 @@ func TestInitDBAddsSpoolImportCleanupTokenToExistingSchema(t *testing.T) {
 	}
 }
 
+func TestInitDBAddsOperationCommandFingerprintsToExistingSchema(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "schema.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close schema database: %v", err)
+		}
+	})
+	if _, err := db.Exec(`CREATE TABLE operation_context_commands (
+		command_id TEXT PRIMARY KEY,
+		processed_at INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO operation_context_commands(command_id, processed_at) VALUES('legacy', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	var kind, fingerprint string
+	if err := db.QueryRow(`SELECT command_kind, payload_fingerprint FROM operation_context_commands WHERE command_id = 'legacy'`).Scan(&kind, &fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "" || fingerprint != "" {
+		t.Fatalf("legacy fingerprint = (%q, %q), want empty", kind, fingerprint)
+	}
+
+	// Payload history cannot be reconstructed for an old command row. Retries
+	// remain no-ops even after later context changes, and the row stays explicitly
+	// unknown rather than adopting whichever payload happens to arrive first.
+	w := &WAL{db: db}
+	want := OperationContext{FlightID: "flight-legacy", IntentID: "intent-legacy", IntentVersion: 4}
+	if _, err := db.Exec(`INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at) VALUES(1, ?, ?, ?, 1)`, want.FlightID, want.IntentID, want.IntentVersion); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := w.SetOperationContext(context.Background(), "legacy", want)
+	if err != nil || applied {
+		t.Fatalf("legacy matching retry = %v, %v", applied, err)
+	}
+	if err := db.QueryRow(`SELECT command_kind, payload_fingerprint FROM operation_context_commands WHERE command_id = 'legacy'`).Scan(&kind, &fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "" || fingerprint != "" {
+		t.Fatalf("legacy fingerprint = (%q, %q), want payload-unknown", kind, fingerprint)
+	}
+	if applied, err = w.SetOperationContext(context.Background(), "legacy", OperationContext{FlightID: "different"}); err != nil || applied {
+		t.Fatalf("payload-unknown legacy retry = %v, %v", applied, err)
+	}
+	current, ok, err := w.LoadOperationContext(context.Background())
+	if err != nil || !ok || current != want {
+		t.Fatalf("legacy retry changed current context = %+v, %v, %v", current, ok, err)
+	}
+	newer := OperationContext{FlightID: "flight-new", IntentID: "intent-new", IntentVersion: 5}
+	if applied, err = w.SetOperationContext(context.Background(), "newer", newer); err != nil || !applied {
+		t.Fatalf("later context update = %v, %v", applied, err)
+	}
+	if applied, err = w.SetOperationContext(context.Background(), "legacy", want); err != nil || applied {
+		t.Fatalf("older exact retry after context change = %v, %v", applied, err)
+	}
+	current, ok, err = w.LoadOperationContext(context.Background())
+	if err != nil || !ok || current != newer {
+		t.Fatalf("older retry rewound current context = %+v, %v, %v", current, ok, err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO operation_context_commands(command_id, processed_at, command_kind, payload_fingerprint) VALUES('legacy-clear', 2, '', '')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM operation_context WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	applied, err = w.ClearOperationContext(context.Background(), "legacy-clear", want.FlightID)
+	if err != nil || applied {
+		t.Fatalf("legacy clear retry = %v, %v", applied, err)
+	}
+}
+
 func TestWALGenerationRotationPreventsRestoredSequenceReuse(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -1989,8 +2068,12 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 		t.Fatalf("SetOperationContext() = %v, %v", applied, err)
 	}
 	applied, err = w.SetOperationContext(ctx, "set-1", OperationContext{FlightID: "wrong"})
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("conflicting SetOperationContext() = %v, %v", applied, err)
+	}
+	applied, err = w.SetOperationContext(ctx, "set-1", want)
 	if err != nil || applied {
-		t.Fatalf("duplicate SetOperationContext() = %v, %v", applied, err)
+		t.Fatalf("idempotent SetOperationContext() = %v, %v", applied, err)
 	}
 	got, ok, err := w.LoadOperationContext(ctx)
 	if err != nil || !ok || got != want {
@@ -2009,18 +2092,45 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 	if err != nil || !ok || got != want {
 		t.Fatalf("context after reopen = %#v, %v, %v; want %#v", got, ok, err, want)
 	}
+	applied, err = w.SetOperationContext(ctx, "set-1", want)
+	if err != nil || applied {
+		t.Fatalf("durable idempotent set after reopen = %v, %v", applied, err)
+	}
+	applied, err = w.ClearOperationContext(ctx, "set-1", want.FlightID)
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("cross-kind command ID reuse = %v, %v", applied, err)
+	}
 
 	applied, err = w.ClearOperationContext(ctx, "clear-empty", "")
-	if err == nil || applied {
-		t.Fatalf("empty-flight clear = %v, %v; want false, error", applied, err)
+	if err != nil || !applied {
+		t.Fatalf("empty-flight clear = %v, %v; want applied", applied, err)
+	}
+	if _, ok, err = w.LoadOperationContext(ctx); err != nil || ok {
+		t.Fatalf("context after empty-flight clear: ok=%v err=%v", ok, err)
+	}
+	applied, err = w.SetOperationContext(ctx, "set-2", want)
+	if err != nil || !applied {
+		t.Fatalf("restore context after reconciliation = %v, %v", applied, err)
+	}
+	applied, err = w.ClearOperationContext(ctx, "clear-empty", "")
+	if err != nil || applied {
+		t.Fatalf("late empty-clear retry = %v, %v; want durable no-op", applied, err)
 	}
 	if got, ok, err = w.LoadOperationContext(ctx); err != nil || !ok || got != want {
-		t.Fatalf("context after empty-flight clear = %#v, %v, %v; want %#v", got, ok, err, want)
+		t.Fatalf("context after late empty-clear retry = %#v, %v, %v; want %#v", got, ok, err, want)
+	}
+	applied, err = w.ClearOperationContext(ctx, "clear-empty", want.FlightID)
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("empty-clear command ID conflict = %v, %v", applied, err)
 	}
 
 	applied, err = w.ClearOperationContext(ctx, "clear-old", "another-flight")
 	if err != nil || !applied {
 		t.Fatalf("conditional clear = %v, %v", applied, err)
+	}
+	applied, err = w.ClearOperationContext(ctx, "clear-old", want.FlightID)
+	if !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("conflicting conditional clear = %v, %v", applied, err)
 	}
 	if got, ok, err = w.LoadOperationContext(ctx); err != nil || !ok || got != want {
 		t.Fatalf("context after mismatched clear = %#v, %v, %v", got, ok, err)

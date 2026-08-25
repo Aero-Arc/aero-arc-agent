@@ -10,12 +10,198 @@ import (
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"github.com/bluenviron/gomavlib/v3"
+	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/bluenviron/gomavlib/v3/pkg/frame"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestMAVLinkControlEvidenceBypassesBlockedTelemetryPersistence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	channel := &gomavlib.Channel{}
+	pending := &pendingMAVLinkCommand{
+		channel: channel, systemID: 1, componentID: 1,
+		command:         common.MAV_CMD_COMPONENT_ARM_DISARM,
+		enqueueComplete: true,
+		acks:            make(chan mavlinkCommandAck, 1),
+	}
+	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
+	a := &Agent{
+		options:               &AgentOptions{EventQueueSize: 1},
+		pendingMAVLinkCommand: pending,
+		aircraftAckAmbiguous:  false,
+		appendTelemetryFrame: func(ctx context.Context, _ *agentv1.TelemetryFrame) error {
+			select {
+			case <-persistStarted:
+			default:
+				close(persistStarted)
+			}
+			select {
+			case <-persistRelease:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+	events := make(chan gomavlib.Event, 4)
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- a.runMAVLinkEvents(ctx, events) }()
+
+	heartbeat := func() gomavlib.Event {
+		return &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{
+			SystemID: 1, ComponentID: 1,
+			Message: &common.MessageHeartbeat{Type: common.MAV_TYPE_QUADROTOR},
+		}}
+	}
+	events <- heartbeat()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry persistence did not block")
+	}
+	// Fill the bounded persistence queue and force an observable overload.
+	events <- heartbeat()
+	events <- heartbeat()
+	events <- &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{
+		SystemID: 1, ComponentID: 1,
+		Message: &common.MessageCommandAck{
+			Command: common.MAV_CMD_COMPONENT_ARM_DISARM,
+			Result:  common.MAV_RESULT_ACCEPTED,
+		},
+	}}
+
+	select {
+	case ack := <-pending.acks:
+		if ack.result != common.MAV_RESULT_ACCEPTED {
+			t.Fatalf("ACK result = %v", ack.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("COMMAND_ACK was blocked behind telemetry persistence")
+	}
+	if a.telemetryDropCount.Load() == 0 {
+		t.Fatal("bounded persistence overload was not accounted")
+	}
+	close(persistRelease)
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("MAVLink event loop did not stop")
+	}
+}
+
+func TestMAVLinkShutdownDrainsPreWALTelemetryQueue(t *testing.T) {
+	persistStarted := make(chan struct{})
+	persistRelease := make(chan struct{})
+	persisted := 0
+	a := &Agent{
+		options: &AgentOptions{EventQueueSize: 2},
+		appendTelemetryFrame: func(ctx context.Context, _ *agentv1.TelemetryFrame) error {
+			if persisted == 0 {
+				select {
+				case <-persistStarted:
+				default:
+					close(persistStarted)
+				}
+			}
+			select {
+			case <-persistRelease:
+				persisted++
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+	events := make(chan gomavlib.Event, 2)
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- a.runMAVLinkEvents(context.Background(), events) }()
+	heartbeat := func() gomavlib.Event {
+		return &gomavlib.EventFrame{Frame: &frame.V2Frame{
+			SystemID: 1, ComponentID: 1,
+			Message: &common.MessageHeartbeat{Type: common.MAV_TYPE_QUADROTOR},
+		}}
+	}
+	events <- heartbeat()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry persistence did not start")
+	}
+	events <- heartbeat()
+	close(events)
+	select {
+	case err := <-loopDone:
+		t.Fatalf("event loop returned before draining telemetry: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(persistRelease)
+	select {
+	case err := <-loopDone:
+		if err != nil {
+			t.Fatalf("event loop error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("event loop did not finish after persistence resumed")
+	}
+	if persisted != 2 {
+		t.Fatalf("persisted frames = %d, want 2", persisted)
+	}
+	if dropped := a.telemetryDropCount.Load(); dropped != 0 {
+		t.Fatalf("graceful drain dropped %d frames", dropped)
+	}
+}
+
+func TestMAVLinkShutdownAccountsForExpiredPreWALDrain(t *testing.T) {
+	persistStarted := make(chan struct{})
+	a := &Agent{
+		options:               &AgentOptions{EventQueueSize: 2},
+		telemetryDrainTimeout: 10 * time.Millisecond,
+		appendTelemetryFrame: func(ctx context.Context, _ *agentv1.TelemetryFrame) error {
+			select {
+			case <-persistStarted:
+			default:
+				close(persistStarted)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	events := make(chan gomavlib.Event, 2)
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- a.runMAVLinkEvents(context.Background(), events) }()
+	heartbeat := func() gomavlib.Event {
+		return &gomavlib.EventFrame{Frame: &frame.V2Frame{
+			SystemID: 1, ComponentID: 1,
+			Message: &common.MessageHeartbeat{Type: common.MAV_TYPE_QUADROTOR},
+		}}
+	}
+	events <- heartbeat()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry persistence did not start")
+	}
+	events <- heartbeat()
+	close(events)
+	select {
+	case err := <-loopDone:
+		if err != nil {
+			t.Fatalf("event loop error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired persistence drain did not stop")
+	}
+	if dropped := a.telemetryDropCount.Load(); dropped != 2 {
+		t.Fatalf("expired drain accounted %d dropped frames, want 2", dropped)
+	}
+}
 
 func TestNextBackoff(t *testing.T) {
 	tests := []struct {
@@ -84,6 +270,31 @@ func TestAgentShutdownFlushesWALBeforeMAVLinkDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := a.shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentWALLifecycleOutlivesRunContextForTelemetryDrain(t *testing.T) {
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	a := &Agent{options: &AgentOptions{
+		WALPath: filepath.Join(t.TempDir(), "agent.db"), WALBatchSize: 1,
+		WALFlushTimeout: time.Millisecond,
+	}}
+	if err := a.initializeWAL(runCtx); err != nil {
+		t.Fatal(err)
+	}
+	cancelRun()
+	// A WAL constructed with runCtx would begin closing asynchronously here.
+	// The production Agent owns an independent lifecycle until explicit shutdown.
+	time.Sleep(20 * time.Millisecond)
+	if err := a.persistTelemetryFrame(context.Background(), &agentv1.TelemetryFrame{
+		RawMavlink: []byte("drained-after-run-cancel"),
+	}); err != nil {
+		t.Fatalf("persist after run cancellation: %v", err)
+	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+	defer cancelShutdown()
+	if err := a.shutdown(shutdownCtx); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -409,28 +620,72 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The same durable command is acknowledged without replacing its original value.
-	set.Context.FlightId = "incorrect-retry-value"
-	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
+	// Reusing a durable command ID with a different payload is rejected and
+	// cannot replace the original context.
+	conflict := proto.Clone(set).(*agentv1.SetOperationContextCommand)
+	conflict.Context.FlightId = "incorrect-retry-value"
+	if err := a.handleSetOperationContext(ctx, stream, conflict); err != nil {
 		t.Fatal(err)
 	}
 	ack := sent[len(sent)-1].GetOperationContextCommandAck()
-	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED || ack.GetActiveContext().GetFlightId() != "flight-1" {
-		t.Fatalf("duplicate ack = %+v", ack)
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("conflicting ack = %+v", ack)
 	}
 
-	// A malformed clear is rejected, correlated to its command, and leaves the active context intact.
-	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty"}); err != nil {
+	// An exact retry remains a successful no-op.
+	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
 		t.Fatal(err)
 	}
 	ack = sent[len(sent)-1].GetOperationContextCommandAck()
-	if ack.GetCommandId() != "clear-empty" || ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED {
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("idempotent ack = %+v", ack)
+	}
+
+	// Legacy empty clears and contradictory authoritative clears are rejected;
+	// omission must never gain unconditional-clear semantics on the wire.
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "legacy-empty"}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("legacy empty-clear ack = %+v", ack)
+	}
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{
+		CommandId: "invalid-authoritative", FlightId: "flight-1", Authoritative: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_REJECTED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("contradictory authoritative-clear ack = %+v", ack)
+	}
+
+	// An authoritative empty clear supports control-plane reconciliation when
+	// the API has no active flight ID to replay.
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty", Authoritative: true}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetCommandId() != "clear-empty" || ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_APPLIED || ack.GetActiveContext() != nil {
 		t.Fatalf("empty-flight clear ack = %+v", ack)
 	}
 	frame = &agentv1.TelemetryFrame{}
 	a.stampFrameContext(frame)
-	if frame.FlightId != "flight-1" {
-		t.Fatalf("empty-flight clear changed flight to %q", frame.FlightId)
+	if frame.FlightId != "" || frame.IntentId != "" {
+		t.Fatalf("empty-flight clear retained context: %+v", frame)
+	}
+
+	setAfterReconciliation := proto.Clone(set).(*agentv1.SetOperationContextCommand)
+	setAfterReconciliation.CommandId = "set-2"
+	if err := a.handleSetOperationContext(ctx, stream, setAfterReconciliation); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.handleClearOperationContext(ctx, stream, &agentv1.ClearOperationContextCommand{CommandId: "clear-empty", Authoritative: true}); err != nil {
+		t.Fatal(err)
+	}
+	ack = sent[len(sent)-1].GetOperationContextCommandAck()
+	if ack.GetStatus() != agentv1.OperationContextCommandAck_STATUS_ALREADY_APPLIED || ack.GetActiveContext().GetFlightId() != "flight-1" {
+		t.Fatalf("late empty-clear retry = %+v", ack)
 	}
 
 	// A stale clear is recorded but cannot clear a newer/different flight.
@@ -628,6 +883,9 @@ func TestNewAgent(t *testing.T) {
 	}
 	if a.backoffInitial == 0 {
 		t.Error("backoffInitial not set")
+	}
+	if !a.aircraftAckAmbiguous {
+		t.Error("new Agent must fence acknowledgements buffered across process restart")
 	}
 }
 

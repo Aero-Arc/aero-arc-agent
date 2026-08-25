@@ -16,6 +16,7 @@ func (a *Agent) runTelemetryStats(ctx context.Context, interval time.Duration) {
 
 	lastIngest := uint64(0)
 	lastSent := uint64(0)
+	lastDropped := uint64(0)
 	last := time.Now()
 
 	for {
@@ -33,12 +34,15 @@ func (a *Agent) runTelemetryStats(ctx context.Context, interval time.Duration) {
 
 			ingestTotal := a.ingestCount.Load()
 			sentTotal := a.sendCount.Load()
+			droppedTotal := a.telemetryDropCount.Load()
 
 			ingestRate := float64(ingestTotal-lastIngest) / elapsed
 			sendRate := float64(sentTotal-lastSent) / elapsed
+			droppedRate := float64(droppedTotal-lastDropped) / elapsed
 
 			lastIngest = ingestTotal
 			lastSent = sentTotal
+			lastDropped = droppedTotal
 			last = now
 
 			undelivered, err := a.wal.CountUndelivered(ctx)
@@ -51,9 +55,11 @@ func (a *Agent) runTelemetryStats(ctx context.Context, interval time.Duration) {
 				"telemetry_stats",
 				slog.Float64("ingest_rate_per_s", ingestRate),
 				slog.Float64("send_rate_per_s", sendRate),
+				slog.Float64("dropped_rate_per_s", droppedRate),
 				slog.Int64("undelivered_count", undelivered),
 				slog.Uint64("ingest_total", ingestTotal),
 				slog.Uint64("sent_total", sentTotal),
+				slog.Uint64("dropped_total", droppedTotal),
 				slog.Float64("interval_s", elapsed),
 			)
 		case <-ctx.Done():

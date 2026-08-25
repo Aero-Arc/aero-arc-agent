@@ -113,6 +113,19 @@ The agent performs three key tasks:
   The copy becomes crash-durable when its batch reaches SQLite or a synced
   spool file. Graceful shutdown attempts to spool the accepted queue, while an
   abrupt process or power loss may lose the current unflushed batch.
+- MAVLink command evidence is observed before telemetry enters a separate,
+  bounded persistence queue. This prevents a slow disk from making an aircraft
+  `COMMAND_ACK` time out. If that queue saturates, newly observed telemetry is
+  not accepted into the WAL: the Agent increments `dropped_total` and emits
+  exponentially rate-limited `telemetry_persistence_queue_full` errors. This
+  explicit overload policy keeps memory bounded and command handling live.
+  Graceful shutdown closes and drains this pre-WAL queue before WAL shutdown;
+  the WAL writer remains live after Agent run cancellation until that drain
+  completes and the Agent explicitly closes it. The overall shutdown budget
+  reserves ten seconds beyond the five-second drain bound for durable WAL
+  spooling/closure and remaining cleanup. Frames that still cannot be accepted
+  by the bounded drain deadline are also
+  included in `dropped_total` and logged.
 - Malformed legacy rows and spool files are quarantined so their bytes and
   diagnostics remain available without blocking later valid telemetry.
 
