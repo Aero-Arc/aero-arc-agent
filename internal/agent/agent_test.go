@@ -674,13 +674,16 @@ func TestOperationContextLifecycleAndFrameSnapshot(t *testing.T) {
 	a := &Agent{wal: w, sessionID: "session-1"}
 	set := &agentv1.SetOperationContextCommand{
 		CommandId: "set-1",
-		Context:   &agentv1.OperationContext{FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2},
+		Context:   &agentv1.OperationContext{AircraftId: "aircraft-1", FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 2},
 	}
 	if err := a.handleSetOperationContext(ctx, stream, set); err != nil {
 		t.Fatal(err)
 	}
 	if got := sent[len(sent)-1].GetOperationContextCommandAck().GetStatus(); got != agentv1.OperationContextCommandAck_STATUS_APPLIED {
 		t.Fatalf("set status = %v", got)
+	}
+	if got := sent[len(sent)-1].GetOperationContextCommandAck().GetActiveContext().GetAircraftId(); got != "aircraft-1" {
+		t.Fatalf("active aircraft ID = %q", got)
 	}
 
 	frame := &agentv1.TelemetryFrame{}

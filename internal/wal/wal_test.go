@@ -225,6 +225,48 @@ func TestInitDBAddsOperationCommandFingerprintsToExistingSchema(t *testing.T) {
 	}
 }
 
+func TestMissionDeploymentJournalIsImmutableAndDurable(t *testing.T) {
+	ctx := context.Background()
+	w, err := New(ctx, filepath.Join(t.TempDir(), "mission-journal.db"), 1, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	record, created, err := w.ReserveMissionDeployment(ctx, "command-1", "fingerprint-1", []byte("payload-1"))
+	if err != nil || !created || record.State != "prepared" {
+		t.Fatalf("reserve = %+v, %v, %v", record, created, err)
+	}
+	if _, created, err = w.ReserveMissionDeployment(ctx, "command-1", "fingerprint-1", []byte("payload-1")); err != nil || created {
+		t.Fatalf("exact reserve retry = %v, %v", created, err)
+	}
+	if _, _, err = w.ReserveMissionDeployment(ctx, "command-1", "fingerprint-2", []byte("payload-2")); !errors.Is(err, ErrMissionDeploymentConflict) {
+		t.Fatalf("conflicting reserve error = %v", err)
+	}
+	if err := w.MarkMissionDeploymentEffectStarted(ctx, "command-1", "fingerprint-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.StoreMissionDeploymentResult(ctx, "command-1", "fingerprint-1", []byte("result"), true); err != nil {
+		t.Fatal(err)
+	}
+	record, err = w.LoadMissionDeployment(ctx, "command-1")
+	if err != nil || record.State != "outcome_unknown" || string(record.ResultPayload) != "result" {
+		t.Fatalf("stored record = %+v, %v", record, err)
+	}
+	if err := w.StoreMissionDeploymentResult(ctx, "command-1", "wrong", []byte("mutation"), false); !errors.Is(err, ErrMissionDeploymentConflict) {
+		t.Fatalf("wrong-row mutation error = %v", err)
+	}
+	if err := w.StoreMissionDeploymentResult(ctx, "command-1", "fingerprint-1", []byte("terminal"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.StoreMissionDeploymentResult(ctx, "command-1", "fingerprint-1", []byte("regression"), true); err == nil {
+		t.Fatal("terminal mission deployment regressed to outcome_unknown")
+	}
+}
+
 func TestWALGenerationRotationPreventsRestoredSequenceReuse(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -2127,7 +2169,7 @@ func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := OperationContext{FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 3}
+	want := OperationContext{AircraftID: "aircraft-1", FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 3}
 	applied, err := w.SetOperationContext(ctx, "set-1", want)
 	if err != nil || !applied {
 		t.Fatalf("SetOperationContext() = %v, %v", applied, err)

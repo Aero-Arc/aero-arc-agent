@@ -39,6 +39,10 @@ const lifecycleShutdownGrace = 5 * time.Second
 // with a different command kind or payload.
 var ErrOperationCommandConflict = errors.New("operation command ID reused with a different payload")
 
+// ErrMissionDeploymentConflict reports reuse of a durable mission command ID
+// with a different immutable command payload.
+var ErrMissionDeploymentConflict = errors.New("mission deployment command ID reused with a different payload")
+
 var (
 	// ErrTelemetryFrameNotFound reports an ACK for no durable WAL sequence.
 	ErrTelemetryFrameNotFound = errors.New("telemetry ACK sequence does not exist")
@@ -228,6 +232,7 @@ func initDB(db *sql.DB) error {
 	);
 	CREATE TABLE IF NOT EXISTS operation_context (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
+		aircraft_id TEXT NOT NULL DEFAULT '',
 		flight_id TEXT NOT NULL,
 		intent_id TEXT NOT NULL,
 		intent_version INTEGER NOT NULL,
@@ -238,6 +243,15 @@ func initDB(db *sql.DB) error {
 		processed_at INTEGER NOT NULL,
 		command_kind TEXT NOT NULL DEFAULT '',
 		payload_fingerprint TEXT NOT NULL DEFAULT ''
+	);
+	CREATE TABLE IF NOT EXISTS mission_deployments (
+		command_id TEXT PRIMARY KEY,
+		payload_fingerprint TEXT NOT NULL,
+		command_payload BLOB NOT NULL,
+		state TEXT NOT NULL CHECK (state IN ('prepared', 'effect_started', 'outcome_unknown', 'terminal')),
+		result_payload BLOB,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS wal_metadata (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -283,7 +297,24 @@ func initDB(db *sql.DB) error {
 	if err := ensureOperationCommandFingerprint(db); err != nil {
 		return err
 	}
+	if err := ensureOperationContextAircraftID(db); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func ensureOperationContextAircraftID(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('operation_context') WHERE name = 'aircraft_id'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect operation context schema: %w", err)
+	}
+	if count != 0 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE operation_context ADD COLUMN aircraft_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("add operation context aircraft_id: %w", err)
+	}
 	return nil
 }
 
@@ -602,8 +633,11 @@ func (w *WAL) GenerationID() string {
 	return w.generationID
 }
 
-// OperationContext is the capture-time flight attribution persisted by the agent.
+// OperationContext is the capture-time aircraft, flight, and intent attribution
+// persisted by the agent. AircraftID may be empty for legacy telemetry context,
+// but mission deployment must fail closed unless it is present.
 type OperationContext struct {
+	AircraftID    string
 	FlightID      string
 	IntentID      string
 	IntentVersion uint32
@@ -613,8 +647,8 @@ type OperationContext struct {
 func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool, error) {
 	var value OperationContext
 	var version int64
-	err := w.db.QueryRowContext(ctx, `SELECT flight_id, intent_id, intent_version FROM operation_context WHERE id = 1`).
-		Scan(&value.FlightID, &value.IntentID, &version)
+	err := w.db.QueryRowContext(ctx, `SELECT aircraft_id, flight_id, intent_id, intent_version FROM operation_context WHERE id = 1`).
+		Scan(&value.AircraftID, &value.FlightID, &value.IntentID, &version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OperationContext{}, false, nil
 	}
@@ -647,12 +681,18 @@ func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool,
 //     reuse with another kind or payload, context cancellation, or a SQLite
 //     transaction, query, mutation, or commit failure.
 func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value OperationContext) (bool, error) {
-	fingerprint := operationCommandFingerprint("set", value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
+	var fingerprint string
+	if value.AircraftID == "" {
+		// Preserve exact retry identity for pre-aircraft_id context producers.
+		fingerprint = operationCommandFingerprint("set", value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
+	} else {
+		fingerprint = operationCommandFingerprint("set-v2", value.AircraftID, value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
+	}
 	return w.applyOperationCommand(ctx, commandID, "set", fingerprint, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at)
-			VALUES(1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET flight_id=excluded.flight_id,
-			intent_id=excluded.intent_id, intent_version=excluded.intent_version, updated_at=excluded.updated_at`,
-			value.FlightID, value.IntentID, value.IntentVersion, time.Now().UnixNano())
+		_, err := tx.ExecContext(ctx, `INSERT INTO operation_context(id, aircraft_id, flight_id, intent_id, intent_version, updated_at)
+			VALUES(1, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET aircraft_id=excluded.aircraft_id,
+			flight_id=excluded.flight_id, intent_id=excluded.intent_id, intent_version=excluded.intent_version, updated_at=excluded.updated_at`,
+			value.AircraftID, value.FlightID, value.IntentID, value.IntentVersion, time.Now().UnixNano())
 		return err
 	})
 }
@@ -746,6 +786,152 @@ func operationCommandFingerprint(parts ...string) string {
 		_, _ = hash.Write([]byte(part))
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// MissionDeploymentRecord is the durable state of a mission deployment command.
+// CommandPayload and ResultPayload are private copies owned by the caller.
+type MissionDeploymentRecord struct {
+	CommandID          string
+	PayloadFingerprint string
+	CommandPayload     []byte
+	State              string
+	ResultPayload      []byte
+}
+
+// ReserveMissionDeployment durably records an immutable mission command before
+// any autopilot interaction. Exact retries return the existing record; an ID
+// reused with another fingerprint returns ErrMissionDeploymentConflict.
+//
+// Parameters:
+//   - ctx: bounds the durable SQLite reservation and reload.
+//   - commandID: is the stable cross-service idempotency key.
+//   - fingerprint: identifies the deterministic immutable command payload.
+//   - payload: contains the deterministic command bytes retained for audit.
+//
+// Returns:
+//   - record: is the newly stored or previously durable command state.
+//   - created: is true only for the first durable reservation.
+//   - error: reports invalid input, conflicting ID reuse, cancellation, or a
+//     SQLite write/read failure.
+func (w *WAL) ReserveMissionDeployment(ctx context.Context, commandID, fingerprint string, payload []byte) (MissionDeploymentRecord, bool, error) {
+	if commandID == "" || fingerprint == "" || len(payload) == 0 {
+		return MissionDeploymentRecord{}, false, errors.New("mission command ID, fingerprint, and payload are required")
+	}
+	now := time.Now().UnixNano()
+	result, err := w.db.ExecContext(ctx, `INSERT OR IGNORE INTO mission_deployments
+		(command_id, payload_fingerprint, command_payload, state, created_at, updated_at)
+		VALUES(?, ?, ?, 'prepared', ?, ?)`, commandID, fingerprint, payload, now, now)
+	if err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("reserve mission deployment: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("inspect mission deployment reservation: %w", err)
+	}
+	record, err := w.LoadMissionDeployment(ctx, commandID)
+	if err != nil {
+		return MissionDeploymentRecord{}, false, err
+	}
+	if record.PayloadFingerprint != fingerprint {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
+	return record, rows == 1, nil
+}
+
+// LoadMissionDeployment returns one durable mission deployment record.
+//
+// Parameters:
+//   - ctx: bounds the SQLite lookup.
+//   - commandID: selects the durable idempotency record.
+//
+// Returns:
+//   - record: owns private copies of the command and result payload bytes.
+//   - error: reports a missing command, cancellation, or a SQLite read failure.
+func (w *WAL) LoadMissionDeployment(ctx context.Context, commandID string) (MissionDeploymentRecord, error) {
+	var record MissionDeploymentRecord
+	err := w.db.QueryRowContext(ctx, `SELECT command_id, payload_fingerprint, command_payload, state,
+		COALESCE(result_payload, X'') FROM mission_deployments WHERE command_id = ?`, commandID).
+		Scan(&record.CommandID, &record.PayloadFingerprint, &record.CommandPayload, &record.State, &record.ResultPayload)
+	if err != nil {
+		return MissionDeploymentRecord{}, fmt.Errorf("load mission deployment: %w", err)
+	}
+	record.CommandPayload = append([]byte(nil), record.CommandPayload...)
+	record.ResultPayload = append([]byte(nil), record.ResultPayload...)
+	return record, nil
+}
+
+// MarkMissionDeploymentEffectStarted commits the write-intent fence before the
+// first MAVLink mission message is handed to the transport.
+//
+// Parameters:
+//   - ctx: bounds the durable state transition.
+//   - commandID: selects the reserved mission command.
+//   - fingerprint: prevents a reused ID from mutating another command row.
+//
+// Returns:
+//   - error: reports identity conflict, cancellation, or a SQLite write failure.
+func (w *WAL) MarkMissionDeploymentEffectStarted(ctx context.Context, commandID, fingerprint string) error {
+	return w.updateMissionDeployment(ctx, commandID, fingerprint, "effect_started", nil)
+}
+
+// StoreMissionDeploymentResult durably records a terminal or uncertain result.
+// uncertain distinguishes a retryable readback-first state from a terminal one.
+//
+// Parameters:
+//   - ctx: bounds the durable state transition.
+//   - commandID: selects the reserved mission command.
+//   - fingerprint: prevents a reused ID from mutating another command row.
+//   - resultPayload: is the deterministic serialized deployment result.
+//   - uncertain: retains a readback-first recovery state when true; false makes
+//     the result terminal and replayable.
+//
+// Returns:
+//   - error: reports invalid result bytes, identity conflict, cancellation, or
+//     a SQLite write failure.
+func (w *WAL) StoreMissionDeploymentResult(ctx context.Context, commandID, fingerprint string, resultPayload []byte, uncertain bool) error {
+	state := "terminal"
+	if uncertain {
+		state = "outcome_unknown"
+	}
+	if len(resultPayload) == 0 {
+		return errors.New("mission deployment result payload is required")
+	}
+	return w.updateMissionDeployment(ctx, commandID, fingerprint, state, resultPayload)
+}
+
+func (w *WAL) updateMissionDeployment(ctx context.Context, commandID, fingerprint, state string, result []byte) error {
+	var allowed string
+	switch state {
+	case "effect_started":
+		allowed = "state = 'prepared'"
+	case "outcome_unknown":
+		allowed = "state IN ('effect_started', 'outcome_unknown')"
+	case "terminal":
+		allowed = "state IN ('prepared', 'effect_started', 'outcome_unknown')"
+	default:
+		return fmt.Errorf("invalid mission deployment state %q", state)
+	}
+	res, err := w.db.ExecContext(ctx, `UPDATE mission_deployments SET state = ?, result_payload = ?, updated_at = ?
+		WHERE command_id = ? AND payload_fingerprint = ? AND `+allowed, state, result, time.Now().UnixNano(), commandID, fingerprint)
+	if err != nil {
+		return fmt.Errorf("update mission deployment: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect mission deployment update: %w", err)
+	}
+	if rows != 1 {
+		var storedFingerprint, storedState string
+		if err := w.db.QueryRowContext(ctx, `SELECT payload_fingerprint, state FROM mission_deployments WHERE command_id = ?`, commandID).
+			Scan(&storedFingerprint, &storedState); err != nil {
+			return fmt.Errorf("load conflicting mission deployment state: %w", err)
+		}
+		if storedFingerprint != fingerprint {
+			return ErrMissionDeploymentConflict
+		}
+		return fmt.Errorf("mission deployment transition %s to %s is not allowed", storedState, state)
+	}
+	return nil
 }
 
 // AppendAsync validates and queues a private copy of a frame for durable

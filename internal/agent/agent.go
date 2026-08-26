@@ -15,6 +15,7 @@ import (
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/bluenviron/gomavlib/v3/pkg/message"
 	"github.com/makinje/aero-arc-agent/internal/identity"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
@@ -57,15 +58,17 @@ type Agent struct {
 	mavlinkDone    chan struct{}
 	cancelWAL      context.CancelFunc
 
-	stateMu          sync.RWMutex
-	sessionID        string
-	operationContext *wal.OperationContext
-	sendMu           sync.Mutex
+	stateMu            sync.RWMutex
+	operationContextMu sync.Mutex
+	sessionID          string
+	operationContext   *wal.OperationContext
+	sendMu             sync.Mutex
 
 	mavlinkMu             sync.Mutex
 	mavlinkTarget         *mavlinkTarget
 	mavlinkHeartbeatSeq   uint64
 	pendingMAVLinkCommand *pendingMAVLinkCommand
+	pendingMissionEvents  chan message.Message
 	aircraftAckAmbiguous  bool
 	// aircraftAckAmbiguousSince starts a transport-quiescence epoch at the
 	// first continuously processed target-channel event after matching ACK
@@ -77,6 +80,8 @@ type Agent struct {
 	aircraftCommandMu         sync.Mutex
 	aircraftCommandActive     bool
 	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
+	writeMAVLinkMessage       func(*gomavlib.Channel, message.Message) error
+	deployMAVLinkMission      func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error)
 	appendTelemetryFrame      func(context.Context, *agentv1.TelemetryFrame) error
 	telemetryDrainTimeout     time.Duration
 
@@ -129,6 +134,9 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, command *common.MessageCommandLong) error {
 		return a.node.WriteMessageTo(channel, command)
 	}
+	a.writeMAVLinkMessage = func(channel *gomavlib.Channel, mavlinkMessage message.Message) error {
+		return a.node.WriteMessageTo(channel, mavlinkMessage)
+	}
 
 	if options.Debug {
 		slog.LogAttrs(context.Background(), slog.LevelInfo, "debug mode enabled, using UDP mavlinkserver")
@@ -144,6 +152,7 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 			Dialect:        common.Dialect,
 		}
 	}
+	a.deployMAVLinkMission = a.executeMAVLinkMissionDeployment
 
 	// Wire default implementations for lifecycle hooks.
 	a.dialFn = a.establishRelayConnection
@@ -689,6 +698,8 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 
 			if command := message.GetAircraftCommand(); command != nil {
 				err = a.dispatchAircraftCommand(commandCtx, stream, command, &commandWG, commandErrors)
+			} else if mission := message.GetDeployMission(); mission != nil {
+				a.dispatchMissionDeployment(commandCtx, stream, mission, &commandWG, commandErrors)
 			} else {
 				err = a.handleRelayMessage(ctx, stream, message)
 			}
@@ -709,16 +720,20 @@ func (a *Agent) handleRelayMessage(ctx context.Context, stream grpc.BidiStreamin
 		return a.handleClearOperationContext(ctx, stream, payload.ClearOperationContext)
 	case *agentv1.RelayStreamMessage_AircraftCommand:
 		return a.handleAircraftCommand(ctx, stream, payload.AircraftCommand)
+	case *agentv1.RelayStreamMessage_DeployMission:
+		return a.handleMissionDeployment(ctx, stream, payload.DeployMission)
 	default:
 		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "relay stream message has no supported payload")
 	}
 }
 
 func (a *Agent) handleSetOperationContext(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.SetOperationContextCommand) error {
+	a.operationContextMu.Lock()
+	defer a.operationContextMu.Unlock()
 	if command.GetCommandId() == "" || command.GetContext() == nil || command.GetContext().GetFlightId() == "" {
 		return a.sendOperationContextAck(stream, command.GetCommandId(), agentv1.OperationContextCommandAck_STATUS_REJECTED, "command_id and flight_id are required")
 	}
-	value := wal.OperationContext{FlightID: command.Context.FlightId, IntentID: command.Context.IntentId, IntentVersion: command.Context.IntentVersion}
+	value := wal.OperationContext{AircraftID: command.Context.AircraftId, FlightID: command.Context.FlightId, IntentID: command.Context.IntentId, IntentVersion: command.Context.IntentVersion}
 	applied, err := a.wal.SetOperationContext(ctx, command.CommandId, value)
 	if err != nil {
 		if errors.Is(err, wal.ErrOperationCommandConflict) {
@@ -749,6 +764,8 @@ func (a *Agent) handleSetOperationContext(ctx context.Context, stream grpc.BidiS
 }
 
 func (a *Agent) handleClearOperationContext(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.ClearOperationContextCommand) error {
+	a.operationContextMu.Lock()
+	defer a.operationContextMu.Unlock()
 	if command.GetCommandId() == "" {
 		return a.sendOperationContextAck(stream, "", agentv1.OperationContextCommandAck_STATUS_REJECTED, "command_id is required")
 	}
@@ -788,7 +805,7 @@ func (a *Agent) sendOperationContextAck(stream grpc.BidiStreamingClient[agentv1.
 	a.stateMu.RLock()
 	var active *agentv1.OperationContext
 	if value := a.operationContext; value != nil {
-		active = &agentv1.OperationContext{FlightId: value.FlightID, IntentId: value.IntentID, IntentVersion: value.IntentVersion}
+		active = &agentv1.OperationContext{AircraftId: value.AircraftID, FlightId: value.FlightID, IntentId: value.IntentID, IntentVersion: value.IntentVersion}
 	}
 	a.stateMu.RUnlock()
 	message := &agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_OperationContextCommandAck{OperationContextCommandAck: &agentv1.OperationContextCommandAck{CommandId: commandID, Status: status, Error: errorMessage, ActiveContext: active}}}

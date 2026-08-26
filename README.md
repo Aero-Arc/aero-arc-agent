@@ -134,6 +134,15 @@ The agent performs three key tasks:
   included in `dropped_total` and logged.
 - Malformed legacy rows and spool files are quarantined so their bytes and
   diagnostics remain available without blocking later valid telemetry.
+- Relay mission deployments use the same durable edge discipline: the Agent
+  fingerprints the immutable command in SQLite, requires an exact active
+  aircraft/flight/intent binding plus fresh disarmed/on-ground MAVLink evidence,
+  uploads with the MAVLink mission protocol, and verifies a canonical onboard
+  readback digest before reporting success. Ambiguous writes are recorded as
+  `OUTCOME_UNKNOWN`; an exact retry reconciles by readback before it may upload
+  again. The ArduPilot adapter keeps wire-sequence-zero HOME outside the
+  canonical plan and normalizes the dynamic `current` cursor bit before digest
+  verification. This slice installs a mission but intentionally does not start it.
 
 ## Configuration
 

@@ -214,7 +214,42 @@ All blocking operations must be cancellable or time-bounded.
 
 ---
 
-## 5. Non-Goals (Explicit)
+## 5. Mission Deployment Invariants
+
+- A deployment command is durably fingerprinted before any MAVLink effect.
+  Reusing its ID with another payload is rejected; an exact terminal retry
+  replays the stored result.
+- Deployment fails closed unless the active operation context exactly matches
+  aircraft, flight, intent, and intent version, and fresh autopilot samples
+  independently show both disarmed and on-ground state.
+- Schema v1 accepts at most 200 contiguous global mission items and only
+  waypoint, takeoff, and land commands. Floating parameters and altitude must
+  be exactly representable as MAVLink `float32`; this keeps deterministic proto
+  and onboard `MISSION_ITEM_INT` readback digests equivalent.
+- Canonical mission items require `current=false`. The Agent normalizes
+  readback `current` to false because ArduPilot derives that bit from the live
+  execution cursor rather than immutable stored mission content.
+- Canonical plans exclude ArduPilot's volatile wire-sequence-zero HOME record.
+  The adapter reads and reuses onboard HOME, shifts canonical items by one for
+  upload, excludes HOME from `uploaded_item_count`, then drops HOME and shifts
+  sequences back before readback digest verification.
+- The first ArduPilot slice accepts canonical global frames `0`, `3`, and `10`,
+  requires `autocontinue=true` and zero command parameters, and requires
+  altitude to round-trip through ArduPilot's centimeter storage. These
+  restrictions reject values the autopilot would silently normalize and thus
+  prevent false readback mismatches.
+- `APPLIED` and `ALREADY_APPLIED` require a complete onboard mission readback
+  whose canonical digest matches the requested plan. An ambiguous handoff,
+  timeout, or incomplete readback is durably `OUTCOME_UNKNOWN`.
+- An uncertain retry always reads the onboard mission first. It reports already
+  applied when the digest matches, and only re-uploads after a complete
+  mismatching readback proves the prior attempt did not install the plan.
+- Mission deployment replaces the stored mission only. It does not arm, start,
+  advance, or complete a flight.
+
+---
+
+## 6. Non-Goals (Explicit)
 
 The following are **not goals** of the Aero Arc Agent v0.1:
 
@@ -226,7 +261,7 @@ The following are **not goals** of the Aero Arc Agent v0.1:
 
 ---
 
-## 6. Invariant Changes
+## 7. Invariant Changes
 
 Any change that violates one or more invariants **must** include:
 
