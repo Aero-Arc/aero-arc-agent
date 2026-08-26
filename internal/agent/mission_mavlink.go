@@ -234,7 +234,7 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 		case event := <-events:
 			switch value := event.(type) {
 			case *common.MessageMissionCount:
-				if value.MissionType != common.MAV_MISSION_TYPE_MISSION || value.Count > maxMissionItems {
+				if value.MissionType != common.MAV_MISSION_TYPE_MISSION || value.Count > maxWireMissionItems {
 					continue
 				}
 				count = int(value.Count)

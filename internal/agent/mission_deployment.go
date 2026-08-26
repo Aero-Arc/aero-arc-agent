@@ -20,6 +20,7 @@ import (
 const (
 	missionSchemaVersion = 1
 	maxMissionItems      = 200
+	maxWireMissionItems  = maxMissionItems + 1 // ArduPilot HOME plus canonical operational items.
 	missionEvidenceTTL   = 3 * time.Second
 )
 
@@ -68,9 +69,12 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 	}
 	if record.State == "terminal" {
 		persisted := &agentv1.MissionDeploymentResult{}
-		if err := proto.Unmarshal(record.ResultPayload, persisted); err == nil {
-			return persisted
+		if err := proto.Unmarshal(record.ResultPayload, persisted); err != nil {
+			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+			result.Message = "durable terminal mission result is corrupt; refusing another MAVLink effect: " + err.Error()
+			return result
 		}
+		return persisted
 	}
 	recovery := !created && (record.State == "effect_started" || record.State == "outcome_unknown")
 	validationTime := time.Now()

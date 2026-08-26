@@ -82,6 +82,30 @@ func TestMissionDeploymentDurablyReplaysTerminalResultAndRejectsIDConflict(t *te
 	}
 }
 
+func TestMissionDeploymentCorruptTerminalResultFailsClosed(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	command := validMissionCommand(t, "corrupt-terminal-1")
+	payload, fingerprint, err := missionCommandIdentity(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.wal.StoreMissionDeploymentResult(context.Background(), command.CommandId, fingerprint, []byte{0xff}, false); err != nil {
+		t.Fatal(err)
+	}
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+		t.Fatal("corrupt terminal result caused another MAVLink effect")
+		return "", 0, nil, nil
+	}
+	result := a.executeMissionDeployment(context.Background(), command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR || !strings.Contains(result.Message, "corrupt") {
+		t.Fatalf("corrupt terminal result = %+v", result)
+	}
+}
+
 func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	a, closeWAL := testMissionAgent(t)
 	defer closeWAL()
@@ -205,6 +229,39 @@ func TestMAVLinkMissionUploadDoesNotAcceptMissingOrMismatchedACK(t *testing.T) {
 	_, uploaded, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false)
 	if !errors.Is(err, errMissionOutcomeUnknown) || uploaded != 1 {
 		t.Fatalf("missing/mismatched ACK result = uploaded %d, err %v", uploaded, err)
+	}
+}
+
+func TestMAVLinkReadbackAcceptsMaximumCanonicalPlanPlusHome(t *testing.T) {
+	plan := &agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: make([]*agentv1.MissionItem, maxMissionItems)}
+	for sequence := range plan.Items {
+		plan.Items[sequence] = &agentv1.MissionItem{Sequence: uint32(sequence), Frame: 3, Command: 16,
+			Autocontinue: true, LatitudeE7: 410000000 + int32(sequence), LongitudeE7: -870000000, AltitudeM: 100}
+	}
+	wantDigest, err := digestMissionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	events := make(chan message.Message, maxWireMissionItems+1)
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: 409999000, LongitudeE7: -869999000, AltitudeM: 200}
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Second}}
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		switch value := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			events <- &common.MessageMissionCount{Count: uint16(maxWireMissionItems), MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			item := home
+			if value.Seq > 0 {
+				item = plan.Items[value.Seq-1]
+			}
+			events <- missionItemINT(target, item, value.Seq)
+		}
+		return nil
+	}
+	gotDigest, err := a.readbackMAVLinkMission(context.Background(), target, events)
+	if err != nil || gotDigest != wantDigest {
+		t.Fatalf("maximum readback digest = %q, %v; want %q", gotDigest, err, wantDigest)
 	}
 }
 
