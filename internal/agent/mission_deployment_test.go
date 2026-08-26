@@ -106,6 +106,31 @@ func TestMissionDeploymentCorruptTerminalResultFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMissionDeploymentRetryableResultHasCompletionTimeWithoutBecomingTerminal(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	a.mavlinkTarget.armed = true
+	command := validMissionCommand(t, "retryable-time-1")
+	var sent *agentv1.MissionDeploymentResult
+	stream := &mockStream{sendFunc: func(message *agentv1.AgentStreamMessage) error {
+		sent = message.GetMissionDeploymentResult()
+		return nil
+	}}
+	if err := a.handleMissionDeployment(context.Background(), stream, command); err != nil {
+		t.Fatal(err)
+	}
+	if sent == nil || sent.Status != agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR || sent.CompletedAtUnixMs <= 0 {
+		t.Fatalf("retryable wire result = %+v", sent)
+	}
+	record, err := a.wal.LoadMissionDeployment(context.Background(), command.CommandId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != "prepared" || len(record.ResultPayload) != 0 {
+		t.Fatalf("retryable result became durable terminal state: %+v", record)
+	}
+}
+
 func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	a, closeWAL := testMissionAgent(t)
 	defer closeWAL()

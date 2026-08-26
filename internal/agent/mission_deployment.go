@@ -31,6 +31,12 @@ var (
 
 func (a *Agent) handleMissionDeployment(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.DeployMissionCommand) error {
 	result := a.executeMissionDeployment(ctx, command)
+	if result.CompletedAtUnixMs == 0 {
+		// Retryable outcomes intentionally remain non-terminal in the durable
+		// journal, but every wire result is a completed Agent attempt and must
+		// carry its own observation time for Relay admission.
+		result.CompletedAtUnixMs = time.Now().UnixMilli()
+	}
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
 	return stream.Send(&agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_MissionDeploymentResult{MissionDeploymentResult: result}})
