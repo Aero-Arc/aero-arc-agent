@@ -798,14 +798,40 @@ func (a *Agent) sendOperationContextAck(stream grpc.BidiStreamingClient[agentv1.
 }
 
 func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAck) error {
+	if ack == nil || ack.GetSeq() == 0 {
+		return fmt.Errorf("%w: ACK and non-zero sequence are required", ErrInvalidTelemetryAck)
+	}
 	slog.LogAttrs(
 		ctx, slog.LevelDebug,
 		"telemetry_ack_received",
 		slog.String("ack", fmt.Sprintf("%+v", ack)),
 	)
 
-	if _, err := a.wal.MarkDelivered(ctx, ack.Seq); err != nil {
-		return fmt.Errorf("failed to mark telemetry ack as delivered: %w", err)
+	var disposition wal.TelemetryAckDisposition
+	switch ack.GetStatus() {
+	case agentv1.TelemetryAck_STATUS_OK:
+		disposition = wal.TelemetryAckDelivered
+	case agentv1.TelemetryAck_STATUS_TEMPORARY_ERROR, agentv1.TelemetryAck_STATUS_RETRY_WITH_BACKOFF:
+		disposition = wal.TelemetryAckRetry
+	case agentv1.TelemetryAck_STATUS_PERMANENT_ERROR:
+		disposition = wal.TelemetryAckPermanentReject
+	default:
+		return fmt.Errorf("%w: unsupported status %d for sequence %d", ErrInvalidTelemetryAck, ack.GetStatus(), ack.GetSeq())
+	}
+	result, err := a.wal.ApplyTelemetryAck(ctx, ack.GetSeq(), ack.GetFrameId(), disposition, ack.GetError())
+	if err != nil {
+		return fmt.Errorf("apply telemetry ACK for sequence %d: %w", ack.GetSeq(), err)
+	}
+	if !result.CorrelatedByFrameID {
+		// The current Relay does not populate frame_id and TelemetryAck has no
+		// wal_id, so deployed peers can only correlate by stream-scoped WAL seq.
+		slog.LogAttrs(ctx, slog.LevelDebug, "telemetry_ack_seq_only", slog.Uint64("seq", ack.GetSeq()))
+	}
+	switch ack.GetStatus() {
+	case agentv1.TelemetryAck_STATUS_TEMPORARY_ERROR, agentv1.TelemetryAck_STATUS_RETRY_WITH_BACKOFF:
+		return fmt.Errorf("%w: sequence %d: %s", ErrTelemetryRetry, ack.GetSeq(), ack.GetError())
+	case agentv1.TelemetryAck_STATUS_PERMANENT_ERROR:
+		return fmt.Errorf("%w: sequence %d quarantined: %s", ErrTelemetryRejected, ack.GetSeq(), ack.GetError())
 	}
 
 	return nil
@@ -836,9 +862,13 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 			continue
 		}
 
-		ids := []uint64{}
+		type outboundFrame struct {
+			message *agentv1.AgentStreamMessage
+		}
+		outbound := make([]outboundFrame, 0, entriesLen)
+		ids := make([]uint64, 0, entriesLen)
 
-		// 2. If data exists, send it
+		// 2. Decode a bounded batch before changing its delivery state.
 		for i := 0; i < entriesLen; i++ {
 			tFrame := &agentv1.TelemetryFrame{}
 			if err := proto.Unmarshal(entries[i].Payload, tFrame); err != nil {
@@ -850,24 +880,39 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 			a.stampCurrentSession(tFrame)
 
 			message := &agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_TelemetryFrame{TelemetryFrame: tFrame}}
+			outbound = append(outbound, outboundFrame{message: message})
+			ids = append(ids, tFrame.Seq)
+		}
+		if len(outbound) == 0 {
+			return errors.New("WAL batch contained no decodable telemetry frames")
+		}
+		// Pending must be durable before Send so a fast ACK cannot be overwritten
+		// by a later pending transition. MarkPendingBatch is all-or-nothing.
+		rows, err := a.wal.MarkPendingBatch(ctx, ids)
+		if err != nil {
+			return fmt.Errorf("mark telemetry batch pending: %w", err)
+		}
+		if rows != int64(len(ids)) {
+			return fmt.Errorf("mark telemetry batch pending: changed %d of %d entries", rows, len(ids))
+		}
+
+		// 3. Send the now-pending batch. A failed stream send returns every entry
+		// that is still pending to written; concurrent ACK terminal states win.
+		for _, frame := range outbound {
 			a.sendMu.Lock()
-			err := stream.Send(message)
+			err := stream.Send(frame.message)
 			a.sendMu.Unlock()
 			if err != nil {
 				slog.LogAttrs(ctx, slog.LevelError, "telemetry_frame_send_error", slog.String("error", err.Error()))
-				break
+				if _, resetErr := a.wal.MarkWrittenBatch(ctx, ids); resetErr != nil {
+					return errors.Join(err, fmt.Errorf("return failed telemetry batch to retry: %w", resetErr))
+				}
+				return err
 			}
 			a.sendCount.Add(1)
-
-			ids = append(ids, tFrame.Seq)
 		}
 
-		if _, err := a.wal.MarkPendingBatch(ctx, ids); err != nil {
-			slog.LogAttrs(ctx, slog.LevelError, "wal_mark_pending_batch_error", slog.String("error", err.Error()))
-			continue
-		}
-
-		slog.LogAttrs(ctx, slog.LevelInfo, "mark_batch_succeed", slog.Int("batch_size", entriesLen))
+		slog.LogAttrs(ctx, slog.LevelInfo, "mark_batch_succeed", slog.Int("batch_size", len(outbound)))
 	}
 }
 

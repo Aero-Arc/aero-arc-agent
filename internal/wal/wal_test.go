@@ -2054,6 +2054,71 @@ func TestWAL_MarkDelivered_Idempotency(t *testing.T) {
 	}
 }
 
+func TestApplyTelemetryAckPermanentlyQuarantinesEvidenceAndIsIdempotent(t *testing.T) {
+	w := mustNewWAL(t)
+	defer w.Close()
+	ctx := context.Background()
+	frame := &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1234, RawMavlink: []byte("evidence")}
+	id, err := w.Append(ctx, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := w.MarkPendingBatch(ctx, []uint64{uint64(id)}); err != nil || rows != 1 {
+		t.Fatalf("MarkPendingBatch() = %d, %v", rows, err)
+	}
+	frameID := "7:agent-1:1234:1"
+	result, err := w.ApplyTelemetryAck(ctx, uint64(id), frameID, TelemetryAckPermanentReject, "normalization rejected payload")
+	if err != nil || !result.Changed || !result.CorrelatedByFrameID || result.PreviousStatus != DeliveryStatusPending {
+		t.Fatalf("ApplyTelemetryAck() = %#v, %v", result, err)
+	}
+	var status DeliveryStatus
+	var reason string
+	var original DeliveryStatus
+	if err = w.db.QueryRowContext(ctx, `SELECT delivery_status, reason, original_delivery_status FROM telemetry_frames JOIN telemetry_frame_quarantine USING(seq) WHERE seq = ?`, id).Scan(&status, &reason, &original); err != nil {
+		t.Fatal(err)
+	}
+	if status != DeliveryStatusQuarantined || reason != "normalization rejected payload" || original != DeliveryStatusPending {
+		t.Fatalf("quarantine = status %d reason %q original %d", status, reason, original)
+	}
+	result, err = w.ApplyTelemetryAck(ctx, uint64(id), frameID, TelemetryAckPermanentReject, "normalization rejected payload")
+	if err != nil || result.Changed {
+		t.Fatalf("duplicate permanent ACK = %#v, %v", result, err)
+	}
+	if _, err = w.ApplyTelemetryAck(ctx, uint64(id), frameID, TelemetryAckDelivered, ""); !errors.Is(err, ErrTelemetryAckConflict) {
+		t.Fatalf("contradictory delivered ACK error = %v", err)
+	}
+}
+
+func TestTelemetryAckMismatchAndPendingBatchConflictDoNotMutateWrongRows(t *testing.T) {
+	w := mustNewWAL(t)
+	defer w.Close()
+	ctx := context.Background()
+	firstID, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.ApplyTelemetryAck(ctx, uint64(firstID), "wrong-frame", TelemetryAckDelivered, ""); !errors.Is(err, ErrTelemetryFrameIdentityMismatch) {
+		t.Fatalf("mismatched frame ID error = %v", err)
+	}
+	if _, err = w.ApplyTelemetryAck(ctx, uint64(secondID+100), "", TelemetryAckDelivered, ""); !errors.Is(err, ErrTelemetryFrameNotFound) {
+		t.Fatalf("unknown sequence error = %v", err)
+	}
+	if rows, err := w.MarkDelivered(ctx, uint64(secondID)); err != nil || rows != 1 {
+		t.Fatalf("prepare delivered row = %d, %v", rows, err)
+	}
+	if rows, err := w.MarkPendingBatch(ctx, []uint64{uint64(firstID), uint64(secondID)}); !errors.Is(err, ErrTelemetryAckConflict) || rows != 0 {
+		t.Fatalf("conflicting pending batch = %d, %v", rows, err)
+	}
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil || len(entries) != 1 || entries[0].ID != firstID {
+		t.Fatalf("all-or-nothing batch mutated rows: entries=%#v err=%v", entries, err)
+	}
+}
+
 func TestWAL_OperationContextPersistsAndCommandsAreIdempotent(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "wal.db")

@@ -39,6 +39,17 @@ const lifecycleShutdownGrace = 5 * time.Second
 // with a different command kind or payload.
 var ErrOperationCommandConflict = errors.New("operation command ID reused with a different payload")
 
+var (
+	// ErrTelemetryFrameNotFound reports an ACK for no durable WAL sequence.
+	ErrTelemetryFrameNotFound = errors.New("telemetry ACK sequence does not exist")
+	// ErrTelemetryFrameIdentityMismatch reports an ACK frame ID that does not
+	// identify the durable payload stored at its sequence.
+	ErrTelemetryFrameIdentityMismatch = errors.New("telemetry ACK frame identity does not match WAL entry")
+	// ErrTelemetryAckConflict reports a status that cannot follow the entry's
+	// current durable delivery state without regressing or discarding evidence.
+	ErrTelemetryAckConflict = errors.New("telemetry ACK conflicts with WAL delivery state")
+)
+
 const (
 	spoolFileMagic           = "AEROARC-SPOOL\x00\x01"
 	spoolIDLength            = 36
@@ -1728,9 +1739,9 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
-// MarkPendingBatch marks already-sent WAL entries as awaiting Relay
-// acknowledgment in one transaction. Individual update failures are logged so
-// remaining entries can still be marked; the returned count is currently zero.
+// MarkPendingBatch atomically reserves written WAL entries for transmission
+// before any network send. Every sequence must still be written or the whole
+// transaction rolls back, preventing a concurrent terminal ACK from regressing.
 //
 // Parameters:
 //   - ctx: contributes its deadline but not its cancellation signal. Without a
@@ -1738,14 +1749,17 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 //   - seqs: identifies the sent WAL entries awaiting acknowledgment.
 //
 // Returns:
-//   - rowsAffected: is currently zero; callers must not use it as a batch count.
-//   - error: reports transaction setup or commit failure.
+//   - rowsAffected: equals len(seqs) after a successful non-empty transition.
+//   - error: reports a missing/non-written sequence, transaction, or commit failure.
 func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
-	return w.updateDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending)
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusWritten, DeliveryStatusPending, true)
 }
 
-func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, status DeliveryStatus) (int64, error) {
-	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq=? AND delivery_status != ?`
+func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, from, to DeliveryStatus, requireAll bool) (int64, error) {
+	if len(seqs) == 0 {
+		return 0, nil
+	}
+	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq=? AND delivery_status = ?`
 	// Detach from stream cancellation so the batch can still commit.
 	baseCtx := context.WithoutCancel(ctx)
 	var txCtx context.Context
@@ -1769,18 +1783,46 @@ func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, stat
 	}
 	defer stmt.Close()
 
+	var rowsAffected int64
 	for _, seq := range seqs {
-		if _, err := stmt.ExecContext(txCtx, status, seq, status); err != nil {
-			slog.Error("failed to update delivery status", "error", err)
-			continue
+		result, err := stmt.ExecContext(txCtx, to, seq, from)
+		if err != nil {
+			return 0, fmt.Errorf("transition telemetry frame %d from %d to %d: %w", seq, from, to, err)
 		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("inspect telemetry frame %d transition: %w", seq, err)
+		}
+		if requireAll && rows != 1 {
+			return 0, fmt.Errorf("%w: sequence %d was not in required status %d", ErrTelemetryAckConflict, seq, from)
+		}
+		rowsAffected += rows
 	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return 0, nil
+	return rowsAffected, nil
+}
+
+// MarkWrittenBatch returns pending entries to the written retry queue without
+// regressing entries concurrently acknowledged as delivered or quarantined.
+//
+// Parameters:
+//   - ctx: contributes its deadline while allowing the transaction to finish
+//     after stream cancellation.
+//   - seqs: identifies entries that may still be pending.
+//
+// Returns:
+//   - rowsAffected: counts pending entries moved back to written.
+//   - error: reports a transaction or SQLite failure.
+func (w *WAL) MarkWrittenBatch(ctx context.Context, seqs []uint64) (int64, error) {
+	rows, err := w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusWritten, false)
+	if err == nil && rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, err
 }
 
 // MarkWritten moves one WAL entry to the written state when its state differs.
@@ -1794,6 +1836,120 @@ func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, stat
 //   - error: reports a SQLite update or context failure.
 func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
+}
+
+// ApplyTelemetryAck atomically correlates one Relay ACK with its durable WAL
+// entry and applies a status-specific monotonic transition. Successful delivery
+// may only consume a pending entry. Retry returns pending evidence to written.
+// Permanent rejection preserves the payload and diagnostic in quarantine.
+// Duplicate ACKs with the same resulting state are idempotent; contradictory
+// late ACKs are rejected without mutating the row.
+//
+// Parameters:
+//   - ctx: controls the SQLite transaction.
+//   - seq: identifies the Agent-local durable WAL row and must be non-zero.
+//   - frameID: when present, must match the deployed Relay v1 identity derived
+//     from the stored Agent ID, capture time, and WAL sequence.
+//   - disposition: selects delivered, retry, or permanent-quarantine handling.
+//   - reason: records Relay diagnostics for a permanent rejection.
+//
+// Returns:
+//   - result: reports prior state, idempotency, and whether frame ID correlation
+//     was available in the ACK.
+//   - error: reports missing/mismatched identity, conflicting state, invalid
+//     disposition, context cancellation, or SQLite failure.
+func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason string) (TelemetryAckResult, error) {
+	if seq == 0 {
+		return TelemetryAckResult{}, fmt.Errorf("%w: sequence is zero", ErrTelemetryFrameNotFound)
+	}
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("begin telemetry ACK transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var payload []byte
+	var current DeliveryStatus
+	if err = tx.QueryRowContext(ctx, `SELECT payload, delivery_status FROM telemetry_frames WHERE seq = ?`, seq).Scan(&payload, &current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d", ErrTelemetryFrameNotFound, seq)
+		}
+		return TelemetryAckResult{}, fmt.Errorf("load telemetry ACK sequence %d: %w", seq, err)
+	}
+	result := TelemetryAckResult{PreviousStatus: current, CorrelatedByFrameID: frameID != ""}
+	if frameID != "" {
+		frame := &agentv1.TelemetryFrame{}
+		if err = proto.Unmarshal(payload, frame); err != nil {
+			return TelemetryAckResult{}, fmt.Errorf("decode telemetry ACK sequence %d: %w", seq, err)
+		}
+		expected := fmt.Sprintf("%d:%s:%d:%d", len(frame.GetAgentId()), frame.GetAgentId(), frame.GetSentAtUnixNs(), seq)
+		if frameID != expected {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d expected %q got %q", ErrTelemetryFrameIdentityMismatch, seq, expected, frameID)
+		}
+	}
+
+	var target DeliveryStatus
+	switch disposition {
+	case TelemetryAckDelivered:
+		target = DeliveryStatusDelivered
+		if current == target {
+			return result, tx.Commit()
+		}
+		if current != DeliveryStatusPending {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d status %d cannot become delivered", ErrTelemetryAckConflict, seq, current)
+		}
+	case TelemetryAckRetry:
+		target = DeliveryStatusWritten
+		if current == target {
+			return result, tx.Commit()
+		}
+		if current != DeliveryStatusPending {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d status %d cannot retry", ErrTelemetryAckConflict, seq, current)
+		}
+	case TelemetryAckPermanentReject:
+		target = DeliveryStatusQuarantined
+		if current == target {
+			return result, tx.Commit()
+		}
+		if current != DeliveryStatusPending {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d status %d cannot be quarantined", ErrTelemetryAckConflict, seq, current)
+		}
+		if reason == "" {
+			reason = "Relay permanently rejected telemetry frame without a diagnostic"
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO telemetry_frame_quarantine(seq, quarantined_at, reason, original_delivery_status) VALUES(?, ?, ?, ?)`, seq, time.Now().UnixNano(), reason, current); err != nil {
+			return TelemetryAckResult{}, fmt.Errorf("quarantine permanently rejected telemetry frame %d: %w", seq, err)
+		}
+	default:
+		return TelemetryAckResult{}, fmt.Errorf("invalid telemetry ACK disposition %d", disposition)
+	}
+
+	update, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ? AND delivery_status = ?`, target, seq, current)
+	if err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("apply telemetry ACK sequence %d: %w", seq, err)
+	}
+	rows, err := update.RowsAffected()
+	if err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("inspect telemetry ACK sequence %d: %w", seq, err)
+	}
+	if rows != 1 {
+		return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d changed concurrently", ErrTelemetryAckConflict, seq)
+	}
+	if err = tx.Commit(); err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("commit telemetry ACK sequence %d: %w", seq, err)
+	}
+	result.Changed = true
+	if target == DeliveryStatusWritten {
+		w.signalDataAvailable()
+	}
+	return result, nil
+}
+
+func (w *WAL) signalDataAvailable() {
+	select {
+	case w.signalChan <- struct{}{}:
+	default:
+	}
 }
 
 // ResetPending resets frames that have been in 'Pending' state for longer than ttl.

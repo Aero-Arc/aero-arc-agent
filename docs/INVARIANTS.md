@@ -45,9 +45,23 @@ Distributed systems favor correctness and durability over strict deduplication g
 
 ### 1.3 ACKs Are the Only Source of Truth for Delivery
 
-- A frame is considered delivered **only** after the relay acknowledges it
+- A frame is considered delivered **only** after the relay acknowledges that
+  exact pending frame with `STATUS_OK`
+- `STATUS_TEMPORARY_ERROR` and `STATUS_RETRY_WITH_BACKOFF` return the frame to
+  the written queue and reconnect through the normal transport backoff
+- `STATUS_PERMANENT_ERROR` never means delivered: the Agent atomically preserves
+  the original payload and Relay diagnostic in durable quarantine
+- ACK transitions are monotonic. A late contradictory ACK must not move a
+  delivered or quarantined row back into the retry queue
 - Pending frames may be retried indefinitely
 - Stuck pending frames may be reset after a TTL and retried
+
+The deployed ACK contract contains `seq` and an optional `frame_id`, but not
+`wal_id`. Current Relay versions omit `frame_id`, so deployed correlation is
+limited to the authenticated stream and Agent-local sequence. When `frame_id`
+is present, the Agent validates it against the durable payload before mutation.
+A future protocol revision must echo `(wal_id, seq)` to make correlation complete
+across WAL generations without relying on stream lifetime.
 
 **Rationale:**  
 The relay is the downstream system of record for delivery confirmation.

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"testing"
@@ -495,42 +496,114 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 	}
 }
 
-func TestHandleTelemetryAck(t *testing.T) {
+func TestHandleTelemetryAckAppliesStatusSpecificDurabilityPolicy(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         agentv1.TelemetryAck_Status
+		wantError      error
+		wantWritten    bool
+		wantQuarantine bool
+	}{
+		{name: "ok is delivered", status: agentv1.TelemetryAck_STATUS_OK},
+		{name: "temporary error retries", status: agentv1.TelemetryAck_STATUS_TEMPORARY_ERROR, wantError: ErrTelemetryRetry, wantWritten: true},
+		{name: "backoff retries", status: agentv1.TelemetryAck_STATUS_RETRY_WITH_BACKOFF, wantError: ErrTelemetryRetry, wantWritten: true},
+		{name: "permanent error quarantines", status: agentv1.TelemetryAck_STATUS_PERMANENT_ERROR, wantError: ErrTelemetryRejected, wantQuarantine: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			w, err := wal.New(ctx, filepath.Join(t.TempDir(), "ack.db"), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = w.Close() })
+			frame := &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1234, RawMavlink: []byte("test")}
+			id, err := w.Append(ctx, frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rows, err := w.MarkPendingBatch(ctx, []uint64{uint64(id)}); err != nil || rows != 1 {
+				t.Fatalf("mark pending = %d, %v", rows, err)
+			}
+			a := &Agent{wal: w}
+			frameID := fmt.Sprintf("%d:%s:%d:%d", len(frame.AgentId), frame.AgentId, frame.SentAtUnixNs, id)
+			err = a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: uint64(id), FrameId: frameID, Status: test.status, Error: "relay diagnostic"})
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("handleTelemetryAck() error = %v, want %v", err, test.wantError)
+			}
+			if test.wantError != nil {
+				err = a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: uint64(id), FrameId: frameID, Status: test.status, Error: "relay diagnostic"})
+				if !errors.Is(err, test.wantError) {
+					t.Fatalf("duplicate status %s error = %v, want %v", test.status, err, test.wantError)
+				}
+			}
+			entries, readErr := w.ReadUndelivered(ctx, 10)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if test.wantWritten != (len(entries) == 1 && entries[0].ID == id) {
+				t.Fatalf("written entries = %#v, wantWritten=%v", entries, test.wantWritten)
+			}
+			if test.wantQuarantine {
+				if deleted, cleanupErr := w.CleanupQuarantined(ctx, 0); cleanupErr != nil || deleted != 1 {
+					t.Fatalf("quarantine cleanup = %d, %v", deleted, cleanupErr)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleTelemetryAckRejectsMissingMismatchedAndConflictingACKs(t *testing.T) {
 	ctx := context.Background()
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_ack.db")
-	w, err := wal.New(context.Background(), dbPath, 0, 0)
-	if err != nil {
-		t.Fatalf("Failed to create WAL: %v", err)
-	}
-	defer w.Close()
-
-	a := &Agent{
-		wal: w,
-	}
-
-	// Add an entry to WAL
-	id, err := w.Append(ctx, &agentv1.TelemetryFrame{RawMavlink: []byte("test")})
+	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "ack-correlation.db"), 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Ack it
-	ack := &agentv1.TelemetryAck{
-		Seq: uint64(id),
+	t.Cleanup(func() { _ = w.Close() })
+	first := &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1234}
+	firstID, err := w.Append(ctx, first)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	if err := a.handleTelemetryAck(ctx, ack); err != nil {
-		t.Fatalf("handleTelemetryAck failed: %v", err)
+	secondID, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 5678})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Verify it is delivered
+	if rows, err := w.MarkPendingBatch(ctx, []uint64{uint64(firstID), uint64(secondID)}); err != nil || rows != 2 {
+		t.Fatalf("mark pending = %d, %v", rows, err)
+	}
+	a := &Agent{wal: w}
+	for _, ack := range []*agentv1.TelemetryAck{nil, {}, {Seq: 0, Status: agentv1.TelemetryAck_STATUS_OK}} {
+		if err := a.handleTelemetryAck(ctx, ack); !errors.Is(err, ErrInvalidTelemetryAck) {
+			t.Fatalf("missing ACK error = %v", err)
+		}
+	}
+	if err := a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: uint64(firstID), FrameId: "wrong", Status: agentv1.TelemetryAck_STATUS_OK}); !errors.Is(err, wal.ErrTelemetryFrameIdentityMismatch) {
+		t.Fatalf("mismatched frame error = %v", err)
+	}
+	if err := a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: uint64(secondID + 100), Status: agentv1.TelemetryAck_STATUS_OK}); !errors.Is(err, wal.ErrTelemetryFrameNotFound) {
+		t.Fatalf("unknown sequence error = %v", err)
+	}
+	if err := a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: uint64(secondID), Status: agentv1.TelemetryAck_Status(99)}); !errors.Is(err, ErrInvalidTelemetryAck) {
+		t.Fatalf("unknown status error = %v", err)
+	}
+	correctFrameID := fmt.Sprintf("%d:%s:%d:%d", len(first.AgentId), first.AgentId, first.SentAtUnixNs, firstID)
+	ok := &agentv1.TelemetryAck{Seq: uint64(firstID), FrameId: correctFrameID, Status: agentv1.TelemetryAck_STATUS_OK}
+	if err := a.handleTelemetryAck(ctx, ok); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.handleTelemetryAck(ctx, ok); err != nil {
+		t.Fatalf("duplicate OK ACK was not idempotent: %v", err)
+	}
+	if err := a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: uint64(firstID), FrameId: correctFrameID, Status: agentv1.TelemetryAck_STATUS_RETRY_WITH_BACKOFF}); !errors.Is(err, wal.ErrTelemetryAckConflict) {
+		t.Fatalf("contradictory late ACK error = %v", err)
+	}
+	if rows, err := w.MarkWrittenBatch(ctx, []uint64{uint64(firstID), uint64(secondID)}); err != nil || rows != 1 {
+		t.Fatalf("pending rows after invalid ACKs = %d, %v; wrong row may have mutated", rows, err)
+	}
 	entries, err := w.ReadUndelivered(ctx, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("Expected 0 undelivered entries, got %d", len(entries))
+	if err != nil || len(entries) != 1 || entries[0].ID != secondID {
+		t.Fatalf("wrong-row mutation check entries = %#v, %v", entries, err)
 	}
 }
 
@@ -838,6 +911,9 @@ func TestHandleRelayMessageDispatchesTelemetryAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if rows, err := w.MarkPendingBatch(ctx, []uint64{uint64(id)}); err != nil || rows != 1 {
+		t.Fatalf("mark pending = %d, %v", rows, err)
+	}
 	a := &Agent{wal: w}
 	message := &agentv1.RelayStreamMessage{Payload: &agentv1.RelayStreamMessage_TelemetryAck{TelemetryAck: &agentv1.TelemetryAck{Seq: uint64(id)}}}
 	if err := a.handleRelayMessage(ctx, &mockStream{}, message); err != nil {
@@ -845,6 +921,69 @@ func TestHandleRelayMessageDispatchesTelemetryAck(t *testing.T) {
 	}
 	if entries, err := w.ReadUndelivered(ctx, 10); err != nil || len(entries) != 0 {
 		t.Fatalf("undelivered after ack = %d, %v", len(entries), err)
+	}
+}
+
+func TestHandleTelemetryFramesMarksPendingBeforeFastACK(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := wal.New(context.Background(), filepath.Join(t.TempDir(), "fast-ack.db"), 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1234, MsgName: "heartbeat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{wal: w, options: &AgentOptions{WALBatchSize: 10}}
+	stream := &mockStream{sendFunc: func(message *agentv1.AgentStreamMessage) error {
+		frame := message.GetTelemetryFrame()
+		if frame == nil || frame.GetSeq() != uint64(id) {
+			t.Fatalf("sent frame = %+v", frame)
+		}
+		if err := a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: frame.GetSeq(), Status: agentv1.TelemetryAck_STATUS_OK}); err != nil {
+			t.Fatalf("fast ACK failed before Send returned: %v", err)
+		}
+		cancel()
+		return nil
+	}}
+	if err := a.handleTelemetryFrames(ctx, stream); !errors.Is(err, context.Canceled) {
+		t.Fatalf("handleTelemetryFrames() error = %v, want cancellation", err)
+	}
+	if rows, err := w.MarkWrittenBatch(context.Background(), []uint64{uint64(id)}); err != nil || rows != 0 {
+		t.Fatalf("delivered frame regressed to retry: rows=%d err=%v", rows, err)
+	}
+	if entries, err := w.ReadUndelivered(context.Background(), 10); err != nil || len(entries) != 0 {
+		t.Fatalf("fast-ACK frame remained undelivered: %#v, %v", entries, err)
+	}
+}
+
+func TestHandleTelemetryFramesSendFailureReturnsOnlyPendingRowsToRetry(t *testing.T) {
+	ctx := context.Background()
+	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "send-failure.db"), 10, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1234, MsgName: "heartbeat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{wal: w, options: &AgentOptions{WALBatchSize: 10}}
+	sendErr := errors.New("stream send failed")
+	stream := &mockStream{sendFunc: func(message *agentv1.AgentStreamMessage) error {
+		if message.GetTelemetryFrame().GetSeq() != uint64(id) {
+			t.Fatalf("sent frame = %+v", message.GetTelemetryFrame())
+		}
+		return sendErr
+	}}
+	if err := a.handleTelemetryFrames(ctx, stream); !errors.Is(err, sendErr) {
+		t.Fatalf("handleTelemetryFrames() error = %v, want send failure", err)
+	}
+	entries, err := w.ReadUndelivered(ctx, 10)
+	if err != nil || len(entries) != 1 || entries[0].ID != id {
+		t.Fatalf("failed-send retry entries = %#v, %v", entries, err)
 	}
 }
 

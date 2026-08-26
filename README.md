@@ -109,6 +109,12 @@ The agent performs three key tasks:
   cursor; already-persisted frames keep their original cursor on retry.
 - Relay ACKs provide at-least-once admission semantics. Retries are expected,
   and end-to-end exactly-once storage is not claimed.
+- Only `STATUS_OK` marks the exact pending WAL row delivered. Retryable ACKs
+  return it to the durable send queue and reconnect with backoff. Permanent
+  rejection moves the payload and Relay diagnostic to durable quarantine for
+  operator inspection instead of silently discarding it or retrying a poison
+  frame forever. ACK mutations are conditional so fast or contradictory ACKs
+  cannot regress a terminal row.
 - `AppendAsync` first transfers an immutable copy into a bounded memory queue.
   The copy becomes crash-durable when its batch reaches SQLite or a synced
   spool file. Graceful shutdown attempts to spool the accepted queue, while an
