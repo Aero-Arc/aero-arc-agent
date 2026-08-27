@@ -221,7 +221,7 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 	}
 	timeout := time.NewTimer(a.aircraftCommandTimeout())
 	defer timeout.Stop()
-	var count int = -1
+	count := -1
 	var nextSequence uint16
 	items := make([]*agentv1.MissionItem, 0)
 	for {

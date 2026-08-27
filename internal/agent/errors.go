@@ -18,8 +18,8 @@ var (
 	ErrGatewayNotInitialized = errors.New("agent gateway client not initialized")
 	ErrFailedToMarkDelivered = errors.New("failed to mark wal entry as delivered")
 	ErrInvalidTelemetryAck   = errors.New("invalid telemetry acknowledgment")
-	ErrTelemetryRetry        = errors.New("Relay requested telemetry retry")
-	ErrTelemetryRejected     = errors.New("Relay permanently rejected telemetry")
+	ErrTelemetryRetry        = errors.New("relay requested telemetry retry")
+	ErrTelemetryRejected     = errors.New("relay permanently rejected telemetry")
 
 	ErrGettingHomeDir = errors.New("error getting user home directory")
 )

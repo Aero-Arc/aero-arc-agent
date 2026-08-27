@@ -2098,7 +2098,11 @@ func TestWAL_MarkDelivered_Idempotency(t *testing.T) {
 
 func TestApplyTelemetryAckPermanentlyQuarantinesEvidenceAndIsIdempotent(t *testing.T) {
 	w := mustNewWAL(t)
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
 	ctx := context.Background()
 	frame := &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1234, RawMavlink: []byte("evidence")}
 	id, err := w.Append(ctx, frame)
@@ -2133,7 +2137,11 @@ func TestApplyTelemetryAckPermanentlyQuarantinesEvidenceAndIsIdempotent(t *testi
 
 func TestTelemetryAckMismatchAndPendingBatchConflictDoNotMutateWrongRows(t *testing.T) {
 	w := mustNewWAL(t)
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
 	ctx := context.Background()
 	firstID, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 100})
 	if err != nil {

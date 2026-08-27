@@ -2052,7 +2052,7 @@ func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string,
 	if err != nil {
 		return TelemetryAckResult{}, fmt.Errorf("begin telemetry ACK transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	var payload []byte
 	var current DeliveryStatus
