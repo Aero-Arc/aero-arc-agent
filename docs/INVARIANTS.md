@@ -222,6 +222,10 @@ All blocking operations must be cancellable or time-bounded.
 - Deployment fails closed unless the active operation context exactly matches
   aircraft, flight, intent, and intent version, and fresh autopilot samples
   independently show both disarmed and on-ground state.
+- If ArduPilot has not streamed fresh `EXTENDED_SYS_STATE`, the Agent issues one
+  target-bound `MAV_CMD_REQUEST_MESSAGE` for message 245 and waits within the
+  command timeout for a newer sample from that exact channel/system/component.
+  Timeout or target movement still fails closed; absence never implies landed.
 - Schema v1 accepts at most 200 contiguous global mission items and only
   waypoint, takeoff, and land commands. Floating parameters and altitude must
   be exactly representable as MAVLink `float32`; this keeps deterministic proto

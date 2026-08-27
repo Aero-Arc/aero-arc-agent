@@ -56,7 +56,7 @@ func TestMissionDeploymentDurablyReplaysTerminalResultAndRejectsIDConflict(t *te
 	a, closeWAL := testMissionAgent(t)
 	defer closeWAL()
 	command := validMissionCommand(t, "mission-1")
-	command.ExpiresAtUnixMs = time.Now().Add(25 * time.Millisecond).UnixMilli()
+	command.ExpiresAtUnixMs = time.Now().Add(500 * time.Millisecond).UnixMilli()
 	digest := command.Binding.MissionDigest
 	calls := 0
 	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
@@ -68,7 +68,7 @@ func TestMissionDeploymentDurablyReplaysTerminalResultAndRejectsIDConflict(t *te
 	if first.Status != agentv1.MissionDeploymentResult_STATUS_APPLIED || calls != 1 {
 		t.Fatalf("first = %v, calls = %d", first.Status, calls)
 	}
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(550 * time.Millisecond)
 	replayed := a.executeMissionDeployment(context.Background(), proto.Clone(command).(*agentv1.DeployMissionCommand))
 	if !proto.Equal(first, replayed) || calls != 1 {
 		t.Fatalf("terminal retry was not replayed: first=%v replayed=%v calls=%d", first, replayed, calls)
@@ -128,6 +128,61 @@ func TestMissionDeploymentRetryableResultHasCompletionTimeWithoutBecomingTermina
 	}
 	if record.State != "prepared" || len(record.ResultPayload) != 0 {
 		t.Fatalf("retryable result became durable terminal state: %+v", record)
+	}
+}
+
+func TestMissionDeploymentAcquiresExplicitOnGroundEvidenceBeforeUpload(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	a.mavlinkTarget.landedState = common.MAV_LANDED_STATE_UNDEFINED
+	a.mavlinkTarget.landedStateAt = time.Time{}
+	command := validMissionCommand(t, "acquire-ground-1")
+	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, request *common.MessageCommandLong) error {
+		if channel != a.mavlinkTarget.channel || request.Command != common.MAV_CMD_REQUEST_MESSAGE ||
+			request.TargetSystem != a.mavlinkTarget.systemID || request.TargetComponent != a.mavlinkTarget.componentID || request.Param1 != 245 {
+			t.Fatalf("unexpected EXTENDED_SYS_STATE request: channel=%p request=%+v", channel, request)
+		}
+		a.observeMAVLinkLandedState(channel, request.TargetSystem, request.TargetComponent, common.MAV_LANDED_STATE_ON_GROUND)
+		return nil
+	}
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+		ack := uint32(common.MAV_MISSION_ACCEPTED)
+		return command.Binding.MissionDigest, 1, &ack, nil
+	}
+	result := a.executeMissionDeployment(context.Background(), command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_APPLIED {
+		t.Fatalf("explicit landed-state acquisition result = %+v", result)
+	}
+}
+
+func TestAcquireFreshLandedStateRejectsWrongTargetAndTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		wrongTarget bool
+	}{
+		{name: "wrong target", wrongTarget: true},
+		{name: "timeout"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now()
+			target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now}
+			a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}}
+			a.writeMAVLinkCommand = func(channel *gomavlib.Channel, request *common.MessageCommandLong) error {
+				if request.Command != common.MAV_CMD_REQUEST_MESSAGE || request.Param1 != 245 {
+					t.Fatalf("request = %+v", request)
+				}
+				if test.wrongTarget {
+					a.observeMAVLinkLandedState(channel, 2, request.TargetComponent, common.MAV_LANDED_STATE_ON_GROUND)
+				}
+				return nil
+			}
+			if _, err := a.acquireFreshLandedState(context.Background(), target); err == nil || !strings.Contains(err.Error(), "timed out") {
+				t.Fatalf("acquireFreshLandedState() error = %v", err)
+			}
+			if a.mavlinkTarget.landedStateSequence != 0 {
+				t.Fatal("wrong-target EXTENDED_SYS_STATE updated selected target")
+			}
+		})
 	}
 }
 

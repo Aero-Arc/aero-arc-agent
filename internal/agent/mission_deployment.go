@@ -12,6 +12,7 @@ import (
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -163,7 +164,23 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 	}
 
 	now = time.Now()
-	if target.armed || target.landedState != 1 || target.landedStateAt.IsZero() || now.Sub(target.landedStateAt) > missionEvidenceTTL {
+	if target.armed {
+		result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+		result.Message = "fresh authoritative MAVLink evidence must show the aircraft disarmed"
+		return result
+	}
+	if target.landedStateAt.IsZero() || now.Sub(target.landedStateAt) > missionEvidenceTTL {
+		var acquisitionErr error
+		target, acquisitionErr = a.acquireFreshLandedState(ctx, target)
+		if acquisitionErr != nil {
+			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+			result.Message = "acquire authoritative on-ground evidence: " + acquisitionErr.Error()
+			return result
+		}
+	}
+	now = time.Now()
+	if target.armed || target.heartbeatAt.IsZero() || now.Sub(target.heartbeatAt) > missionEvidenceTTL ||
+		target.landedState != common.MAV_LANDED_STATE_ON_GROUND || target.landedStateAt.IsZero() || now.Sub(target.landedStateAt) > missionEvidenceTTL {
 		result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
 		result.Message = "fresh authoritative MAVLink evidence must show the aircraft disarmed and on ground"
 		return result
@@ -196,6 +213,43 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
 		result.Message = err.Error()
 		return result
+	}
+}
+
+func (a *Agent) acquireFreshLandedState(ctx context.Context, expected *mavlinkTarget) (*mavlinkTarget, error) {
+	if expected == nil || expected.channel == nil || a.writeMAVLinkCommand == nil {
+		return nil, errors.New("MAVLink request-message transport is unavailable")
+	}
+	baseline := expected.landedStateSequence
+	request := &common.MessageCommandLong{
+		TargetSystem: expected.systemID, TargetComponent: expected.componentID,
+		Command: common.MAV_CMD_REQUEST_MESSAGE, Param1: float32((&common.MessageExtendedSysState{}).GetID()),
+	}
+	if err := a.writeMAVLinkCommand(expected.channel, request); err != nil {
+		return nil, fmt.Errorf("request EXTENDED_SYS_STATE: %w", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, a.aircraftCommandTimeout())
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		a.mavlinkMu.Lock()
+		current := a.mavlinkTarget
+		if current == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID {
+			a.mavlinkMu.Unlock()
+			return nil, errors.New("selected autopilot target changed while awaiting EXTENDED_SYS_STATE")
+		}
+		if current.landedStateSequence > baseline {
+			result := *current
+			a.mavlinkMu.Unlock()
+			return &result, nil
+		}
+		a.mavlinkMu.Unlock()
+		select {
+		case <-waitCtx.Done():
+			return nil, fmt.Errorf("timed out awaiting matching EXTENDED_SYS_STATE: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 

@@ -21,14 +21,15 @@ const (
 )
 
 type mavlinkTarget struct {
-	channel           *gomavlib.Channel
-	systemID          uint8
-	componentID       uint8
-	heartbeatSequence uint64
-	armed             bool
-	heartbeatAt       time.Time
-	landedState       common.MAV_LANDED_STATE
-	landedStateAt     time.Time
+	channel             *gomavlib.Channel
+	systemID            uint8
+	componentID         uint8
+	heartbeatSequence   uint64
+	armed               bool
+	heartbeatAt         time.Time
+	landedState         common.MAV_LANDED_STATE
+	landedStateAt       time.Time
+	landedStateSequence uint64
 }
 
 type mavlinkCommandAck struct {
@@ -94,8 +95,10 @@ func (a *Agent) observeMAVLinkLandedState(channel *gomavlib.Channel, systemID, c
 	a.mavlinkMu.Lock()
 	defer a.mavlinkMu.Unlock()
 	if target := a.mavlinkTarget; target != nil && target.channel == channel && target.systemID == systemID && target.componentID == componentID {
+		a.mavlinkLandedStateSeq++
 		target.landedState = state
 		target.landedStateAt = time.Now()
+		target.landedStateSequence = a.mavlinkLandedStateSeq
 	}
 }
 
@@ -155,6 +158,7 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	if !targetChanged {
 		updated.landedState = previous.landedState
 		updated.landedStateAt = previous.landedStateAt
+		updated.landedStateSequence = previous.landedStateSequence
 	}
 	a.mavlinkTarget = updated
 	pending := a.pendingMAVLinkCommand

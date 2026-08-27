@@ -67,6 +67,7 @@ type Agent struct {
 	mavlinkMu             sync.Mutex
 	mavlinkTarget         *mavlinkTarget
 	mavlinkHeartbeatSeq   uint64
+	mavlinkLandedStateSeq uint64
 	pendingMAVLinkCommand *pendingMAVLinkCommand
 	pendingMissionEvents  chan message.Message
 	aircraftAckAmbiguous  bool
