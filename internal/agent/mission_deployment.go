@@ -306,8 +306,8 @@ func validateMissionCommand(command *agentv1.DeployMissionCommand, now time.Time
 		if !item.Autocontinue {
 			return nil, "", fmt.Errorf("mission item %d autocontinue must be true for the ArduPilot canonical adapter", i)
 		}
-		if item.Param1 != 0 || item.Param2 != 0 || item.Param3 != 0 || item.Param4 != 0 {
-			return nil, "", fmt.Errorf("mission item %d parameters must be zero in the first ArduPilot canonical slice", i)
+		if !canonicalMissionParameters(item) {
+			return nil, "", fmt.Errorf("mission item %d parameters do not match the ArduPilot canonical values for command %d", i, item.Command)
 		}
 		for _, value := range []float64{item.Param1, item.Param2, item.Param3, item.Param4, item.AltitudeM} {
 			if math.IsNaN(value) || math.IsInf(value, 0) || float64(float32(value)) != value {
@@ -316,6 +316,9 @@ func validateMissionCommand(command *agentv1.DeployMissionCommand, now time.Time
 		}
 		if item.LatitudeE7 < -900000000 || item.LatitudeE7 > 900000000 || item.LongitudeE7 < -1800000000 || item.LongitudeE7 > 1800000000 {
 			return nil, "", fmt.Errorf("mission item %d coordinates are out of range", i)
+		}
+		if !legacyCoordinateRoundTrips(item.LatitudeE7) || !legacyCoordinateRoundTrips(item.LongitudeE7) {
+			return nil, "", fmt.Errorf("mission item %d coordinates do not round-trip through ArduPilot legacy MISSION_ITEM float32 storage", i)
 		}
 		altitudeCM := math.Round(item.AltitudeM * 100)
 		if altitudeCM < -8388608 || altitudeCM > 8388607 || float32(altitudeCM/100) != float32(item.AltitudeM) {
@@ -336,6 +339,20 @@ func validateMissionCommand(command *agentv1.DeployMissionCommand, now time.Time
 	}
 	fingerprint := sha256.Sum256(payload)
 	return payload, hex.EncodeToString(fingerprint[:]), nil
+}
+
+func canonicalMissionParameters(item *agentv1.MissionItem) bool {
+	if item == nil || !positiveZero(item.Param1) || !positiveZero(item.Param2) || !positiveZero(item.Param3) {
+		return false
+	}
+	if item.Command == uint32(common.MAV_CMD_NAV_LAND) {
+		return item.Param4 == 1
+	}
+	return positiveZero(item.Param4)
+}
+
+func positiveZero(value float64) bool {
+	return value == 0 && !math.Signbit(value)
 }
 
 func missionCommandIdentity(command *agentv1.DeployMissionCommand) ([]byte, string, error) {

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -281,9 +280,9 @@ func missionItemINT(target *mavlinkTarget, item *agentv1.MissionItem, wireSequen
 }
 
 func missionItemLegacy(target *mavlinkTarget, item *agentv1.MissionItem, wireSequence uint16) (*common.MessageMissionItem, error) {
-	latitude := float32(float64(item.LatitudeE7) / 1e7)
-	longitude := float32(float64(item.LongitudeE7) / 1e7)
-	if int32(math.Round(float64(latitude)*1e7)) != item.LatitudeE7 || int32(math.Round(float64(longitude)*1e7)) != item.LongitudeE7 {
+	latitude := float32(item.LatitudeE7) / float32(1e7)
+	longitude := float32(item.LongitudeE7) / float32(1e7)
+	if int32(latitude*float32(1e7)) != item.LatitudeE7 || int32(longitude*float32(1e7)) != item.LongitudeE7 {
 		return nil, errors.New("legacy MISSION_ITEM request cannot preserve canonical coordinates; MISSION_REQUEST_INT is required")
 	}
 	return &common.MessageMissionItem{TargetSystem: target.systemID, TargetComponent: target.componentID,
@@ -291,6 +290,11 @@ func missionItemLegacy(target *mavlinkTarget, item *agentv1.MissionItem, wireSeq
 		Current: 0, Autocontinue: boolByte(item.Autocontinue), Param1: float32(item.Param1),
 		Param2: float32(item.Param2), Param3: float32(item.Param3), Param4: float32(item.Param4),
 		X: latitude, Y: longitude, Z: float32(item.AltitudeM), MissionType: common.MAV_MISSION_TYPE_MISSION}, nil
+}
+
+func legacyCoordinateRoundTrips(coordinateE7 int32) bool {
+	degrees := float32(coordinateE7) / float32(1e7)
+	return int32(degrees*float32(1e7)) == coordinateE7
 }
 
 func protoMissionItem(item *common.MessageMissionItemInt) *agentv1.MissionItem {

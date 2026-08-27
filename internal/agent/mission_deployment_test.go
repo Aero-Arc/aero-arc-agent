@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -36,6 +37,51 @@ func TestMissionCurrentBitIsRejectedAndReadbackNormalized(t *testing.T) {
 	readback := protoMissionItem(&common.MessageMissionItemInt{Current: 1})
 	if readback.Current {
 		t.Fatal("dynamic autopilot current bit entered canonical readback")
+	}
+}
+
+func TestCanonicalLandRequiresArduPilotReadbackParam4(t *testing.T) {
+	command := validMissionCommand(t, "land-param-1")
+	command.Plan.Items[0].Command = uint32(common.MAV_CMD_NAV_LAND)
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err == nil || !strings.Contains(err.Error(), "canonical values") {
+		t.Fatalf("LAND param4=0 validation error = %v", err)
+	}
+	command.Plan.Items[0].Param4 = 1
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err != nil {
+		t.Fatalf("LAND param4=1 rejected: %v", err)
+	}
+}
+
+func TestCanonicalMissionParametersRejectNegativeZero(t *testing.T) {
+	command := validMissionCommand(t, "negative-zero-1")
+	command.Plan.Items[0].Param1 = math.Copysign(0, -1)
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err == nil || !strings.Contains(err.Error(), "canonical values") {
+		t.Fatalf("negative zero validation error = %v", err)
+	}
+}
+
+func TestLegacyCoordinateRoundTripUsesArduPilotFloat32Storage(t *testing.T) {
+	const latitudeE7 int32 = -353632608
+	const longitudeE7 int32 = 1491652352
+	if !legacyCoordinateRoundTrips(latitudeE7) || !legacyCoordinateRoundTrips(longitudeE7) {
+		t.Fatal("known Canberra coordinates did not pass legacy float32 round-trip")
+	}
+	if legacyCoordinateRoundTrips(latitudeE7 + 1) {
+		t.Fatal("non-lossless adjacent latitude passed legacy float32 round-trip")
+	}
+	target := &mavlinkTarget{systemID: 1, componentID: 1}
+	legacy, err := missionItemLegacy(target, &agentv1.MissionItem{LatitudeE7: latitudeE7, LongitudeE7: longitudeE7}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored := int32(legacy.X * float32(1e7)); stored != latitudeE7 {
+		t.Fatalf("stored latitude = %d, want %d", stored, latitudeE7)
+	}
+	if _, err := missionItemLegacy(target, &agentv1.MissionItem{LatitudeE7: latitudeE7 + 1, LongitudeE7: longitudeE7}, 1); err == nil {
+		t.Fatal("non-lossless legacy coordinate was accepted")
 	}
 }
 
@@ -215,13 +261,13 @@ func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 func TestMAVLinkMissionUploadRequiresACKAndCanonicalReadback(t *testing.T) {
 	command := validMissionCommand(t, "protocol-1")
 	command.Plan.Items = append(command.Plan.Items, &agentv1.MissionItem{Sequence: 1, Frame: 3, Command: 16,
-		Autocontinue: true, LatitudeE7: 410001000, LongitudeE7: -870001000, AltitudeM: 110})
+		Autocontinue: true, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 110})
 	setMissionDigest(t, command)
 	now := time.Now()
 	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
 		landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
 	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: time.Second}}
-	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: 409999000, LongitudeE7: -869999000, AltitudeM: 200}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 200}
 	uploadResponses := 0
 	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
 		a.mavlinkMu.Lock()
@@ -278,7 +324,7 @@ func TestMAVLinkMissionUploadDoesNotAcceptMissingOrMismatchedACK(t *testing.T) {
 	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
 		landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
 	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}}
-	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: 409999000, LongitudeE7: -869999000, AltitudeM: 200}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 200}
 	uploadResponses := 0
 	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
 		a.mavlinkMu.Lock()
@@ -324,7 +370,7 @@ func TestMAVLinkReadbackAcceptsMaximumCanonicalPlanPlusHome(t *testing.T) {
 	}
 	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
 	events := make(chan message.Message, maxWireMissionItems+1)
-	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: 409999000, LongitudeE7: -869999000, AltitudeM: 200}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 200}
 	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Second}}
 	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
 		switch value := outbound.(type) {
@@ -375,7 +421,7 @@ func validMissionCommand(t *testing.T, commandID string) *agentv1.DeployMissionC
 		Binding: &agentv1.MissionBinding{MissionId: "mission-1", MissionVersion: 1, DeploymentId: "deployment-1",
 			OperatorId: "operator-1", AircraftId: "aircraft-1", FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 1},
 		Plan: &agentv1.MissionPlan{SchemaVersion: 1, Items: []*agentv1.MissionItem{{Sequence: 0, Frame: 3,
-			Command: 16, Autocontinue: true, LatitudeE7: 410000000, LongitudeE7: -870000000, AltitudeM: 100}}},
+			Command: 16, Autocontinue: true, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 100}}},
 	}
 	setMissionDigest(t, command)
 	return command

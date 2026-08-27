@@ -238,10 +238,11 @@ All blocking operations must be cancellable or time-bounded.
   upload, excludes HOME from `uploaded_item_count`, then drops HOME and shifts
   sequences back before readback digest verification.
 - The first ArduPilot slice accepts canonical global frames `0`, `3`, and `10`,
-  requires `autocontinue=true` and zero command parameters, and requires
-  altitude to round-trip through ArduPilot's centimeter storage. These
-  restrictions reject values the autopilot would silently normalize and thus
-  prevent false readback mismatches.
+  requires `autocontinue=true`, positive-zero parameters except LAND param4
+  exactly `+1`, and altitude that round-trips through ArduPilot centimeter
+  storage. Coordinates must survive ArduPilot's legacy float32 degrees-to-E7
+  multiplication exactly. These restrictions reject values the autopilot would
+  silently normalize and thus prevent false readback mismatches.
 - `APPLIED` and `ALREADY_APPLIED` require a complete onboard mission readback
   whose canonical digest matches the requested plan. An ambiguous handoff,
   timeout, or incomplete readback is durably `OUTCOME_UNKNOWN`.
