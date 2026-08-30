@@ -205,12 +205,12 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 	if recovery {
 		digest, _, _, readbackErr := a.deployMAVLinkMission(ctx, target, command.Plan, true, command.ExpiresAtUnixMs)
 		result.OnboardMissionDigest = digest
-		if readbackErr != nil {
+		if readbackErr != nil && !errors.Is(readbackErr, errOnboardMismatch) {
 			result.Status = agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN
 			result.Message = readbackErr.Error()
 			return a.persistMissionResult(ctx, fingerprint, result, true)
 		}
-		if digest == command.Binding.MissionDigest {
+		if readbackErr == nil && digest == command.Binding.MissionDigest {
 			result.Status = agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED
 			result.Message = "uncertain deployment reconciled by verified onboard mission readback"
 			return a.persistMissionResult(ctx, fingerprint, result, false)

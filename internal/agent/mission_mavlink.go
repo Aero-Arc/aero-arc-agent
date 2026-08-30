@@ -87,6 +87,9 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	if readbackOnly {
 		digest, err := a.readbackMAVLinkMission(ctx, target, events)
 		if err != nil {
+			if errors.Is(err, errOnboardMismatch) {
+				return digest, 0, nil, err
+			}
 			return digest, 0, nil, fmt.Errorf("%w: reconcile uncertain deployment: %v", errMissionOutcomeUnknown, err)
 		}
 		return digest, 0, nil, nil
@@ -188,6 +191,9 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				}
 				digest, err := a.readbackMAVLinkMission(ctx, target, events)
 				if err != nil {
+					if errors.Is(err, errOnboardMismatch) {
+						return digest, uploaded, ackType, err
+					}
 					return digest, uploaded, ackType, fmt.Errorf("%w: post-upload readback: %v", errMissionOutcomeUnknown, err)
 				}
 				return digest, uploaded, ackType, nil
@@ -258,16 +264,20 @@ func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, 
 				if !countReceived || value.MissionType != common.MAV_MISSION_TYPE_MISSION || value.Seq != 0 {
 					continue
 				}
-				if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionAck{
-					TargetSystem: target.systemID, TargetComponent: target.componentID,
-					Type: common.MAV_MISSION_OPERATION_CANCELLED, MissionType: common.MAV_MISSION_TYPE_MISSION,
-				}); err != nil {
+				if err := a.cancelMissionReadback(target); err != nil {
 					return nil, fmt.Errorf("cancel HOME-only mission readback: %w", err)
 				}
 				return protoMissionItem(value), nil
 			}
 		}
 	}
+}
+
+func (a *Agent) cancelMissionReadback(target *mavlinkTarget) error {
+	return a.writeMAVLinkMessage(target.channel, &common.MessageMissionAck{
+		TargetSystem: target.systemID, TargetComponent: target.componentID,
+		Type: common.MAV_MISSION_OPERATION_CANCELLED, MissionType: common.MAV_MISSION_TYPE_MISSION,
+	})
 }
 
 func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) ([]*agentv1.MissionItem, error) {
@@ -290,8 +300,14 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 		case event := <-events:
 			switch value := event.(type) {
 			case *common.MessageMissionCount:
-				if value.MissionType != common.MAV_MISSION_TYPE_MISSION || value.Count > maxWireMissionItems {
+				if value.MissionType != common.MAV_MISSION_TYPE_MISSION {
 					continue
+				}
+				if value.Count > maxWireMissionItems {
+					if err := a.cancelMissionReadback(target); err != nil {
+						return nil, fmt.Errorf("cancel oversized mission readback: %w", err)
+					}
+					return nil, fmt.Errorf("%w: onboard wire item count %d exceeds canonical maximum %d", errOnboardMismatch, value.Count, maxWireMissionItems)
 				}
 				count = int(value.Count)
 				nextSequence = 0
