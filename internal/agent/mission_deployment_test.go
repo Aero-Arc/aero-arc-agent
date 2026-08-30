@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -552,6 +553,46 @@ func TestMAVLinkReadbackAcceptsMaximumCanonicalPlanPlusHome(t *testing.T) {
 	gotDigest, err := a.readbackMAVLinkMission(context.Background(), target, events)
 	if err != nil || gotDigest != wantDigest {
 		t.Fatalf("maximum readback digest = %q, %v; want %q", gotDigest, err, wantDigest)
+	}
+}
+
+func TestMAVLinkReadbackRestartsAfterRepeatedMissionCount(t *testing.T) {
+	plan := &agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: []*agentv1.MissionItem{
+		{Sequence: 0, Frame: 0, Command: 16, Autocontinue: true, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 110},
+		{Sequence: 1, Frame: 0, Command: 16, Autocontinue: true, LatitudeE7: -353632708, LongitudeE7: 1491652452, AltitudeM: 120},
+	}}
+	wantDigest, err := digestMissionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
+	events := make(chan message.Message, 8)
+	events <- &common.MessageMissionCount{Count: 3, MissionType: common.MAV_MISSION_TYPE_MISSION}
+	events <- missionItemINT(target, home, 0)
+	// ArduPilot may restart the transfer after partial progress. An item queued
+	// for the old epoch must not advance the restarted transfer or leave holes.
+	events <- &common.MessageMissionCount{Count: 3, MissionType: common.MAV_MISSION_TYPE_MISSION}
+	events <- missionItemINT(target, plan.Items[0], 1)
+	events <- missionItemINT(target, home, 0)
+	events <- missionItemINT(target, plan.Items[0], 1)
+	events <- missionItemINT(target, plan.Items[1], 2)
+
+	requested := make([]uint16, 0, 5)
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Second}}
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		if request, ok := outbound.(*common.MessageMissionRequestInt); ok {
+			requested = append(requested, request.Seq)
+		}
+		return nil
+	}
+	gotDigest, err := a.readbackMAVLinkMission(context.Background(), target, events)
+	if err != nil || gotDigest != wantDigest {
+		t.Fatalf("restarted readback digest = %q, %v; want %q", gotDigest, err, wantDigest)
+	}
+	wantRequested := []uint16{0, 1, 0, 1, 2}
+	if !slices.Equal(requested, wantRequested) {
+		t.Fatalf("requested sequences = %v, want %v", requested, wantRequested)
 	}
 }
 

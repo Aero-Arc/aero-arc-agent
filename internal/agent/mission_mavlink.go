@@ -251,6 +251,7 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 					continue
 				}
 				count = int(value.Count)
+				nextSequence = 0
 				items = make([]*agentv1.MissionItem, count)
 				if count == 0 {
 					return items, nil
