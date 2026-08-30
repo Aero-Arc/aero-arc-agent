@@ -34,6 +34,10 @@ var (
 
 func (a *Agent) handleMissionDeployment(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.DeployMissionCommand) error {
 	result := a.executeMissionDeployment(ctx, command)
+	return a.sendMissionDeploymentResult(stream, result)
+}
+
+func (a *Agent) sendMissionDeploymentResult(stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], result *agentv1.MissionDeploymentResult) error {
 	if result.CompletedAtUnixMs == 0 {
 		// Retryable outcomes intentionally remain non-terminal in the durable
 		// journal, but every wire result is a completed Agent attempt and must
@@ -45,10 +49,17 @@ func (a *Agent) handleMissionDeployment(ctx context.Context, stream grpc.BidiStr
 	return stream.Send(&agentv1.AgentStreamMessage{Payload: &agentv1.AgentStreamMessage_MissionDeploymentResult{MissionDeploymentResult: result}})
 }
 
-func (a *Agent) dispatchMissionDeployment(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.DeployMissionCommand, wg *sync.WaitGroup, errorC chan<- error) {
+func (a *Agent) dispatchMissionDeployment(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], command *agentv1.DeployMissionCommand, wg *sync.WaitGroup, errorC chan<- error) error {
+	if !a.tryBeginMissionDeployment() {
+		result := newMissionResult(command)
+		result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+		result.Message = "another mission deployment is already in progress"
+		return a.sendMissionDeploymentResult(stream, result)
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer a.endMissionDeployment()
 		if err := a.handleMissionDeployment(ctx, stream, command); err != nil {
 			select {
 			case errorC <- err:
@@ -56,6 +67,23 @@ func (a *Agent) dispatchMissionDeployment(ctx context.Context, stream grpc.BidiS
 			}
 		}
 	}()
+	return nil
+}
+
+func (a *Agent) tryBeginMissionDeployment() bool {
+	a.missionDeploymentMu.Lock()
+	defer a.missionDeploymentMu.Unlock()
+	if a.missionDeploymentActive {
+		return false
+	}
+	a.missionDeploymentActive = true
+	return true
+}
+
+func (a *Agent) endMissionDeployment() {
+	a.missionDeploymentMu.Lock()
+	a.missionDeploymentActive = false
+	a.missionDeploymentMu.Unlock()
 }
 
 func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.DeployMissionCommand) *agentv1.MissionDeploymentResult {

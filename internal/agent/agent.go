@@ -94,6 +94,8 @@ type Agent struct {
 	aircraftAckLastProgressAt time.Time
 	aircraftCommandMu         sync.Mutex
 	aircraftCommandActive     bool
+	missionDeploymentMu       sync.Mutex
+	missionDeploymentActive   bool
 	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
 	writeMAVLinkMessage       func(*gomavlib.Channel, message.Message) error
 	deployMAVLinkMission      func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error)
@@ -718,7 +720,7 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 			if command := message.GetAircraftCommand(); command != nil {
 				err = a.dispatchAircraftCommand(commandCtx, stream, command, &commandWG, commandErrors)
 			} else if mission := message.GetDeployMission(); mission != nil {
-				a.dispatchMissionDeployment(commandCtx, stream, mission, &commandWG, commandErrors)
+				err = a.dispatchMissionDeployment(commandCtx, stream, mission, &commandWG, commandErrors)
 			} else {
 				err = a.handleRelayMessage(ctx, stream, message)
 			}

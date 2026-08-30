@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"path/filepath"
 	"slices"
@@ -21,6 +23,50 @@ import (
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestRunAckLoopBoundsMissionDeploymentBurstWhileBusy(t *testing.T) {
+	const commandCount = 64
+	a := &Agent{}
+	if !a.tryBeginMissionDeployment() {
+		t.Fatal("failed to establish active mission deployment")
+	}
+	defer a.endMissionDeployment()
+	var receives atomic.Int32
+	var sends atomic.Int32
+	stream := &mockStream{
+		recvFunc: func() (*agentv1.RelayStreamMessage, error) {
+			call := receives.Add(1)
+			if call > commandCount {
+				return nil, io.EOF
+			}
+			return &agentv1.RelayStreamMessage{Payload: &agentv1.RelayStreamMessage_DeployMission{
+				DeployMission: &agentv1.DeployMissionCommand{CommandId: fmt.Sprintf("burst-%d", call)},
+			}}, nil
+		},
+		sendFunc: func(message *agentv1.AgentStreamMessage) error {
+			result := message.GetMissionDeploymentResult()
+			if result.GetStatus() != agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR ||
+				!strings.Contains(result.GetMessage(), "already in progress") {
+				t.Fatalf("busy mission result = %+v", result)
+			}
+			sends.Add(1)
+			return nil
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.runAckLoop(context.Background(), stream) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("runAckLoop() error = %v, want EOF", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("busy mission burst left queued workers during ACK-loop teardown")
+	}
+	if got := sends.Load(); got != commandCount {
+		t.Fatalf("busy mission results = %d, want %d", got, commandCount)
+	}
+}
 
 func TestMissionProtocolEventsRemainBoundToTransactionTarget(t *testing.T) {
 	oldChannel := &gomavlib.Channel{}
