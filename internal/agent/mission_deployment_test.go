@@ -7,6 +7,7 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -303,6 +304,51 @@ func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	}
 }
 
+func TestConcurrentExactMissionRetryReloadsTerminalStateAfterLock(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	command := validMissionCommand(t, "concurrent-exact-1")
+	deploymentStarted := make(chan struct{}, 2)
+	releaseDeployment := make(chan struct{})
+	var calls atomic.Int32
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+		calls.Add(1)
+		deploymentStarted <- struct{}{}
+		<-releaseDeployment
+		ack := uint32(common.MAV_MISSION_ACCEPTED)
+		return command.Binding.MissionDigest, 1, &ack, nil
+	}
+	firstResult := make(chan *agentv1.MissionDeploymentResult, 1)
+	go func() { firstResult <- a.executeMissionDeployment(context.Background(), command) }()
+	select {
+	case <-deploymentStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first deployment did not reach MAVLink")
+	}
+	secondResult := make(chan *agentv1.MissionDeploymentResult, 1)
+	go func() {
+		secondResult <- a.executeMissionDeployment(context.Background(), proto.Clone(command).(*agentv1.DeployMissionCommand))
+	}()
+	// The first invocation owns operationContextMu while blocked in MAVLink. Give
+	// the exact retry time to load effect_started and wait on that lock.
+	time.Sleep(20 * time.Millisecond)
+	close(releaseDeployment)
+	var first, second *agentv1.MissionDeploymentResult
+	select {
+	case first = <-firstResult:
+	case <-time.After(time.Second):
+		t.Fatal("first deployment did not finish")
+	}
+	select {
+	case second = <-secondResult:
+	case <-time.After(time.Second):
+		t.Fatal("exact concurrent retry did not finish")
+	}
+	if first.GetStatus() != agentv1.MissionDeploymentResult_STATUS_APPLIED || !proto.Equal(first, second) || calls.Load() != 1 {
+		t.Fatalf("concurrent results first=%+v second=%+v MAVLink calls=%d", first, second, calls.Load())
+	}
+}
+
 func TestMissionDeploymentFirstSeenExpiredIsRejectedWithoutAdmissionOrEffect(t *testing.T) {
 	a, closeWAL := testMissionAgent(t)
 	defer closeWAL()
@@ -390,6 +436,9 @@ func TestMAVLinkMissionUploadRequiresACKAndCanonicalReadback(t *testing.T) {
 		a.mavlinkMu.Unlock()
 		switch value := outbound.(type) {
 		case *common.MessageMissionCount:
+			// A late accepted ACK from an older upload must not end this
+			// transaction before its own full wire list was handed off.
+			events <- &common.MessageMissionAck{Type: common.MAV_MISSION_ACCEPTED, MissionType: common.MAV_MISSION_TYPE_MISSION}
 			// MAVLink permits retries and does not promise request order. Resend
 			// duplicates, but report only unique uploaded sequences to Relay.
 			events <- &common.MessageMissionRequestInt{Seq: 2, MissionType: common.MAV_MISSION_TYPE_MISSION}

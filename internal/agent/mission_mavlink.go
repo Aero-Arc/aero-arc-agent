@@ -111,6 +111,8 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	}
 	uploaded := uint32(0)
 	uploadedSequences := make([]bool, len(plan.Items))
+	handedOffSequences := make([]bool, len(plan.Items)+1)
+	handedOffCount := 0
 	var ackType *uint32
 	deadline := time.NewTimer(a.aircraftCommandTimeout())
 	defer deadline.Stop()
@@ -136,6 +138,10 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if err := a.writeMAVLinkMessage(target.channel, missionItemINT(target, item, request.Seq)); err != nil {
 					return "", uploaded, ackType, fmt.Errorf("%w: hand off MISSION_ITEM_INT: %v", errMissionOutcomeUnknown, err)
 				}
+				if !handedOffSequences[request.Seq] {
+					handedOffSequences[request.Seq] = true
+					handedOffCount++
+				}
 				if request.Seq > 0 && !uploadedSequences[request.Seq-1] {
 					uploadedSequences[request.Seq-1] = true
 					uploaded++
@@ -158,12 +164,22 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if err := a.writeMAVLinkMessage(target.channel, legacyItem); err != nil {
 					return "", uploaded, ackType, fmt.Errorf("%w: hand off legacy MISSION_ITEM: %v", errMissionOutcomeUnknown, err)
 				}
+				if !handedOffSequences[request.Seq] {
+					handedOffSequences[request.Seq] = true
+					handedOffCount++
+				}
 				if request.Seq > 0 && !uploadedSequences[request.Seq-1] {
 					uploadedSequences[request.Seq-1] = true
 					uploaded++
 				}
 			case *common.MessageMissionAck:
 				if request.MissionType != common.MAV_MISSION_TYPE_MISSION {
+					continue
+				}
+				if request.Type == common.MAV_MISSION_ACCEPTED && handedOffCount != len(handedOffSequences) {
+					// An accepted ACK buffered from an older timed-out upload is
+					// indistinguishable by transaction ID. Do not let it end the
+					// current epoch until this epoch handed off every wire item.
 					continue
 				}
 				value := uint32(request.Type)

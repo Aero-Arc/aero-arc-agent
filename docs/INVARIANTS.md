@@ -244,6 +244,10 @@ All blocking operations must be cancellable or time-bounded.
   The adapter reads and reuses onboard HOME, shifts canonical items by one for
   upload, excludes HOME from `uploaded_item_count`, then drops HOME and shifts
   sequences back before readback digest verification.
+- An accepted mission ACK can end an upload epoch only after that epoch handed
+  off every requested wire item, including HOME. An accepted ACK buffered from
+  an older timed-out upload must not trigger premature readback or a terminal
+  mismatch for a partially replaced list.
 - The first ArduPilot slice requires `autocontinue=true`, positive-zero
   parameters except LAND param4 exactly `+1`, and float32 altitude that
   round-trips bit-for-bit through ArduPilot signed-centimeter storage. Canonical

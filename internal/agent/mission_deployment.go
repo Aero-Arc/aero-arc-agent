@@ -92,6 +92,38 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		return persisted
 	}
 
+	// Holding the operation-context lock makes the exact binding fence stable
+	// from first admission through any new aircraft effect and verified success.
+	// Terminal replay and recovery readback above remain effect-free exemptions.
+	a.operationContextMu.Lock()
+	defer a.operationContextMu.Unlock()
+
+	// Another exact invocation may have completed while this one waited for the
+	// deployment/context lock. Reload before evaluating expiry or effect state so
+	// a waiter replays the committed terminal outcome instead of continuing from
+	// stale prepared/effect_started evidence.
+	record, loadErr = a.wal.LoadMissionDeployment(ctx, command.CommandId)
+	found = loadErr == nil
+	if loadErr != nil && !errors.Is(loadErr, sql.ErrNoRows) {
+		result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+		result.Message = loadErr.Error()
+		return result
+	}
+	if found && record.PayloadFingerprint != fingerprint {
+		result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
+		result.Message = wal.ErrMissionDeploymentConflict.Error()
+		return result
+	}
+	if found && record.State == "terminal" {
+		persisted := &agentv1.MissionDeploymentResult{}
+		if err := proto.Unmarshal(record.ResultPayload, persisted); err != nil {
+			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+			result.Message = "durable terminal mission result is corrupt; refusing another MAVLink effect: " + err.Error()
+			return result
+		}
+		return persisted
+	}
+
 	recovery := found && (record.State == "effect_started" || record.State == "outcome_unknown")
 	_, _, validationErr := validateMissionCommandAt(command, time.Now(), recovery)
 	if validationErr != nil {
@@ -103,11 +135,6 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		return result
 	}
 
-	// Holding the operation-context lock makes the exact binding fence stable
-	// from first admission through any new aircraft effect and verified success.
-	// Terminal replay and recovery readback above remain effect-free exemptions.
-	a.operationContextMu.Lock()
-	defer a.operationContextMu.Unlock()
 	a.stateMu.RLock()
 	active := a.operationContext
 	var contextCopy wal.OperationContext
