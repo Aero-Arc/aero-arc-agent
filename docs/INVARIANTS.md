@@ -56,6 +56,9 @@ Distributed systems favor correctness and durability over strict deduplication g
 - Pending frames may be retried indefinitely. Their TTL starts from a durable
   written-to-pending send epoch, never from the frame's capture time, because
   replayed telemetry can be old while its current send is still active.
+- Batch senders reserve each row immediately before its own network Send.
+  Cleanup cannot reset rows while a live batch owns them, and successful batch
+  completion renews the ACK window for every row that remains pending.
 - Stream teardown waits for ACK handling to quiesce, then immediately returns
   every still-pending peer to written. Status-conditional updates preserve
   terminal ACKs that already committed. If a worker misses the bounded

@@ -87,9 +87,10 @@ type Agent struct {
 	appendTelemetryFrame      func(context.Context, *agentv1.TelemetryFrame) error
 	telemetryDrainTimeout     time.Duration
 
-	ingestCount        atomic.Uint64
-	sendCount          atomic.Uint64
-	telemetryDropCount atomic.Uint64
+	ingestCount          atomic.Uint64
+	sendCount            atomic.Uint64
+	telemetryDropCount   atomic.Uint64
+	telemetryBatchActive atomic.Int32
 }
 
 // NewAgent constructs an Agent and its MAVLink endpoint from runtime options.
@@ -216,7 +217,7 @@ func (a *Agent) Start(ctx context.Context) (startErr error) {
 
 				// Reset stuck pending frames (e.g. 5 minute TTL)
 				// This handles cases where a frame was marked pending but we never got an ACK or crashed.
-				if _, err := a.wal.ResetPending(ctx, 5*time.Minute); err != nil {
+				if _, err := a.resetStuckPending(ctx, 5*time.Minute); err != nil {
 					slog.LogAttrs(ctx, slog.LevelError, "wal_reset_pending_failed", slog.String("error", err.Error()))
 				}
 			}
@@ -905,34 +906,61 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		if len(outbound) == 0 {
 			return errors.New("WAL batch contained no decodable telemetry frames")
 		}
-		// Pending must be durable before Send so a fast ACK cannot be overwritten
-		// by a later pending transition. MarkPendingBatch is all-or-nothing.
-		rows, err := a.wal.MarkPendingBatch(ctx, ids)
-		if err != nil {
-			return fmt.Errorf("mark telemetry batch pending: %w", err)
-		}
-		if rows != int64(len(ids)) {
-			return fmt.Errorf("mark telemetry batch pending: changed %d of %d entries", rows, len(ids))
-		}
-
-		// 3. Send the now-pending batch. A failed stream send returns every entry
-		// that is still pending to written; concurrent ACK terminal states win.
-		for _, frame := range outbound {
+		// 3. Reserve each frame immediately before its Send. This preserves the
+		// fast-ACK ordering fence without aging not-yet-sent peers while gRPC flow
+		// control blocks an earlier frame. The active counter prevents cleanup from
+		// stealing a stream-owned pending row during a long Send.
+		a.telemetryBatchActive.Add(1)
+		sentIDs := make([]uint64, 0, len(ids))
+		var batchErr error
+		for index, frame := range outbound {
+			rows, markErr := a.wal.MarkPendingBatch(ctx, []uint64{ids[index]})
+			if markErr != nil || rows != 1 {
+				if markErr == nil {
+					markErr = fmt.Errorf("changed %d of 1 entries", rows)
+				}
+				batchErr = fmt.Errorf("mark telemetry frame %d pending: %w", ids[index], markErr)
+				break
+			}
+			sentIDs = append(sentIDs, ids[index])
 			a.sendMu.Lock()
 			err := stream.Send(frame.message)
 			a.sendMu.Unlock()
 			if err != nil {
 				slog.LogAttrs(ctx, slog.LevelError, "telemetry_frame_send_error", slog.String("error", err.Error()))
-				if _, resetErr := a.wal.MarkWrittenBatch(ctx, ids); resetErr != nil {
-					return errors.Join(err, fmt.Errorf("return failed telemetry batch to retry: %w", resetErr))
-				}
-				return err
+				batchErr = err
+				break
 			}
 			a.sendCount.Add(1)
+		}
+		if batchErr == nil {
+			// Give every unacknowledged row a full post-batch ACK window. Terminal
+			// ACKs that raced the refresh are excluded by the pending predicate.
+			if _, refreshErr := a.wal.RefreshPendingBatch(ctx, sentIDs); refreshErr != nil {
+				batchErr = fmt.Errorf("refresh telemetry batch pending epochs: %w", refreshErr)
+			}
+		}
+		if batchErr != nil {
+			// Return only rows that this sender actually reserved. Later peers are
+			// still written, while concurrent terminal ACK states win.
+			if _, resetErr := a.wal.MarkWrittenBatch(ctx, sentIDs); resetErr != nil {
+				batchErr = errors.Join(batchErr, fmt.Errorf("return failed telemetry batch to retry: %w", resetErr))
+			}
+		}
+		a.telemetryBatchActive.Add(-1)
+		if batchErr != nil {
+			return batchErr
 		}
 
 		slog.LogAttrs(ctx, slog.LevelInfo, "mark_batch_succeed", slog.Int("batch_size", len(outbound)))
 	}
+}
+
+func (a *Agent) resetStuckPending(ctx context.Context, ttl time.Duration) (int64, error) {
+	if a.telemetryBatchActive.Load() > 0 {
+		return 0, nil
+	}
+	return a.wal.ResetPending(ctx, ttl)
 }
 
 func (a *Agent) stampWALGeneration(frame *agentv1.TelemetryFrame) {

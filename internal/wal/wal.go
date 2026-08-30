@@ -2019,6 +2019,13 @@ func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error
 	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusWritten, DeliveryStatusPending, true)
 }
 
+// RefreshPendingBatch renews the durable send epoch for entries that remain
+// pending after a stream sender finishes its batch. Concurrent terminal ACKs
+// are excluded by the pending-state predicate and never regress.
+func (w *WAL) RefreshPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false)
+}
+
 func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, from, to DeliveryStatus, requireAll bool) (int64, error) {
 	if len(seqs) == 0 {
 		return 0, nil

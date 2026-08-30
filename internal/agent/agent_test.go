@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -630,6 +631,78 @@ func TestRunWithReconnectRemainsSupervisedAfterWorkerTeardownTimeout(t *testing.
 		}
 	case <-time.After(time.Second):
 		t.Fatal("runWithReconnect did not stop after supervised reconnect cancellation")
+	}
+}
+
+func TestTelemetryBatchReservesPerSendAndCleanupPreservesActiveOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	w, err := wal.New(context.Background(), filepath.Join(t.TempDir(), "per-send-pending.db"), 2, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = w.Close()
+	})
+	ids := make([]uint64, 2)
+	for index := range ids {
+		id, err := w.Append(context.Background(), &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[index] = uint64(id)
+	}
+
+	a := &Agent{options: &AgentOptions{WALBatchSize: 2}, wal: w}
+	firstSendStarted := make(chan struct{})
+	releaseFirstSend := make(chan struct{})
+	var sendCount atomic.Int32
+	stream := &mockStream{sendFunc: func(*agentv1.AgentStreamMessage) error {
+		if sendCount.Add(1) == 1 {
+			close(firstSendStarted)
+			<-releaseFirstSend
+		}
+		return nil
+	}}
+	errC := make(chan error, 1)
+	go func() { errC <- a.handleTelemetryFrames(ctx, stream) }()
+	select {
+	case <-firstSendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first telemetry Send did not start")
+	}
+	entries, err := w.ReadUndelivered(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || uint64(entries[0].ID) != ids[1] {
+		t.Fatalf("queue while first Send is blocked = %#v, want only unsent sequence %d", entries, ids[1])
+	}
+	if rows, err := a.resetStuckPending(context.Background(), time.Nanosecond); err != nil || rows != 0 {
+		t.Fatalf("cleanup during active Send = %d, %v", rows, err)
+	}
+	if err := a.handleTelemetryAck(context.Background(), &agentv1.TelemetryAck{Seq: ids[0], Status: agentv1.TelemetryAck_STATUS_OK}); err != nil {
+		t.Fatalf("fast exact ACK during Send = %v", err)
+	}
+	close(releaseFirstSend)
+	deadline := time.Now().Add(time.Second)
+	for a.telemetryBatchActive.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if a.telemetryBatchActive.Load() != 0 || sendCount.Load() != 2 {
+		t.Fatalf("batch did not finish: active=%d sends=%d", a.telemetryBatchActive.Load(), sendCount.Load())
+	}
+	if err := a.handleTelemetryAck(context.Background(), &agentv1.TelemetryAck{Seq: ids[1], Status: agentv1.TelemetryAck_STATUS_OK}); err != nil {
+		t.Fatalf("second exact ACK after batch refresh = %v", err)
+	}
+	cancel()
+	select {
+	case err := <-errC:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("handleTelemetryFrames() error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("telemetry sender did not stop")
 	}
 }
 

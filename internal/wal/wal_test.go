@@ -2261,6 +2261,49 @@ func TestResetPendingUsesDurableSendEpochInsteadOfCaptureAge(t *testing.T) {
 	}
 }
 
+func TestRefreshPendingBatchRenewsOnlyLivePendingRows(t *testing.T) {
+	w := mustNewWAL(t)
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+	ctx := context.Background()
+	ids := make([]uint64, 2)
+	for index := range ids {
+		id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[index] = uint64(id)
+	}
+	if rows, err := w.MarkPendingBatch(ctx, ids); err != nil || rows != 2 {
+		t.Fatalf("MarkPendingBatch() = %d, %v", rows, err)
+	}
+	oldEpoch := time.Now().Add(-time.Hour).UnixNano()
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET pending_since_unix_ns = ? WHERE seq IN (?, ?)`, oldEpoch, ids[0], ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.ApplyTelemetryAck(ctx, ids[0], "", TelemetryAckDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := w.RefreshPendingBatch(ctx, ids); err != nil || rows != 1 {
+		t.Fatalf("RefreshPendingBatch() = %d, %v", rows, err)
+	}
+	var deliveredStatus DeliveryStatus
+	var pendingStatus DeliveryStatus
+	var refreshedEpoch int64
+	if err := w.db.QueryRowContext(ctx, `SELECT delivery_status FROM telemetry_frames WHERE seq = ?`, ids[0]).Scan(&deliveredStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT delivery_status, pending_since_unix_ns FROM telemetry_frames WHERE seq = ?`, ids[1]).Scan(&pendingStatus, &refreshedEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if deliveredStatus != DeliveryStatusDelivered || pendingStatus != DeliveryStatusPending || refreshedEpoch <= oldEpoch {
+		t.Fatalf("refresh states = delivered %d pending %d epoch %d, want delivered/pending and epoch > %d", deliveredStatus, pendingStatus, refreshedEpoch, oldEpoch)
+	}
+}
+
 func TestResetPendingAndTeardownRequeueClearEpochWithoutRegressingTerminalACKs(t *testing.T) {
 	w := mustNewWAL(t)
 	defer func() {
