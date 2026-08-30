@@ -148,8 +148,13 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if request.MissionType != common.MAV_MISSION_TYPE_MISSION || int(request.Seq) > len(plan.Items) {
 					continue
 				}
+				stopMissionResponseTimer(idle)
+				target, err = a.refreshMissionUploadSafetyEvidence(ctx, target)
+				if err != nil {
+					return "", uploaded, ackType, fmt.Errorf("%w: refresh upload safety evidence: %v", errMissionOutcomeUnknown, err)
+				}
 				resetMissionResponseTimer(idle, responseTimeout)
-				if err := a.ensureMissionUploadSafe(target); err != nil {
+				if err = a.ensureMissionUploadSafe(target); err != nil {
 					return "", uploaded, ackType, fmt.Errorf("%w: %v", errMissionOutcomeUnknown, err)
 				}
 				item := home
@@ -171,8 +176,13 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if request.MissionType != common.MAV_MISSION_TYPE_MISSION || int(request.Seq) > len(plan.Items) {
 					continue
 				}
+				stopMissionResponseTimer(idle)
+				target, err = a.refreshMissionUploadSafetyEvidence(ctx, target)
+				if err != nil {
+					return "", uploaded, ackType, fmt.Errorf("%w: refresh upload safety evidence: %v", errMissionOutcomeUnknown, err)
+				}
 				resetMissionResponseTimer(idle, responseTimeout)
-				if err := a.ensureMissionUploadSafe(target); err != nil {
+				if err = a.ensureMissionUploadSafe(target); err != nil {
 					return "", uploaded, ackType, fmt.Errorf("%w: %v", errMissionOutcomeUnknown, err)
 				}
 				item := home
@@ -342,13 +352,17 @@ func (a *Agent) cancelMissionReadback(target *mavlinkTarget) error {
 }
 
 func resetMissionResponseTimer(timer *time.Timer, timeout time.Duration) {
+	stopMissionResponseTimer(timer)
+	timer.Reset(timeout)
+}
+
+func stopMissionResponseTimer(timer *time.Timer) {
 	if !timer.Stop() {
 		select {
 		case <-timer.C:
 		default:
 		}
 	}
-	timer.Reset(timeout)
 }
 
 // beginMissionReadbackEpoch terminates any earlier download and requires one

@@ -2472,6 +2472,26 @@ func (w *WAL) RequeuePendingOwner(ctx context.Context, owner string) (int64, err
 //     signaled for retry.
 //   - error: reports a SQLite row-count, update, or context failure.
 func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error) {
+	return w.ResetPendingExcludingOwners(ctx, ttl, nil)
+}
+
+// ResetPendingExcludingOwners returns expired pending entries to written while
+// preserving every row owned by a currently active stream sender. This lets a
+// wedged old sender remain fenced without disabling recovery for later streams.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the SQLite update.
+//   - ttl: is the maximum pending age; a non-positive duration is a successful
+//     no-op.
+//   - activeOwners: lists non-empty stream tokens whose pending rows must remain
+//     untouched; an empty slice applies normal TTL recovery to every owner.
+//
+// Returns:
+//   - rowsAffected: counts expired, non-excluded entries returned to written and
+//     signaled for retry.
+//   - error: reports an empty owner token, SQLite row-count or update failure,
+//     or context cancellation.
+func (w *WAL) ResetPendingExcludingOwners(ctx context.Context, ttl time.Duration, activeOwners []string) (int64, error) {
 	if ttl <= 0 {
 		return 0, nil
 	}
@@ -2482,10 +2502,24 @@ func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error
 	UPDATE telemetry_frames 
 	SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
 	WHERE delivery_status = ? 
-	AND pending_since_unix_ns < ?
-	`
+	AND pending_since_unix_ns < ?`
+	args := []any{DeliveryStatusWritten, DeliveryStatusPending, cutoff}
+	if len(activeOwners) > 0 {
+		query += ` AND (pending_owner IS NULL OR pending_owner NOT IN (`
+		for index, owner := range activeOwners {
+			if owner == "" {
+				return 0, errors.New("active telemetry pending owner is empty")
+			}
+			if index > 0 {
+				query += `, `
+			}
+			query += `?`
+			args = append(args, owner)
+		}
+		query += `))`
+	}
 
-	res, err := w.db.ExecContext(ctx, query, DeliveryStatusWritten, DeliveryStatusPending, cutoff)
+	res, err := w.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to reset pending frames: %w", err)
 	}

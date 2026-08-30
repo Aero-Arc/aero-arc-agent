@@ -563,6 +563,15 @@ func TestMAVLinkLargeMissionUsesIdleResponseTimeout(t *testing.T) {
 	const responseTimeout = 15 * time.Millisecond
 	const responseDelay = 2 * time.Millisecond
 	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: responseTimeout}}
+	landedRefreshes := 0
+	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, request *common.MessageCommandLong) error {
+		if channel != target.channel || request.Command != common.MAV_CMD_REQUEST_MESSAGE || request.Param1 != 245 {
+			t.Fatalf("landed-state refresh request = channel %p command %v param1 %v", channel, request.Command, request.Param1)
+		}
+		landedRefreshes++
+		a.observeMAVLinkLandedState(channel, target.systemID, target.componentID, common.MAV_LANDED_STATE_ON_GROUND)
+		return nil
+	}
 	home := &agentv1.MissionItem{Frame: 0, Command: 16, Autocontinue: true,
 		LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
 	listRequests := 0
@@ -589,6 +598,12 @@ func TestMAVLinkLargeMissionUsesIdleResponseTimeout(t *testing.T) {
 			events <- missionItemINT(target, item, value.Seq)
 		case *common.MessageMissionItemInt:
 			time.Sleep(responseDelay)
+			if int(value.Seq) == maxMissionItems/2 {
+				a.mavlinkMu.Lock()
+				a.mavlinkTarget.heartbeatAt = time.Now()
+				a.mavlinkTarget.landedStateAt = time.Now().Add(-missionEvidenceTTL - time.Second)
+				a.mavlinkMu.Unlock()
+			}
 			if int(value.Seq) < maxMissionItems {
 				events <- &common.MessageMissionRequestInt{Seq: value.Seq + 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
 			} else {
@@ -604,6 +619,9 @@ func TestMAVLinkLargeMissionUsesIdleResponseTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed <= responseTimeout*2 {
 		t.Fatalf("large mission completed in %v; test did not exceed former one-shot timeout", elapsed)
+	}
+	if landedRefreshes != 1 {
+		t.Fatalf("landed-state refreshes during slow upload = %d, want 1", landedRefreshes)
 	}
 }
 

@@ -706,6 +706,46 @@ func TestTelemetryBatchReservesPerSendAndCleanupPreservesActiveOwnership(t *test
 	}
 }
 
+func TestStaleTelemetrySenderDoesNotSuppressLaterOwnerCleanup(t *testing.T) {
+	w, err := wal.New(context.Background(), filepath.Join(t.TempDir(), "owner-scoped-cleanup.db"), 2, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	ids := make([]uint64, 2)
+	for index := range ids {
+		id, appendErr := w.Append(context.Background(), &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if appendErr != nil {
+			t.Fatal(appendErr)
+		}
+		ids[index] = uint64(id)
+	}
+	if rows, markErr := w.MarkPendingBatchOwned(context.Background(), ids[:1], "wedged-old-stream"); markErr != nil || rows != 1 {
+		t.Fatalf("reserve old stream row = %d, %v", rows, markErr)
+	}
+	if rows, markErr := w.MarkPendingBatchOwned(context.Background(), ids[1:], "healthy-new-stream"); markErr != nil || rows != 1 {
+		t.Fatalf("reserve new stream row = %d, %v", rows, markErr)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	a := &Agent{wal: w}
+	a.beginTelemetryBatch("wedged-old-stream")
+	defer a.endTelemetryBatch("wedged-old-stream")
+	if rows, cleanupErr := a.resetStuckPending(context.Background(), time.Millisecond); cleanupErr != nil || rows != 1 {
+		t.Fatalf("owner-scoped cleanup = %d, %v; want only later stream row", rows, cleanupErr)
+	}
+	entries, readErr := w.ReadUndelivered(context.Background(), 10)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 || uint64(entries[0].ID) != ids[1] {
+		t.Fatalf("retry queue after owner-scoped cleanup = %#v, want sequence %d", entries, ids[1])
+	}
+	if _, ackErr := w.ApplyTelemetryAckOwned(context.Background(), ids[0], "", wal.TelemetryAckDelivered, "", "wedged-old-stream"); ackErr != nil {
+		t.Fatalf("old sender exact ACK after later cleanup = %v", ackErr)
+	}
+}
+
 func TestHandleTelemetryAckAppliesStatusSpecificDurabilityPolicy(t *testing.T) {
 	tests := []struct {
 		name           string

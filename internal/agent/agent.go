@@ -104,6 +104,9 @@ type Agent struct {
 	sendCount            atomic.Uint64
 	telemetryDropCount   atomic.Uint64
 	telemetryBatchActive atomic.Int32
+	telemetryBatchMu     sync.Mutex
+	telemetryBatchOwners map[string]int
+	telemetryBatchLegacy int
 }
 
 // NewAgent constructs an Agent and its MAVLink endpoint from runtime options.
@@ -928,9 +931,9 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		}
 		// 3. Reserve each frame immediately before its Send. This preserves the
 		// fast-ACK ordering fence without aging not-yet-sent peers while gRPC flow
-		// control blocks an earlier frame. The active counter prevents cleanup from
-		// stealing a stream-owned pending row during a long Send.
-		a.telemetryBatchActive.Add(1)
+		// control blocks an earlier frame. Active owner tracking prevents cleanup
+		// from stealing this stream's rows without suppressing recovery for peers.
+		a.beginTelemetryBatch(owner)
 		sentIDs := make([]uint64, 0, len(ids))
 		var batchErr error
 		for index, frame := range outbound {
@@ -985,7 +988,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				batchErr = errors.Join(batchErr, fmt.Errorf("return failed telemetry batch to retry: %w", resetErr))
 			}
 		}
-		a.telemetryBatchActive.Add(-1)
+		a.endTelemetryBatch(owner)
 		if batchErr != nil {
 			return batchErr
 		}
@@ -995,10 +998,43 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 }
 
 func (a *Agent) resetStuckPending(ctx context.Context, ttl time.Duration) (int64, error) {
-	if a.telemetryBatchActive.Load() > 0 {
+	a.telemetryBatchMu.Lock()
+	defer a.telemetryBatchMu.Unlock()
+	if a.telemetryBatchLegacy > 0 {
 		return 0, nil
 	}
-	return a.wal.ResetPending(ctx, ttl)
+	owners := make([]string, 0, len(a.telemetryBatchOwners))
+	for owner := range a.telemetryBatchOwners {
+		owners = append(owners, owner)
+	}
+	return a.wal.ResetPendingExcludingOwners(ctx, ttl, owners)
+}
+
+func (a *Agent) beginTelemetryBatch(owner string) {
+	a.telemetryBatchMu.Lock()
+	defer a.telemetryBatchMu.Unlock()
+	if owner == "" {
+		a.telemetryBatchLegacy++
+	} else {
+		if a.telemetryBatchOwners == nil {
+			a.telemetryBatchOwners = make(map[string]int)
+		}
+		a.telemetryBatchOwners[owner]++
+	}
+	a.telemetryBatchActive.Add(1)
+}
+
+func (a *Agent) endTelemetryBatch(owner string) {
+	a.telemetryBatchMu.Lock()
+	defer a.telemetryBatchMu.Unlock()
+	if owner == "" {
+		a.telemetryBatchLegacy--
+	} else if active := a.telemetryBatchOwners[owner]; active <= 1 {
+		delete(a.telemetryBatchOwners, owner)
+	} else {
+		a.telemetryBatchOwners[owner] = active - 1
+	}
+	a.telemetryBatchActive.Add(-1)
 }
 
 func (a *Agent) stampWALGeneration(frame *agentv1.TelemetryFrame) {

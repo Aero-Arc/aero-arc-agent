@@ -65,7 +65,9 @@ Distributed systems favor correctness and durability over strict deduplication g
   fenced by an older timed-out sender. Status-conditional updates preserve
   terminal ACKs that already committed. If a worker misses the bounded teardown
   deadline, its rows remain fenced, but the supervised transport loop continues
-  backoff and reconnect instead of silently ending Relay activity.
+  backoff and reconnect instead of silently ending Relay activity. TTL cleanup
+  excludes only owners with a currently active send; one wedged old sender does
+  not suppress recovery of expired pending rows owned by later streams.
 
 The deployed ACK contract contains `seq` and an optional `frame_id`, but not
 `wal_id`. Current Relay versions omit `frame_id`, so deployed correlation is
@@ -276,7 +278,10 @@ All blocking operations must be cancellable or time-bounded.
 - Because the readback quiet window may outlive one-shot landed evidence, the
   Agent snapshots the exact selected target again after HOME acquisition and
   explicitly reacquires `EXTENDED_SYS_STATE` when needed before the upload
-  safety and expiry fences.
+  safety and expiry fences. Every valid item request repeats that exact-target,
+  fresh-heartbeat, disarmed, and on-ground fence before handing off the item;
+  a progressing long upload reacquires one-shot landed evidence whenever it
+  ages out instead of either assuming safety or failing permanently on staleness.
 - The first ArduPilot slice requires `autocontinue=true`, positive-zero
   parameters except LAND param4 exactly `+1`, and float32 altitude that
   round-trips bit-for-bit through ArduPilot signed-centimeter storage. Canonical
