@@ -91,14 +91,10 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 		}
 		return digest, 0, nil, nil
 	}
-	wireItems, err := a.readbackMAVLinkWireMission(ctx, target, events)
+	home, err := a.readbackMAVLinkHome(ctx, target, events)
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("pre-upload HOME readback: %w", err)
 	}
-	if len(wireItems) == 0 {
-		return "", 0, nil, errors.New("pre-upload readback omitted ArduPilot HOME at wire sequence 0")
-	}
-	home := wireItems[0]
 
 	if err := a.ensureMissionUploadSafe(target); err != nil {
 		return "", 0, nil, err
@@ -228,6 +224,50 @@ func (a *Agent) readbackMAVLinkMission(ctx context.Context, target *mavlinkTarge
 		canonical = append(canonical, item)
 	}
 	return digestMissionPlan(&agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: canonical})
+}
+
+func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) (*agentv1.MissionItem, error) {
+	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
+		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
+	}); err != nil {
+		return nil, err
+	}
+	timeout := time.NewTimer(a.aircraftCommandTimeout())
+	defer timeout.Stop()
+	countReceived := false
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeout.C:
+			return nil, errors.New("mission HOME readback timed out")
+		case event := <-events:
+			switch value := event.(type) {
+			case *common.MessageMissionCount:
+				if value.MissionType != common.MAV_MISSION_TYPE_MISSION {
+					continue
+				}
+				if value.Count == 0 {
+					return nil, errors.New("ArduPilot mission readback omitted HOME at wire sequence 0")
+				}
+				countReceived = true
+				if err := a.requestMissionItem(target, 0); err != nil {
+					return nil, err
+				}
+			case *common.MessageMissionItemInt:
+				if !countReceived || value.MissionType != common.MAV_MISSION_TYPE_MISSION || value.Seq != 0 {
+					continue
+				}
+				if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionAck{
+					TargetSystem: target.systemID, TargetComponent: target.componentID,
+					Type: common.MAV_MISSION_OPERATION_CANCELLED, MissionType: common.MAV_MISSION_TYPE_MISSION,
+				}); err != nil {
+					return nil, fmt.Errorf("cancel HOME-only mission readback: %w", err)
+				}
+				return protoMissionItem(value), nil
+			}
+		}
+	}
 }
 
 func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) ([]*agentv1.MissionItem, error) {

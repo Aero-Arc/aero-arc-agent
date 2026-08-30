@@ -246,9 +246,11 @@ All blocking operations must be cancellable or time-bounded.
   readback `current` to false because ArduPilot derives that bit from the live
   execution cursor rather than immutable stored mission content.
 - Canonical plans exclude ArduPilot's volatile wire-sequence-zero HOME record.
-  The adapter reads and reuses onboard HOME, shifts canonical items by one for
-  upload, excludes HOME from `uploaded_item_count`, then drops HOME and shifts
-  sequences back before readback digest verification.
+  Before replacement, a HOME-only read requests sequence zero without applying
+  the incoming-plan item limit to the existing onboard mission, then explicitly
+  cancels that partial download. The adapter reuses HOME, shifts canonical
+  items by one for upload, excludes HOME from `uploaded_item_count`, then drops
+  HOME and shifts sequences back before readback digest verification.
 - An accepted mission ACK can end an upload epoch only after that epoch handed
   off every requested wire item, including HOME. An accepted ACK buffered from
   an older timed-out upload must not trigger premature readback or a terminal

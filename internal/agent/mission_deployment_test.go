@@ -554,6 +554,47 @@ func TestMAVLinkMissionUploadRechecksExpiryAtMissionCountBoundary(t *testing.T) 
 	}
 }
 
+func TestMAVLinkMissionUploadReadsHomeFromLargerExistingMission(t *testing.T) {
+	command := validMissionCommand(t, "large-existing-mission-1")
+	now := time.Now()
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
+		landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
+	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: time.Second}}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 200}
+	cancelledHomeRead := false
+	replacementStarted := false
+	errReplacementObserved := errors.New("replacement MISSION_COUNT observed")
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		a.mavlinkMu.Lock()
+		events := a.pendingMissionEvents
+		a.mavlinkMu.Unlock()
+		switch value := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			events <- &common.MessageMissionCount{Count: uint16(maxWireMissionItems + 10), MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			if value.Seq != 0 {
+				t.Fatalf("HOME-only readback requested sequence %d", value.Seq)
+			}
+			events <- missionItemINT(target, home, 0)
+		case *common.MessageMissionAck:
+			if value.Type == common.MAV_MISSION_OPERATION_CANCELLED {
+				cancelledHomeRead = true
+			}
+		case *common.MessageMissionCount:
+			replacementStarted = true
+			return errReplacementObserved
+		}
+		return nil
+	}
+	_, _, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false, command.ExpiresAtUnixMs)
+	if !errors.Is(err, errMissionOutcomeUnknown) || !strings.Contains(err.Error(), errReplacementObserved.Error()) {
+		t.Fatalf("oversized existing mission replacement error = %v", err)
+	}
+	if !cancelledHomeRead || !replacementStarted {
+		t.Fatalf("HOME-only read cancelled=%v replacement started=%v, want both true", cancelledHomeRead, replacementStarted)
+	}
+}
+
 func TestMAVLinkReadbackAcceptsMaximumCanonicalPlanPlusHome(t *testing.T) {
 	plan := &agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: make([]*agentv1.MissionItem, maxMissionItems)}
 	for sequence := range plan.Items {
