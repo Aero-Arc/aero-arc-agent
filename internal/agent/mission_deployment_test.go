@@ -510,6 +510,64 @@ func TestMAVLinkMissionUploadRequiresACKAndCanonicalReadback(t *testing.T) {
 	}
 }
 
+func TestMAVLinkLargeMissionUsesIdleResponseTimeout(t *testing.T) {
+	command := validMissionCommand(t, "slow-large-protocol-1")
+	command.Plan.Items = make([]*agentv1.MissionItem, maxMissionItems)
+	for sequence := range command.Plan.Items {
+		command.Plan.Items[sequence] = &agentv1.MissionItem{Sequence: uint32(sequence), Frame: 0, Command: 16,
+			Autocontinue: true, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 100}
+	}
+	setMissionDigest(t, command)
+	now := time.Now()
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
+		landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
+	const responseTimeout = 15 * time.Millisecond
+	const responseDelay = 2 * time.Millisecond
+	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: responseTimeout}}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, Autocontinue: true,
+		LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
+	listRequests := 0
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		a.mavlinkMu.Lock()
+		events := a.pendingMissionEvents
+		a.mavlinkMu.Unlock()
+		switch value := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			listRequests++
+			count := uint16(1)
+			if listRequests == 2 {
+				count = uint16(maxWireMissionItems)
+			}
+			events <- &common.MessageMissionCount{Count: count, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionCount:
+			events <- &common.MessageMissionRequestInt{Seq: 0, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			time.Sleep(responseDelay)
+			item := home
+			if value.Seq > 0 {
+				item = command.Plan.Items[value.Seq-1]
+			}
+			events <- missionItemINT(target, item, value.Seq)
+		case *common.MessageMissionItemInt:
+			time.Sleep(responseDelay)
+			if int(value.Seq) < maxMissionItems {
+				events <- &common.MessageMissionRequestInt{Seq: value.Seq + 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+			} else {
+				events <- &common.MessageMissionAck{Type: common.MAV_MISSION_ACCEPTED, MissionType: common.MAV_MISSION_TYPE_MISSION}
+			}
+		}
+		return nil
+	}
+	started := time.Now()
+	digest, uploaded, ack, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false, command.ExpiresAtUnixMs)
+	if err != nil || digest != command.Binding.MissionDigest || uploaded != maxMissionItems || ack == nil || *ack != uint32(common.MAV_MISSION_ACCEPTED) {
+		t.Fatalf("slow large upload/readback = digest %q count %d ack %v err %v", digest, uploaded, ack, err)
+	}
+	if elapsed := time.Since(started); elapsed <= responseTimeout*2 {
+		t.Fatalf("large mission completed in %v; test did not exceed former one-shot timeout", elapsed)
+	}
+}
+
 func TestMissionProtocolCorrelationRejectsMessagesForAnotherGCS(t *testing.T) {
 	if missionMessageTargetsAgent(&common.MessageMissionAck{TargetSystem: 42, TargetComponent: mavlinkSourceComponentID}) {
 		t.Fatal("mission ACK for another GCS was accepted")

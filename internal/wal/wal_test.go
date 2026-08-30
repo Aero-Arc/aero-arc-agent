@@ -178,7 +178,7 @@ func TestInitDBMigratesPendingTimestampsTransactionallyAndIdempotently(t *testin
 	if err := initDB(db); err != nil {
 		t.Fatalf("idempotent initDB: %v", err)
 	}
-	rows, err := db.Query(`SELECT seq, pending_since_unix_ns FROM telemetry_frames ORDER BY seq`)
+	rows, err := db.Query(`SELECT seq, pending_since_unix_ns, pending_owner FROM telemetry_frames ORDER BY seq`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,8 @@ func TestInitDBMigratesPendingTimestampsTransactionallyAndIdempotently(t *testin
 	for sequence := int64(1); rows.Next(); sequence++ {
 		var seq int64
 		var pendingSince sql.NullInt64
-		if err := rows.Scan(&seq, &pendingSince); err != nil {
+		var pendingOwner sql.NullString
+		if err := rows.Scan(&seq, &pendingSince, &pendingOwner); err != nil {
 			t.Fatal(err)
 		}
 		if seq == 2 {
@@ -199,6 +200,9 @@ func TestInitDBMigratesPendingTimestampsTransactionallyAndIdempotently(t *testin
 			}
 		} else if pendingSince.Valid {
 			t.Fatalf("non-pending sequence %d retained timestamp %d", seq, pendingSince.Int64)
+		}
+		if pendingOwner.Valid {
+			t.Fatalf("migrated sequence %d retained pending owner %q", seq, pendingOwner.String)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -2356,6 +2360,51 @@ func TestResetPendingAndTeardownRequeueClearEpochWithoutRegressingTerminalACKs(t
 	}
 	if rows, err := w.ResetPending(ctx, time.Minute); err != nil || rows != 1 {
 		t.Fatalf("ResetPending() = %d, %v", rows, err)
+	}
+}
+
+func TestPendingStreamOwnershipFencesOverlappingTeardownAndSenderCleanup(t *testing.T) {
+	w := mustNewWAL(t)
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+	ctx := context.Background()
+	ids := make([]uint64, 2)
+	for index := range ids {
+		id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[index] = uint64(id)
+	}
+	if rows, err := w.MarkPendingBatchOwned(ctx, []uint64{ids[0]}, "old-stream"); err != nil || rows != 1 {
+		t.Fatalf("old stream reserve = %d, %v", rows, err)
+	}
+	if rows, err := w.MarkPendingBatchOwned(ctx, []uint64{ids[1]}, "new-stream"); err != nil || rows != 1 {
+		t.Fatalf("new stream reserve = %d, %v", rows, err)
+	}
+
+	// The later stream quiesces while the older timed-out sender is still
+	// running. Its teardown may expose only its own row.
+	if rows, err := w.RequeuePendingOwner(ctx, "new-stream"); err != nil || rows != 1 {
+		t.Fatalf("new stream teardown requeue = %d, %v", rows, err)
+	}
+	if rows, err := w.MarkWrittenBatchOwned(ctx, ids, "old-stream"); err != nil || rows != 1 {
+		t.Fatalf("late old sender cleanup = %d, %v", rows, err)
+	}
+	if rows, err := w.MarkPendingBatchOwned(ctx, []uint64{ids[1]}, "replacement-stream"); err != nil || rows != 1 {
+		t.Fatalf("replacement stream reserve = %d, %v", rows, err)
+	}
+	if rows, err := w.MarkWrittenBatchOwned(ctx, []uint64{ids[1]}, "old-stream"); err != nil || rows != 0 {
+		t.Fatalf("old sender stole replacement ownership = %d, %v", rows, err)
+	}
+	if _, err := w.ApplyTelemetryAckOwned(ctx, ids[1], "", TelemetryAckRetry, "late old retry", "old-stream"); !errors.Is(err, ErrTelemetryAckConflict) {
+		t.Fatalf("late old ACK crossed stream ownership: %v", err)
+	}
+	if result, err := w.ApplyTelemetryAckOwned(ctx, ids[1], "", TelemetryAckDelivered, "", "replacement-stream"); err != nil || !result.Changed {
+		t.Fatalf("replacement exact ACK = %#v, %v", result, err)
 	}
 }
 

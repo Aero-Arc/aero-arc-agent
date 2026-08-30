@@ -116,13 +116,14 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	handedOffSequences := make([]bool, len(plan.Items)+1)
 	handedOffCount := 0
 	var ackType *uint32
-	deadline := time.NewTimer(a.aircraftCommandTimeout())
-	defer deadline.Stop()
+	responseTimeout := a.aircraftCommandTimeout()
+	idle := time.NewTimer(responseTimeout)
+	defer idle.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return "", uploaded, ackType, fmt.Errorf("%w: %v", errMissionOutcomeUnknown, ctx.Err())
-		case <-deadline.C:
+		case <-idle.C:
 			return "", uploaded, ackType, fmt.Errorf("%w: upload timed out", errMissionOutcomeUnknown)
 		case event := <-events:
 			switch request := event.(type) {
@@ -130,6 +131,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if request.MissionType != common.MAV_MISSION_TYPE_MISSION || int(request.Seq) > len(plan.Items) {
 					continue
 				}
+				resetMissionResponseTimer(idle, responseTimeout)
 				if err := a.ensureMissionUploadSafe(target); err != nil {
 					return "", uploaded, ackType, fmt.Errorf("%w: %v", errMissionOutcomeUnknown, err)
 				}
@@ -152,6 +154,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if request.MissionType != common.MAV_MISSION_TYPE_MISSION || int(request.Seq) > len(plan.Items) {
 					continue
 				}
+				resetMissionResponseTimer(idle, responseTimeout)
 				if err := a.ensureMissionUploadSafe(target); err != nil {
 					return "", uploaded, ackType, fmt.Errorf("%w: %v", errMissionOutcomeUnknown, err)
 				}
@@ -178,6 +181,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if request.MissionType != common.MAV_MISSION_TYPE_MISSION {
 					continue
 				}
+				resetMissionResponseTimer(idle, responseTimeout)
 				if request.Type == common.MAV_MISSION_ACCEPTED && handedOffCount != len(handedOffSequences) {
 					// An accepted ACK buffered from an older timed-out upload is
 					// indistinguishable by transaction ID. Do not let it end the
@@ -241,7 +245,8 @@ func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, 
 	}); err != nil {
 		return nil, err
 	}
-	timeout := time.NewTimer(a.aircraftCommandTimeout())
+	responseTimeout := a.aircraftCommandTimeout()
+	timeout := time.NewTimer(responseTimeout)
 	defer timeout.Stop()
 	countReceived := false
 	for {
@@ -256,6 +261,7 @@ func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, 
 				if value.MissionType != common.MAV_MISSION_TYPE_MISSION {
 					continue
 				}
+				resetMissionResponseTimer(timeout, responseTimeout)
 				if value.Count == 0 {
 					return nil, errors.New("ArduPilot mission readback omitted HOME at wire sequence 0")
 				}
@@ -267,6 +273,7 @@ func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, 
 				if !countReceived || value.MissionType != common.MAV_MISSION_TYPE_MISSION || value.Seq != 0 {
 					continue
 				}
+				resetMissionResponseTimer(timeout, responseTimeout)
 				if err := a.cancelMissionReadback(target); err != nil {
 					return nil, fmt.Errorf("cancel HOME-only mission readback: %w", err)
 				}
@@ -281,6 +288,16 @@ func (a *Agent) cancelMissionReadback(target *mavlinkTarget) error {
 		TargetSystem: target.systemID, TargetComponent: target.componentID,
 		Type: common.MAV_MISSION_OPERATION_CANCELLED, MissionType: common.MAV_MISSION_TYPE_MISSION,
 	})
+}
+
+func resetMissionResponseTimer(timer *time.Timer, timeout time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(timeout)
 }
 
 // beginMissionReadbackEpoch terminates any earlier download and requires one
@@ -303,13 +320,7 @@ func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTa
 		case <-quiet.C:
 			return nil
 		case <-events:
-			if !quiet.Stop() {
-				select {
-				case <-quiet.C:
-				default:
-				}
-			}
-			quiet.Reset(quietPeriod)
+			resetMissionResponseTimer(quiet, quietPeriod)
 		}
 	}
 }
@@ -323,7 +334,8 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 	}); err != nil {
 		return nil, err
 	}
-	timeout := time.NewTimer(a.aircraftCommandTimeout())
+	responseTimeout := a.aircraftCommandTimeout()
+	timeout := time.NewTimer(responseTimeout)
 	defer timeout.Stop()
 	count := -1
 	var nextSequence uint16
@@ -340,6 +352,7 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 				if value.MissionType != common.MAV_MISSION_TYPE_MISSION {
 					continue
 				}
+				resetMissionResponseTimer(timeout, responseTimeout)
 				if value.Count == 0 || value.Count > maxWireMissionItems {
 					if err := a.cancelMissionReadback(target); err != nil {
 						return nil, fmt.Errorf("cancel invalid mission readback with wire item count %d: %w", value.Count, err)
@@ -359,6 +372,7 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 				if count < 0 || value.MissionType != common.MAV_MISSION_TYPE_MISSION || int(value.Seq) >= count || value.Seq != nextSequence || items[value.Seq] != nil {
 					continue
 				}
+				resetMissionResponseTimer(timeout, responseTimeout)
 				items[value.Seq] = protoMissionItem(value)
 				nextSequence++
 				if int(value.Seq)+1 < count {

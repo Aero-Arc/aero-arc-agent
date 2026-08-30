@@ -59,11 +59,13 @@ Distributed systems favor correctness and durability over strict deduplication g
 - Batch senders reserve each row immediately before its own network Send.
   Cleanup cannot reset rows while a live batch owns them, and successful batch
   completion renews the ACK window for every row that remains pending.
-- Stream teardown waits for ACK handling to quiesce, then immediately returns
-  every still-pending peer to written. Status-conditional updates preserve
-  terminal ACKs that already committed. If a worker misses the bounded
-  teardown deadline, its rows remain fenced, but the supervised transport loop
-  continues backoff and reconnect instead of silently ending Relay activity.
+- Every pending row durably records the unique stream lifecycle that reserved
+  it. Stream ACK, sender cleanup, refresh, and quiesced teardown transitions
+  match that owner, so a later stream cannot expose or regress rows still
+  fenced by an older timed-out sender. Status-conditional updates preserve
+  terminal ACKs that already committed. If a worker misses the bounded teardown
+  deadline, its rows remain fenced, but the supervised transport loop continues
+  backoff and reconnect instead of silently ending Relay activity.
 
 The deployed ACK contract contains `seq` and an optional `frame_id`, but not
 `wal_id`. Current Relay versions omit `frame_id`, so deployed correlation is
@@ -262,6 +264,10 @@ All blocking operations must be cancellable or time-bounded.
   transfer and observes a full mission-response timeout with no mission-protocol
   traffic. Only a `MISSION_COUNT` received after that quiet boundary can start
   the new readback epoch or decide a durable reconciliation result.
+- Upload and download response timeouts measure idle protocol time, not total
+  transfer duration. Every valid count, requested item, or ACK renews the idle
+  window so a progressing maximum-size mission can complete on a slow serial
+  link; context cancellation still bounds the overall operation.
 - The first ArduPilot slice requires `autocontinue=true`, positive-zero
   parameters except LAND param4 exactly `+1`, and float32 altitude that
   round-trips bit-for-bit through ArduPilot signed-centimeter storage. Canonical

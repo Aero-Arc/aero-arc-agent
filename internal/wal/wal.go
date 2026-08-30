@@ -229,7 +229,8 @@ func initDB(db *sql.DB) error {
 		created_at INTEGER NOT NULL,
 		payload BLOB NOT NULL,
 		delivery_status INTEGER NOT NULL DEFAULT 0,
-		pending_since_unix_ns INTEGER
+		pending_since_unix_ns INTEGER,
+		pending_owner TEXT
 	);
 	CREATE TABLE IF NOT EXISTS operation_context (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -282,6 +283,9 @@ func initDB(db *sql.DB) error {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 	if err := ensureTelemetryPendingSince(db); err != nil {
+		return err
+	}
+	if err := ensureTelemetryPendingOwner(db); err != nil {
 		return err
 	}
 
@@ -344,6 +348,38 @@ func ensureTelemetryPendingSince(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit telemetry pending timestamp migration: %w", err)
+	}
+	return nil
+}
+
+// ensureTelemetryPendingOwner adds the durable stream-ownership fence used by
+// send, teardown, and ACK transitions. Legacy pending rows intentionally keep
+// a NULL owner: no sender from the previous process survives startup, and the
+// pending-age migration makes those rows safely recoverable through TTL reset.
+// The schema repair is transactional and idempotent.
+func ensureTelemetryPendingOwner(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin telemetry pending owner migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('telemetry_frames') WHERE name = 'pending_owner'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect telemetry pending owner schema: %w", err)
+	}
+	if count == 0 {
+		if _, err := tx.Exec(`ALTER TABLE telemetry_frames ADD COLUMN pending_owner TEXT`); err != nil {
+			return fmt.Errorf("add telemetry pending owner: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE telemetry_frames
+		SET pending_owner = NULL
+		WHERE delivery_status != ? AND pending_owner IS NOT NULL`, DeliveryStatusPending); err != nil {
+		return fmt.Errorf("repair non-pending telemetry owners: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit telemetry pending owner migration: %w", err)
 	}
 	return nil
 }
@@ -602,7 +638,8 @@ func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID strin
 				item.seq, time.Now().UnixNano(), item.quarantineReason, item.originalDeliveryStatus); err != nil {
 				return legacyMigrationState{}, fmt.Errorf("quarantine malformed legacy WAL frame %d: %w", item.seq, err)
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ?`,
+			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames
+				SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL WHERE seq = ?`,
 				DeliveryStatusQuarantined, item.seq); err != nil {
 				return legacyMigrationState{}, fmt.Errorf("mark malformed legacy WAL frame %d quarantined: %w", item.seq, err)
 			}
@@ -1973,7 +2010,7 @@ func (w *WAL) updateDeliveryStatus(ctx context.Context, seq uint64, status Deliv
 		pendingSince = time.Now().UnixNano()
 	}
 	query := `UPDATE telemetry_frames
-		SET delivery_status = ?, pending_since_unix_ns = ?
+		SET delivery_status = ?, pending_since_unix_ns = ?, pending_owner = NULL
 		WHERE seq = ? AND delivery_status != ?`
 
 	res, err := w.db.ExecContext(ctx, query, status, pendingSince, seq, status)
@@ -2016,17 +2053,34 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 //   - rowsAffected: equals len(seqs) after a successful non-empty transition.
 //   - error: reports a missing/non-written sequence, transaction, or commit failure.
 func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
-	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusWritten, DeliveryStatusPending, true)
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusWritten, DeliveryStatusPending, true, false, "", "")
+}
+
+// MarkPendingBatchOwned atomically reserves written entries for exactly one
+// live telemetry stream. owner must be unique for that stream lifecycle.
+func (w *WAL) MarkPendingBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusWritten, DeliveryStatusPending, true, false, "", owner)
 }
 
 // RefreshPendingBatch renews the durable send epoch for entries that remain
 // pending after a stream sender finishes its batch. Concurrent terminal ACKs
 // are excluded by the pending-state predicate and never regress.
 func (w *WAL) RefreshPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
-	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false)
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false, true, "", "")
 }
 
-func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, from, to DeliveryStatus, requireAll bool) (int64, error) {
+// RefreshPendingBatchOwned renews only rows still pending for owner.
+func (w *WAL) RefreshPendingBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false, true, owner, owner)
+}
+
+func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, from, to DeliveryStatus, requireAll, matchOwner bool, fromOwner, toOwner string) (int64, error) {
 	if len(seqs) == 0 {
 		return 0, nil
 	}
@@ -2034,9 +2088,20 @@ func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, 
 	if to == DeliveryStatusPending {
 		pendingSince = time.Now().UnixNano()
 	}
+	var pendingOwner any
+	if to == DeliveryStatusPending && toOwner != "" {
+		pendingOwner = toOwner
+	}
 	query := `UPDATE telemetry_frames
-		SET delivery_status = ?, pending_since_unix_ns = ?
+		SET delivery_status = ?, pending_since_unix_ns = ?, pending_owner = ?
 		WHERE seq=? AND delivery_status = ?`
+	if matchOwner {
+		if fromOwner == "" {
+			query += ` AND pending_owner IS NULL`
+		} else {
+			query += ` AND pending_owner = ?`
+		}
+	}
 	// Detach from stream cancellation so the batch can still commit.
 	baseCtx := context.WithoutCancel(ctx)
 	var txCtx context.Context
@@ -2062,7 +2127,11 @@ func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, 
 
 	var rowsAffected int64
 	for _, seq := range seqs {
-		result, err := stmt.ExecContext(txCtx, to, pendingSince, seq, from)
+		args := []any{to, pendingSince, pendingOwner, seq, from}
+		if matchOwner && fromOwner != "" {
+			args = append(args, fromOwner)
+		}
+		result, err := stmt.ExecContext(txCtx, args...)
 		if err != nil {
 			return 0, fmt.Errorf("transition telemetry frame %d from %d to %d: %w", seq, from, to, err)
 		}
@@ -2095,7 +2164,20 @@ func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, 
 //   - rowsAffected: counts pending entries moved back to written.
 //   - error: reports a transaction or SQLite failure.
 func (w *WAL) MarkWrittenBatch(ctx context.Context, seqs []uint64) (int64, error) {
-	rows, err := w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusWritten, false)
+	rows, err := w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusWritten, false, true, "", "")
+	if err == nil && rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, err
+}
+
+// MarkWrittenBatchOwned returns only entries still pending for owner to the
+// retry queue. A delayed sender cannot regress rows re-reserved by a later stream.
+func (w *WAL) MarkWrittenBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	rows, err := w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusWritten, false, true, owner, "")
 	if err == nil && rows > 0 {
 		w.signalDataAvailable()
 	}
@@ -2136,6 +2218,20 @@ func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 //   - error: reports missing/mismatched identity, conflicting state, invalid
 //     disposition, context cancellation, or SQLite failure.
 func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason string) (TelemetryAckResult, error) {
+	return w.applyTelemetryAck(ctx, seq, frameID, disposition, reason, "")
+}
+
+// ApplyTelemetryAckOwned applies a stream ACK only while the pending row still
+// belongs to that stream. Duplicate terminal ACKs remain idempotent after the
+// owner is cleared.
+func (w *WAL) ApplyTelemetryAckOwned(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason, owner string) (TelemetryAckResult, error) {
+	if owner == "" {
+		return TelemetryAckResult{}, errors.New("telemetry pending owner is required")
+	}
+	return w.applyTelemetryAck(ctx, seq, frameID, disposition, reason, owner)
+}
+
+func (w *WAL) applyTelemetryAck(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason, owner string) (TelemetryAckResult, error) {
 	if seq == 0 {
 		return TelemetryAckResult{}, fmt.Errorf("%w: sequence is zero", ErrTelemetryFrameNotFound)
 	}
@@ -2147,13 +2243,17 @@ func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string,
 
 	var payload []byte
 	var current DeliveryStatus
-	if err = tx.QueryRowContext(ctx, `SELECT payload, delivery_status FROM telemetry_frames WHERE seq = ?`, seq).Scan(&payload, &current); err != nil {
+	var pendingOwner sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT payload, delivery_status, pending_owner FROM telemetry_frames WHERE seq = ?`, seq).Scan(&payload, &current, &pendingOwner); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d", ErrTelemetryFrameNotFound, seq)
 		}
 		return TelemetryAckResult{}, fmt.Errorf("load telemetry ACK sequence %d: %w", seq, err)
 	}
 	result := TelemetryAckResult{PreviousStatus: current, CorrelatedByFrameID: frameID != ""}
+	if owner != "" && current == DeliveryStatusPending && (!pendingOwner.Valid || pendingOwner.String != owner) {
+		return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d is owned by another telemetry stream", ErrTelemetryAckConflict, seq)
+	}
 	if frameID != "" {
 		frame := &agentv1.TelemetryFrame{}
 		if err = proto.Unmarshal(payload, frame); err != nil {
@@ -2202,7 +2302,7 @@ func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string,
 	}
 
 	update, err := tx.ExecContext(ctx, `UPDATE telemetry_frames
-		SET delivery_status = ?, pending_since_unix_ns = NULL
+		SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
 		WHERE seq = ? AND delivery_status = ?`, target, seq, current)
 	if err != nil {
 		return TelemetryAckResult{}, fmt.Errorf("apply telemetry ACK sequence %d: %w", seq, err)
@@ -2231,8 +2331,8 @@ func (w *WAL) signalDataAvailable() {
 	}
 }
 
-// RequeueAllPending returns every entry still awaiting an ACK to the written
-// retry queue. Callers must first stop the stream receive loop so an exact ACK
+// RequeueAllPending returns legacy unowned entries still awaiting an ACK to the
+// written retry queue. Callers must first stop the stream receive loop so an exact ACK
 // cannot begin after teardown. Status-conditional updates preserve terminal
 // ACKs that committed before or while this statement waited for SQLite.
 //
@@ -2244,14 +2344,36 @@ func (w *WAL) signalDataAvailable() {
 //   - error: reports a SQLite or context failure.
 func (w *WAL) RequeueAllPending(ctx context.Context) (int64, error) {
 	res, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames
-		SET delivery_status = ?, pending_since_unix_ns = NULL
-		WHERE delivery_status = ?`, DeliveryStatusWritten, DeliveryStatusPending)
+		SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
+		WHERE delivery_status = ? AND pending_owner IS NULL`, DeliveryStatusWritten, DeliveryStatusPending)
 	if err != nil {
 		return 0, fmt.Errorf("requeue pending telemetry frames: %w", err)
 	}
 	rows, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("inspect requeued pending telemetry frames: %w", err)
+	}
+	if rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, nil
+}
+
+// RequeuePendingOwner returns only the rows owned by a quiesced stream. Rows
+// fenced by an older sender are never exposed to a later stream teardown.
+func (w *WAL) RequeuePendingOwner(ctx context.Context, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	res, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
+		WHERE delivery_status = ? AND pending_owner = ?`, DeliveryStatusWritten, DeliveryStatusPending, owner)
+	if err != nil {
+		return 0, fmt.Errorf("requeue telemetry frames for owner %q: %w", owner, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect requeued telemetry frames for owner %q: %w", owner, err)
 	}
 	if rows > 0 {
 		w.signalDataAvailable()
@@ -2271,7 +2393,7 @@ func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error
 
 	query := `
 	UPDATE telemetry_frames 
-	SET delivery_status = ?, pending_since_unix_ns = NULL
+	SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
 	WHERE delivery_status = ? 
 	AND pending_since_unix_ns < ?
 	`

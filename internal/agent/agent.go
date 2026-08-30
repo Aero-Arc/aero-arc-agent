@@ -16,6 +16,7 @@ import (
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/bluenviron/gomavlib/v3/pkg/message"
+	"github.com/google/uuid"
 	"github.com/makinje/aero-arc-agent/internal/identity"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
@@ -30,6 +31,17 @@ const (
 	agentShutdownTimeout                    = defaultTelemetryPersistenceDrainTimeout + walShutdownReserve
 	streamTeardownTimeout                   = 2 * time.Second
 )
+
+type telemetryStreamOwnerContextKey struct{}
+
+func withTelemetryStreamOwner(ctx context.Context, owner string) context.Context {
+	return context.WithValue(ctx, telemetryStreamOwnerContextKey{}, owner)
+}
+
+func telemetryStreamOwner(ctx context.Context) string {
+	owner, _ := ctx.Value(telemetryStreamOwnerContextKey{}).(string)
+	return owner
+}
 
 type Agent struct {
 	node *gomavlib.Node
@@ -838,7 +850,13 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 	default:
 		return fmt.Errorf("%w: unsupported status %d for sequence %d", ErrInvalidTelemetryAck, ack.GetStatus(), ack.GetSeq())
 	}
-	result, err := a.wal.ApplyTelemetryAck(ctx, ack.GetSeq(), ack.GetFrameId(), disposition, ack.GetError())
+	var result wal.TelemetryAckResult
+	var err error
+	if owner := telemetryStreamOwner(ctx); owner != "" {
+		result, err = a.wal.ApplyTelemetryAckOwned(ctx, ack.GetSeq(), ack.GetFrameId(), disposition, ack.GetError(), owner)
+	} else {
+		result, err = a.wal.ApplyTelemetryAck(ctx, ack.GetSeq(), ack.GetFrameId(), disposition, ack.GetError())
+	}
 	if err != nil {
 		return fmt.Errorf("apply telemetry ACK for sequence %d: %w", ack.GetSeq(), err)
 	}
@@ -865,6 +883,7 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 
 	slog.LogAttrs(ctx, slog.LevelInfo, "telemetry_stream_sender_starting")
 
+	owner := telemetryStreamOwner(ctx)
 	for {
 		// 1. Read undelivered frames
 		entries, err := a.wal.ReadUndelivered(ctx, int(a.options.WALBatchSize))
@@ -914,7 +933,13 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		sentIDs := make([]uint64, 0, len(ids))
 		var batchErr error
 		for index, frame := range outbound {
-			rows, markErr := a.wal.MarkPendingBatch(ctx, []uint64{ids[index]})
+			var rows int64
+			var markErr error
+			if owner != "" {
+				rows, markErr = a.wal.MarkPendingBatchOwned(ctx, []uint64{ids[index]}, owner)
+			} else {
+				rows, markErr = a.wal.MarkPendingBatch(ctx, []uint64{ids[index]})
+			}
 			if markErr != nil || rows != 1 {
 				if markErr == nil {
 					markErr = fmt.Errorf("changed %d of 1 entries", rows)
@@ -936,14 +961,26 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		if batchErr == nil {
 			// Give every unacknowledged row a full post-batch ACK window. Terminal
 			// ACKs that raced the refresh are excluded by the pending predicate.
-			if _, refreshErr := a.wal.RefreshPendingBatch(ctx, sentIDs); refreshErr != nil {
+			var refreshErr error
+			if owner != "" {
+				_, refreshErr = a.wal.RefreshPendingBatchOwned(ctx, sentIDs, owner)
+			} else {
+				_, refreshErr = a.wal.RefreshPendingBatch(ctx, sentIDs)
+			}
+			if refreshErr != nil {
 				batchErr = fmt.Errorf("refresh telemetry batch pending epochs: %w", refreshErr)
 			}
 		}
 		if batchErr != nil {
 			// Return only rows that this sender actually reserved. Later peers are
 			// still written, while concurrent terminal ACK states win.
-			if _, resetErr := a.wal.MarkWrittenBatch(ctx, sentIDs); resetErr != nil {
+			var resetErr error
+			if owner != "" {
+				_, resetErr = a.wal.MarkWrittenBatchOwned(ctx, sentIDs, owner)
+			} else {
+				_, resetErr = a.wal.MarkWrittenBatch(ctx, sentIDs)
+			}
+			if resetErr != nil {
 				batchErr = errors.Join(batchErr, fmt.Errorf("return failed telemetry batch to retry: %w", resetErr))
 			}
 		}
@@ -1006,6 +1043,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		}
 
 		connCtx, cancelConn := context.WithCancel(ctx)
+		connCtx = withTelemetryStreamOwner(connCtx, uuid.NewString())
 
 		a.conn = conn
 		a.gateway = agentv1.NewAgentGatewayClient(conn)
@@ -1119,7 +1157,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			err = errors.Join(err, errors.New("telemetry stream workers did not stop within teardown deadline; pending rows left fenced"))
 		} else {
 			teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), streamTeardownTimeout)
-			if _, requeueErr := a.wal.RequeueAllPending(teardownCtx); requeueErr != nil {
+			if _, requeueErr := a.wal.RequeuePendingOwner(teardownCtx, telemetryStreamOwner(connCtx)); requeueErr != nil {
 				err = errors.Join(err, fmt.Errorf("requeue telemetry after stream teardown: %w", requeueErr))
 			}
 			cancelTeardown()
