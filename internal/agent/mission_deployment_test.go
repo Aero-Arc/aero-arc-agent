@@ -152,7 +152,7 @@ func TestMissionDeploymentDurablyReplaysTerminalResultAndRejectsIDConflict(t *te
 	command.ExpiresAtUnixMs = time.Now().Add(500 * time.Millisecond).UnixMilli()
 	digest := command.Binding.MissionDigest
 	calls := 0
-	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
 		calls++
 		ack := uint32(common.MAV_MISSION_ACCEPTED)
 		return digest, 1, &ack, nil
@@ -189,7 +189,7 @@ func TestMissionDeploymentCorruptTerminalResultFailsClosed(t *testing.T) {
 	if err := a.wal.StoreMissionDeploymentResult(context.Background(), command.CommandId, fingerprint, []byte{0xff}, false); err != nil {
 		t.Fatal(err)
 	}
-	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
 		t.Fatal("corrupt terminal result caused another MAVLink effect")
 		return "", 0, nil, nil
 	}
@@ -238,7 +238,7 @@ func TestMissionDeploymentAcquiresExplicitOnGroundEvidenceBeforeUpload(t *testin
 		a.observeMAVLinkLandedState(channel, request.TargetSystem, request.TargetComponent, common.MAV_LANDED_STATE_ON_GROUND)
 		return nil
 	}
-	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
 		ack := uint32(common.MAV_MISSION_ACCEPTED)
 		return command.Binding.MissionDigest, 1, &ack, nil
 	}
@@ -285,7 +285,7 @@ func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	command := validMissionCommand(t, "uncertain-1")
 	digest := command.Binding.MissionDigest
 	readbackFlags := []bool{}
-	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
 		readbackFlags = append(readbackFlags, readbackOnly)
 		if len(readbackFlags) == 1 {
 			return "", 0, nil, errMissionOutcomeUnknown
@@ -312,7 +312,7 @@ func TestConcurrentExactMissionRetryReloadsTerminalStateAfterLock(t *testing.T) 
 	deploymentStarted := make(chan struct{}, 2)
 	releaseDeployment := make(chan struct{})
 	var calls atomic.Int32
-	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
 		calls.Add(1)
 		deploymentStarted <- struct{}{}
 		<-releaseDeployment
@@ -356,7 +356,7 @@ func TestMissionDeploymentFirstSeenExpiredIsRejectedWithoutAdmissionOrEffect(t *
 	command := validMissionCommand(t, "expired-first-seen-1")
 	command.IssuedAtUnixMs = time.Now().Add(-2 * time.Minute).UnixMilli()
 	command.ExpiresAtUnixMs = time.Now().Add(-time.Minute).UnixMilli()
-	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
 		t.Fatal("expired first-seen command reached MAVLink")
 		return "", 0, nil, nil
 	}
@@ -398,7 +398,7 @@ func TestExpiredUncertainDeploymentIsReadbackOnly(t *testing.T) {
 			// operation context has moved on.
 			a.operationContext = &wal.OperationContext{AircraftID: "other-aircraft", FlightID: "other-flight", IntentID: "other-intent", IntentVersion: 2}
 			calls := 0
-			a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool) (string, uint32, *uint32, error) {
+			a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
 				calls++
 				if !readbackOnly {
 					t.Fatal("expired uncertain command attempted a replacement upload")
@@ -468,7 +468,7 @@ func TestMAVLinkMissionUploadRequiresACKAndCanonicalReadback(t *testing.T) {
 		}
 		return nil
 	}
-	digest, uploaded, ack, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false)
+	digest, uploaded, ack, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false, command.ExpiresAtUnixMs)
 	if err != nil || digest != command.Binding.MissionDigest || uploaded != 2 || ack == nil || *ack != uint32(common.MAV_MISSION_ACCEPTED) {
 		t.Fatalf("upload/readback = digest %q count %d ack %v err %v", digest, uploaded, ack, err)
 	}
@@ -517,9 +517,40 @@ func TestMAVLinkMissionUploadDoesNotAcceptMissingOrMismatchedACK(t *testing.T) {
 		}
 		return nil
 	}
-	_, uploaded, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false)
+	_, uploaded, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false, command.ExpiresAtUnixMs)
 	if !errors.Is(err, errMissionOutcomeUnknown) || uploaded != 1 {
 		t.Fatalf("missing/mismatched ACK result = uploaded %d, err %v", uploaded, err)
+	}
+}
+
+func TestMAVLinkMissionUploadRechecksExpiryAtMissionCountBoundary(t *testing.T) {
+	command := validMissionCommand(t, "expired-boundary-1")
+	now := time.Now()
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
+		landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
+	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: time.Second}}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 200}
+	missionCountSent := false
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		a.mavlinkMu.Lock()
+		events := a.pendingMissionEvents
+		a.mavlinkMu.Unlock()
+		switch value := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			events <- &common.MessageMissionCount{Count: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			events <- missionItemINT(target, home, value.Seq)
+		case *common.MessageMissionCount:
+			missionCountSent = true
+		}
+		return nil
+	}
+	_, _, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false, now.Add(-time.Millisecond).UnixMilli())
+	if err == nil || !strings.Contains(err.Error(), "effect deadline expired") {
+		t.Fatalf("expired upload boundary error = %v", err)
+	}
+	if missionCountSent {
+		t.Fatal("expired mission reached MISSION_COUNT effect boundary")
 	}
 }
 

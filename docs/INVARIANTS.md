@@ -58,7 +58,9 @@ Distributed systems favor correctness and durability over strict deduplication g
   replayed telemetry can be old while its current send is still active.
 - Stream teardown waits for ACK handling to quiesce, then immediately returns
   every still-pending peer to written. Status-conditional updates preserve
-  terminal ACKs that already committed.
+  terminal ACKs that already committed. If a worker misses the bounded
+  teardown deadline, its rows remain fenced, but the supervised transport loop
+  continues backoff and reconnect instead of silently ending Relay activity.
 
 The deployed ACK contract contains `seq` and an optional `frame_id`, but not
 `wal_id`. Current Relay versions omit `frame_id`, so deployed correlation is
@@ -248,6 +250,9 @@ All blocking operations must be cancellable or time-bounded.
   off every requested wire item, including HOME. An accepted ACK buffered from
   an older timed-out upload must not trigger premature readback or a terminal
   mismatch for a partially replaced list.
+- A repeated valid `MISSION_COUNT` restarts readback sequence progress and item
+  storage together at wire sequence zero; stale items from the previous
+  transfer epoch cannot leave holes in canonical readback.
 - The first ArduPilot slice requires `autocontinue=true`, positive-zero
   parameters except LAND param4 exactly `+1`, and float32 altitude that
   round-trips bit-for-bit through ArduPilot signed-centimeter storage. Canonical
@@ -260,9 +265,11 @@ All blocking operations must be cancellable or time-bounded.
 - An uncertain retry always reads the onboard mission first. It reports already
   applied when the digest matches. Before expiry, a complete mismatch may
   re-upload only behind a fresh exact operation binding plus disarmed/on-ground
-  fences. After expiry, recovery is readback-only: mismatch is terminal and can
-  never replace the onboard mission. First-seen expired commands are rejected
-  without durable admission, while exact terminal replay remains available.
+  fences, and authority is rechecked at the actual `MISSION_COUNT` handoff
+  boundary after HOME readback. After expiry, recovery is readback-only:
+  mismatch is terminal and can never replace the onboard mission. First-seen
+  expired commands are rejected without durable admission, while exact
+  terminal replay remains available.
 - Mission deployment replaces the stored mission only. It does not arm, start,
   advance, or complete a flight.
 

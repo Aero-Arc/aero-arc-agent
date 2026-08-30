@@ -572,6 +572,67 @@ func TestRunWithReconnectRequeuesUnacknowledgedBatchPeersBeforeReconnect(t *test
 	}
 }
 
+func TestRunWithReconnectRemainsSupervisedAfterWorkerTeardownTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := wal.New(context.Background(), filepath.Join(t.TempDir(), "teardown-timeout.db"), 1, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	if _, err := w.Append(context.Background(), &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &Agent{
+		options:        &AgentOptions{RelayTarget: "test:1234", WALBatchSize: 1},
+		backoffInitial: time.Millisecond,
+		backoffMax:     time.Millisecond,
+		wal:            w,
+	}
+	reconnected := make(chan struct{})
+	dialCount := 0
+	a.dialFn = func(context.Context) (*grpc.ClientConn, error) {
+		dialCount++
+		if dialCount > 1 {
+			close(reconnected)
+			cancel()
+			return nil, errors.New("stop after supervised reconnect")
+		}
+		return grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	a.registerFn = func(context.Context) error { return nil }
+	a.openStreamFn = func(context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
+		return &mockStream{sendFunc: func(*agentv1.AgentStreamMessage) error {
+			return errors.New("end sender while ACK worker is stuck")
+		}}, nil
+	}
+	releaseACKWorker := make(chan struct{})
+	a.ackLoopFn = func(context.Context, grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+		<-releaseACKWorker // Deliberately ignore stream cancellation past the teardown deadline.
+		return errors.New("released stale ACK worker")
+	}
+	a.sleepWithBack = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
+
+	errC := make(chan error, 1)
+	go func() { errC <- a.runWithReconnect(ctx) }()
+	select {
+	case <-reconnected:
+		close(releaseACKWorker)
+	case <-time.After(3 * time.Second):
+		close(releaseACKWorker)
+		t.Fatal("worker teardown timeout ended reconnect supervision")
+	}
+	select {
+	case err := <-errC:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runWithReconnect() error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runWithReconnect did not stop after supervised reconnect cancellation")
+	}
+}
+
 func TestHandleTelemetryAckAppliesStatusSpecificDurabilityPolicy(t *testing.T) {
 	tests := []struct {
 		name           string

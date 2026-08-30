@@ -64,7 +64,7 @@ func missionMessageTargetsAgent(value message.Message) bool {
 		(componentID == 0 || componentID == mavlinkSourceComponentID)
 }
 
-func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mavlinkTarget, plan *agentv1.MissionPlan, readbackOnly bool) (string, uint32, *uint32, error) {
+func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mavlinkTarget, plan *agentv1.MissionPlan, readbackOnly bool, expiresAtUnixMs int64) (string, uint32, *uint32, error) {
 	if target == nil || target.channel == nil || a.writeMAVLinkMessage == nil {
 		return "", 0, nil, errors.New("MAVLink mission channel is unavailable")
 	}
@@ -102,6 +102,9 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 
 	if err := a.ensureMissionUploadSafe(target); err != nil {
 		return "", 0, nil, err
+	}
+	if expiresAtUnixMs <= 0 || time.Now().UnixMilli() > expiresAtUnixMs {
+		return "", 0, nil, errors.New("mission effect deadline expired before MISSION_COUNT handoff")
 	}
 	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionCount{
 		TargetSystem: target.systemID, TargetComponent: target.componentID,

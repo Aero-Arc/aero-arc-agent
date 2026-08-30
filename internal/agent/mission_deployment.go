@@ -203,7 +203,7 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 	}
 
 	if recovery {
-		digest, _, _, readbackErr := a.deployMAVLinkMission(ctx, target, command.Plan, true)
+		digest, _, _, readbackErr := a.deployMAVLinkMission(ctx, target, command.Plan, true, command.ExpiresAtUnixMs)
 		result.OnboardMissionDigest = digest
 		if readbackErr != nil {
 			result.Status = agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN
@@ -259,7 +259,7 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 			return result
 		}
 	}
-	digest, count, ack, err := a.deployMAVLinkMission(ctx, target, command.Plan, false)
+	digest, count, ack, err := a.deployMAVLinkMission(ctx, target, command.Plan, false, command.ExpiresAtUnixMs)
 	result.OnboardMissionDigest = digest
 	result.UploadedItemCount = count
 	result.MavlinkMissionAckType = ack

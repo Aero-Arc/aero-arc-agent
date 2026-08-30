@@ -83,7 +83,7 @@ type Agent struct {
 	aircraftCommandActive     bool
 	writeMAVLinkCommand       func(*gomavlib.Channel, *common.MessageCommandLong) error
 	writeMAVLinkMessage       func(*gomavlib.Channel, message.Message) error
-	deployMAVLinkMission      func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error)
+	deployMAVLinkMission      func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error)
 	appendTelemetryFrame      func(context.Context, *agentv1.TelemetryFrame) error
 	telemetryDrainTimeout     time.Duration
 
@@ -1084,15 +1084,18 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			}
 		}
 		if !streamQuiesced {
-			a.conn = nil
-			a.gateway = nil
-			return errors.Join(err, errors.New("telemetry stream workers did not stop within teardown deadline; pending rows left fenced"))
+			// The old stream may still own pending rows, so keep them fenced. The
+			// reconnect supervisor must nevertheless remain alive: Start does not
+			// consume this goroutine's return value, and returning here would leave
+			// an otherwise healthy process permanently disconnected from Relay.
+			err = errors.Join(err, errors.New("telemetry stream workers did not stop within teardown deadline; pending rows left fenced"))
+		} else {
+			teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), streamTeardownTimeout)
+			if _, requeueErr := a.wal.RequeueAllPending(teardownCtx); requeueErr != nil {
+				err = errors.Join(err, fmt.Errorf("requeue telemetry after stream teardown: %w", requeueErr))
+			}
+			cancelTeardown()
 		}
-		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), streamTeardownTimeout)
-		if _, requeueErr := a.wal.RequeueAllPending(teardownCtx); requeueErr != nil {
-			err = errors.Join(err, fmt.Errorf("requeue telemetry after stream teardown: %w", requeueErr))
-		}
-		cancelTeardown()
 		a.conn = nil
 		a.gateway = nil
 
