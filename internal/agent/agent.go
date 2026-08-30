@@ -28,6 +28,7 @@ const (
 	defaultTelemetryPersistenceDrainTimeout = 5 * time.Second
 	walShutdownReserve                      = 10 * time.Second
 	agentShutdownTimeout                    = defaultTelemetryPersistenceDrainTimeout + walShutdownReserve
+	streamTeardownTimeout                   = 2 * time.Second
 )
 
 type Agent struct {
@@ -1030,14 +1031,17 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		}
 
 		errChan := make(chan error, 2)
+		streamStopped := make(chan struct{}, 2)
 
 		// 4. Handle telemetry frames.
 		go func() {
+			defer func() { streamStopped <- struct{}{} }()
 			errChan <- a.handleTelemetryFrames(connCtx, stream)
 		}()
 
 		// 5. Run the ack loop until it ends or context is cancelled.
 		go func() {
+			defer func() { streamStopped <- struct{}{} }()
 			errChan <- a.ackLoopFn(connCtx, stream)
 		}()
 
@@ -1059,6 +1063,36 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		cancelConn()
 		_ = stream.CloseSend()
 		_ = conn.Close()
+		// Wait until no ACK handler can still start or commit before returning
+		// stream-owned pending rows to the retry queue. This ordering lets exact
+		// terminal ACKs win while avoiding a TTL-sized stall for their peers.
+		stopTimer := time.NewTimer(streamTeardownTimeout)
+		streamQuiesced := true
+	streamStopWait:
+		for stopped := 0; stopped < 2; stopped++ {
+			select {
+			case <-streamStopped:
+			case <-stopTimer.C:
+				streamQuiesced = false
+				break streamStopWait
+			}
+		}
+		if !stopTimer.Stop() {
+			select {
+			case <-stopTimer.C:
+			default:
+			}
+		}
+		if !streamQuiesced {
+			a.conn = nil
+			a.gateway = nil
+			return errors.Join(err, errors.New("telemetry stream workers did not stop within teardown deadline; pending rows left fenced"))
+		}
+		teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), streamTeardownTimeout)
+		if _, requeueErr := a.wal.RequeueAllPending(teardownCtx); requeueErr != nil {
+			err = errors.Join(err, fmt.Errorf("requeue telemetry after stream teardown: %w", requeueErr))
+		}
+		cancelTeardown()
 		a.conn = nil
 		a.gateway = nil
 

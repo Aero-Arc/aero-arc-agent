@@ -496,6 +496,82 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 	}
 }
 
+func TestRunWithReconnectRequeuesUnacknowledgedBatchPeersBeforeReconnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, err := wal.New(context.Background(), filepath.Join(t.TempDir(), "teardown-requeue.db"), 3, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	ids := make([]uint64, 3)
+	for index := range ids {
+		id, err := w.Append(context.Background(), &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[index] = uint64(id)
+	}
+
+	a := &Agent{
+		options:        &AgentOptions{RelayTarget: "test:1234", WALBatchSize: 3},
+		backoffInitial: time.Millisecond,
+		backoffMax:     time.Millisecond,
+		wal:            w,
+	}
+	dialCount := 0
+	a.dialFn = func(context.Context) (*grpc.ClientConn, error) {
+		dialCount++
+		if dialCount > 1 {
+			cancel()
+			return nil, errors.New("stop after observing reconnect")
+		}
+		return grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	a.registerFn = func(context.Context) error { return nil }
+	allSent := make(chan struct{})
+	sendCount := 0
+	stream := &mockStream{sendFunc: func(message *agentv1.AgentStreamMessage) error {
+		if message.GetTelemetryFrame() == nil {
+			t.Fatalf("unexpected non-telemetry send: %+v", message)
+		}
+		sendCount++
+		if sendCount == len(ids) {
+			close(allSent)
+		}
+		return nil
+	}}
+	a.openStreamFn = func(context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
+		return stream, nil
+	}
+	a.ackLoopFn = func(ackCtx context.Context, _ grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+		select {
+		case <-allSent:
+		case <-ackCtx.Done():
+			return ackCtx.Err()
+		}
+		return a.handleTelemetryAck(ackCtx, &agentv1.TelemetryAck{
+			Seq: ids[1], Status: agentv1.TelemetryAck_STATUS_PERMANENT_ERROR, Error: "relay rejected peer",
+		})
+	}
+	a.sleepWithBack = func(context.Context, time.Duration) bool { return true }
+
+	if err := a.runWithReconnect(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("runWithReconnect() error = %v, want cancellation", err)
+	}
+	entries, err := w.ReadUndelivered(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || uint64(entries[0].ID) != ids[0] || uint64(entries[1].ID) != ids[2] {
+		t.Fatalf("retry queue after reconnect = %#v, want peers %v and %v", entries, ids[0], ids[2])
+	}
+	rejected, err := w.ApplyTelemetryAck(context.Background(), ids[1], "", wal.TelemetryAckPermanentReject, "relay rejected peer")
+	if err != nil || rejected.Changed || rejected.PreviousStatus != wal.DeliveryStatusQuarantined {
+		t.Fatalf("rejected peer replay = %#v, %v", rejected, err)
+	}
+}
+
 func TestHandleTelemetryAckAppliesStatusSpecificDurabilityPolicy(t *testing.T) {
 	tests := []struct {
 		name           string

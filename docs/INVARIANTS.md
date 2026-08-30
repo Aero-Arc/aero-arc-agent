@@ -53,8 +53,12 @@ Distributed systems favor correctness and durability over strict deduplication g
   the original payload and Relay diagnostic in durable quarantine
 - ACK transitions are monotonic. A late contradictory ACK must not move a
   delivered or quarantined row back into the retry queue
-- Pending frames may be retried indefinitely
-- Stuck pending frames may be reset after a TTL and retried
+- Pending frames may be retried indefinitely. Their TTL starts from a durable
+  written-to-pending send epoch, never from the frame's capture time, because
+  replayed telemetry can be old while its current send is still active.
+- Stream teardown waits for ACK handling to quiesce, then immediately returns
+  every still-pending peer to written. Status-conditional updates preserve
+  terminal ACKs that already committed.
 
 The deployed ACK contract contains `seq` and an optional `frame_id`, but not
 `wal_id`. Current Relay versions omit `frame_id`, so deployed correlation is
@@ -226,10 +230,10 @@ All blocking operations must be cancellable or time-bounded.
   target-bound `MAV_CMD_REQUEST_MESSAGE` for message 245 and waits within the
   command timeout for a newer sample from that exact channel/system/component.
   Timeout or target movement still fails closed; absence never implies landed.
-- Schema v1 accepts at most 200 contiguous global mission items and only
-  waypoint, takeoff, and land commands. Floating parameters and altitude must
-  be exactly representable as MAVLink `float32`; this keeps deterministic proto
-  and onboard `MISSION_ITEM_INT` readback digests equivalent.
+- Schema v1 accepts at most 200 contiguous `MAV_FRAME_GLOBAL` (frame `0`)
+  mission items and only waypoint (`16`), land (`21`), and takeoff (`22`)
+  commands. The shared Protos `missiondigest` encoder, rather than protobuf
+  wire serialization, defines the cross-runtime canonical bytes and SHA-256.
 - Canonical mission items require `current=false`. The Agent normalizes
   readback `current` to false because ArduPilot derives that bit from the live
   execution cursor rather than immutable stored mission content.
@@ -237,18 +241,21 @@ All blocking operations must be cancellable or time-bounded.
   The adapter reads and reuses onboard HOME, shifts canonical items by one for
   upload, excludes HOME from `uploaded_item_count`, then drops HOME and shifts
   sequences back before readback digest verification.
-- The first ArduPilot slice accepts canonical global frames `0`, `3`, and `10`,
-  requires `autocontinue=true`, positive-zero parameters except LAND param4
-  exactly `+1`, and altitude that round-trips through ArduPilot centimeter
-  storage. Coordinates must survive ArduPilot's legacy float32 degrees-to-E7
-  multiplication exactly. These restrictions reject values the autopilot would
-  silently normalize and thus prevent false readback mismatches.
+- The first ArduPilot slice requires `autocontinue=true`, positive-zero
+  parameters except LAND param4 exactly `+1`, and float32 altitude that
+  round-trips bit-for-bit through ArduPilot signed-centimeter storage. Canonical
+  E7 coordinates are authoritative and remain exact over `MISSION_ITEM_INT`;
+  float-coordinate losslessness is checked only when an autopilot actually
+  requests the legacy `MISSION_ITEM` fallback.
 - `APPLIED` and `ALREADY_APPLIED` require a complete onboard mission readback
   whose canonical digest matches the requested plan. An ambiguous handoff,
   timeout, or incomplete readback is durably `OUTCOME_UNKNOWN`.
 - An uncertain retry always reads the onboard mission first. It reports already
-  applied when the digest matches, and only re-uploads after a complete
-  mismatching readback proves the prior attempt did not install the plan.
+  applied when the digest matches. Before expiry, a complete mismatch may
+  re-upload only behind a fresh exact operation binding plus disarmed/on-ground
+  fences. After expiry, recovery is readback-only: mismatch is terminal and can
+  never replace the onboard mission. First-seen expired commands are rejected
+  without durable admission, while exact terminal replay remains available.
 - Mission deployment replaces the stored mission only. It does not arm, start,
   advance, or complete a flight.
 

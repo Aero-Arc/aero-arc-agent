@@ -2,17 +2,15 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/aero-arc/aero-arc-protos/missiondigest"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/bluenviron/gomavlib/v3/pkg/message"
-	"google.golang.org/protobuf/proto"
 )
 
 func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
@@ -276,7 +274,7 @@ func missionItemINT(target *mavlinkTarget, item *agentv1.MissionItem, wireSequen
 		Seq: wireSequence, Frame: common.MAV_FRAME(item.Frame), Command: common.MAV_CMD(item.Command),
 		Current: 0, Autocontinue: boolByte(item.Autocontinue), Param1: float32(item.Param1),
 		Param2: float32(item.Param2), Param3: float32(item.Param3), Param4: float32(item.Param4),
-		X: item.LatitudeE7, Y: item.LongitudeE7, Z: float32(item.AltitudeM), MissionType: common.MAV_MISSION_TYPE_MISSION}
+		X: item.LatitudeE7, Y: item.LongitudeE7, Z: item.AltitudeM, MissionType: common.MAV_MISSION_TYPE_MISSION}
 }
 
 func missionItemLegacy(target *mavlinkTarget, item *agentv1.MissionItem, wireSequence uint16) (*common.MessageMissionItem, error) {
@@ -300,16 +298,11 @@ func legacyCoordinateRoundTrips(coordinateE7 int32) bool {
 func protoMissionItem(item *common.MessageMissionItemInt) *agentv1.MissionItem {
 	return &agentv1.MissionItem{Sequence: uint32(item.Seq), Frame: uint32(item.Frame), Command: uint32(item.Command),
 		Current: false, Autocontinue: item.Autocontinue != 0, Param1: float64(item.Param1), Param2: float64(item.Param2),
-		Param3: float64(item.Param3), Param4: float64(item.Param4), LatitudeE7: item.X, LongitudeE7: item.Y, AltitudeM: float64(item.Z)}
+		Param3: float64(item.Param3), Param4: float64(item.Param4), LatitudeE7: item.X, LongitudeE7: item.Y, AltitudeM: item.Z}
 }
 
 func digestMissionPlan(plan *agentv1.MissionPlan) (string, error) {
-	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(plan)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(payload)
-	return hex.EncodeToString(digest[:]), nil
+	return missiondigest.Digest(plan)
 }
 
 func boolByte(value bool) uint8 {

@@ -146,6 +146,62 @@ func TestInitDBAddsSpoolImportCleanupTokenToExistingSchema(t *testing.T) {
 	}
 }
 
+func TestInitDBMigratesPendingTimestampsTransactionallyAndIdempotently(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "pending-schema.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close schema database: %v", err)
+		}
+	})
+	if _, err := db.Exec(`CREATE TABLE telemetry_frames (
+		seq INTEGER PRIMARY KEY AUTOINCREMENT,
+		created_at INTEGER NOT NULL,
+		payload BLOB NOT NULL,
+		delivery_status INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		createdAt int64
+		status    DeliveryStatus
+	}{{11, DeliveryStatusWritten}, {22, DeliveryStatusPending}, {33, DeliveryStatusDelivered}} {
+		if _, err := db.Exec(`INSERT INTO telemetry_frames(created_at, payload, delivery_status) VALUES(?, X'00', ?)`, row.createdAt, row.status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(db); err != nil {
+		t.Fatalf("idempotent initDB: %v", err)
+	}
+	rows, err := db.Query(`SELECT seq, pending_since_unix_ns FROM telemetry_frames ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for sequence := int64(1); rows.Next(); sequence++ {
+		var seq int64
+		var pendingSince sql.NullInt64
+		if err := rows.Scan(&seq, &pendingSince); err != nil {
+			t.Fatal(err)
+		}
+		if seq == 2 {
+			if !pendingSince.Valid || pendingSince.Int64 != 22 {
+				t.Fatalf("legacy pending timestamp = %+v, want 22", pendingSince)
+			}
+		} else if pendingSince.Valid {
+			t.Fatalf("non-pending sequence %d retained timestamp %d", seq, pendingSince.Int64)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInitDBAddsOperationCommandFingerprintsToExistingSchema(t *testing.T) {
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "schema.db"))
 	if err != nil {
@@ -2132,6 +2188,163 @@ func TestApplyTelemetryAckPermanentlyQuarantinesEvidenceAndIsIdempotent(t *testi
 	}
 	if _, err = w.ApplyTelemetryAck(ctx, uint64(id), frameID, TelemetryAckDelivered, ""); !errors.Is(err, ErrTelemetryAckConflict) {
 		t.Fatalf("contradictory delivered ACK error = %v", err)
+	}
+}
+
+func TestResetPendingUsesDurableSendEpochInsteadOfCaptureAge(t *testing.T) {
+	w := mustNewWAL(t)
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+	ctx := context.Background()
+	id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: 1234})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedAt := time.Now().Add(-24 * time.Hour).UnixNano()
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET created_at = ? WHERE seq = ?`, capturedAt, id); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := w.MarkPendingBatch(ctx, []uint64{uint64(id)}); err != nil || rows != 1 {
+		t.Fatalf("MarkPendingBatch() = %d, %v", rows, err)
+	}
+	var pendingSince int64
+	if err := w.db.QueryRowContext(ctx, `SELECT pending_since_unix_ns FROM telemetry_frames WHERE seq = ?`, id).Scan(&pendingSince); err != nil {
+		t.Fatal(err)
+	}
+	if pendingSince <= capturedAt {
+		t.Fatalf("pending epoch %d did not advance beyond capture %d", pendingSince, capturedAt)
+	}
+	if rows, err := w.ResetPending(ctx, 5*time.Minute); err != nil || rows != 0 {
+		t.Fatalf("fresh replay send reset = %d, %v", rows, err)
+	}
+	result, err := w.ApplyTelemetryAck(ctx, uint64(id), "7:agent-1:1234:1", TelemetryAckDelivered, "")
+	if err != nil || !result.Changed {
+		t.Fatalf("exact ACK after cleanup tick = %#v, %v", result, err)
+	}
+}
+
+func TestResetPendingAndTeardownRequeueClearEpochWithoutRegressingTerminalACKs(t *testing.T) {
+	w := mustNewWAL(t)
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+	ctx := context.Background()
+	ids := make([]uint64, 3)
+	for index := range ids {
+		id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[index] = uint64(id)
+	}
+	if rows, err := w.MarkPendingBatch(ctx, ids); err != nil || rows != 3 {
+		t.Fatalf("MarkPendingBatch() = %d, %v", rows, err)
+	}
+	if _, err := w.ApplyTelemetryAck(ctx, ids[0], "", TelemetryAckDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.ApplyTelemetryAck(ctx, ids[1], "", TelemetryAckPermanentReject, "bad frame"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := w.RequeueAllPending(ctx); err != nil || rows != 1 {
+		t.Fatalf("RequeueAllPending() = %d, %v", rows, err)
+	}
+
+	var deliveredStatus, quarantinedStatus, writtenStatus DeliveryStatus
+	var writtenPendingSince sql.NullInt64
+	if err := w.db.QueryRowContext(ctx, `SELECT delivery_status FROM telemetry_frames WHERE seq = ?`, ids[0]).Scan(&deliveredStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT delivery_status FROM telemetry_frames WHERE seq = ?`, ids[1]).Scan(&quarantinedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.db.QueryRowContext(ctx, `SELECT delivery_status, pending_since_unix_ns FROM telemetry_frames WHERE seq = ?`, ids[2]).Scan(&writtenStatus, &writtenPendingSince); err != nil {
+		t.Fatal(err)
+	}
+	if deliveredStatus != DeliveryStatusDelivered || quarantinedStatus != DeliveryStatusQuarantined || writtenStatus != DeliveryStatusWritten || writtenPendingSince.Valid {
+		t.Fatalf("states after requeue = delivered %d quarantined %d written %d pending_since %+v", deliveredStatus, quarantinedStatus, writtenStatus, writtenPendingSince)
+	}
+
+	if rows, err := w.MarkPendingBatch(ctx, []uint64{ids[2]}); err != nil || rows != 1 {
+		t.Fatalf("second MarkPendingBatch() = %d, %v", rows, err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames SET pending_since_unix_ns = ? WHERE seq = ?`, time.Now().Add(-time.Hour).UnixNano(), ids[2]); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := w.ResetPending(ctx, time.Minute); err != nil || rows != 1 {
+		t.Fatalf("ResetPending() = %d, %v", rows, err)
+	}
+}
+
+func TestConcurrentTerminalACKsAndTeardownRequeueNeverRegressCommittedRows(t *testing.T) {
+	w := mustNewWAL(t)
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+	ctx := context.Background()
+	const frameCount = 32
+	ids := make([]uint64, frameCount)
+	for index := range ids {
+		id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[index] = uint64(id)
+	}
+	if rows, err := w.MarkPendingBatch(ctx, ids); err != nil || rows != frameCount {
+		t.Fatalf("MarkPendingBatch() = %d, %v", rows, err)
+	}
+
+	start := make(chan struct{})
+	type ackOutcome struct {
+		id  uint64
+		err error
+	}
+	outcomes := make(chan ackOutcome, frameCount)
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id uint64) {
+			defer wg.Done()
+			<-start
+			_, err := w.ApplyTelemetryAck(ctx, id, "", TelemetryAckDelivered, "")
+			outcomes <- ackOutcome{id: id, err: err}
+		}(id)
+	}
+	requeueDone := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := w.RequeueAllPending(ctx)
+		requeueDone <- err
+	}()
+	close(start)
+	wg.Wait()
+	close(outcomes)
+	if err := <-requeueDone; err != nil {
+		t.Fatal(err)
+	}
+
+	for outcome := range outcomes {
+		var status DeliveryStatus
+		if err := w.db.QueryRowContext(ctx, `SELECT delivery_status FROM telemetry_frames WHERE seq = ?`, outcome.id).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if outcome.err == nil {
+			if status != DeliveryStatusDelivered {
+				t.Fatalf("committed ACK sequence %d regressed to %d", outcome.id, status)
+			}
+			continue
+		}
+		if !errors.Is(outcome.err, ErrTelemetryAckConflict) || status != DeliveryStatusWritten {
+			t.Fatalf("racing ACK sequence %d = status %d error %v", outcome.id, status, outcome.err)
+		}
 	}
 }
 

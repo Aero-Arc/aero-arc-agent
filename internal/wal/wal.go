@@ -228,7 +228,8 @@ func initDB(db *sql.DB) error {
 		seq INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at INTEGER NOT NULL,
 		payload BLOB NOT NULL,
-		delivery_status INTEGER NOT NULL DEFAULT 0
+		delivery_status INTEGER NOT NULL DEFAULT 0,
+		pending_since_unix_ns INTEGER
 	);
 	CREATE TABLE IF NOT EXISTS operation_context (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -280,10 +281,15 @@ func initDB(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
+	if err := ensureTelemetryPendingSince(db); err != nil {
+		return err
+	}
 
 	indexQuery := `
 	CREATE INDEX IF NOT EXISTS idx_telemetry_undelivered
 	ON telemetry_frames (delivery_status, seq);
+	CREATE INDEX IF NOT EXISTS idx_telemetry_pending_age
+	ON telemetry_frames (delivery_status, pending_since_unix_ns);
 	CREATE INDEX IF NOT EXISTS idx_telemetry_frame_quarantine_newest
 	ON telemetry_frame_quarantine (quarantined_at DESC, seq DESC);
 	`
@@ -301,6 +307,44 @@ func initDB(db *sql.DB) error {
 		return err
 	}
 
+	return nil
+}
+
+// ensureTelemetryPendingSince adds the durable send-epoch timestamp to WALs
+// created by older Agent versions. The schema change and backfill share one
+// transaction so startup never exposes a partially migrated delivery state.
+// Legacy pending rows inherit their capture time and may therefore be eligible
+// for immediate retry after startup; no sender from the previous process can
+// still own them. Non-pending rows never retain a pending timestamp.
+func ensureTelemetryPendingSince(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin telemetry pending timestamp migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('telemetry_frames') WHERE name = 'pending_since_unix_ns'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect telemetry pending timestamp schema: %w", err)
+	}
+	if count == 0 {
+		if _, err := tx.Exec(`ALTER TABLE telemetry_frames ADD COLUMN pending_since_unix_ns INTEGER`); err != nil {
+			return fmt.Errorf("add telemetry pending timestamp: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE telemetry_frames
+		SET pending_since_unix_ns = created_at
+		WHERE delivery_status = ? AND pending_since_unix_ns IS NULL`, DeliveryStatusPending); err != nil {
+		return fmt.Errorf("backfill telemetry pending timestamps: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE telemetry_frames
+		SET pending_since_unix_ns = NULL
+		WHERE delivery_status != ? AND pending_since_unix_ns IS NOT NULL`, DeliveryStatusPending); err != nil {
+		return fmt.Errorf("repair non-pending telemetry timestamps: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit telemetry pending timestamp migration: %w", err)
+	}
 	return nil
 }
 
@@ -1896,9 +1940,15 @@ func (w *WAL) WaitForData(ctx context.Context) error {
 
 func (w *WAL) updateDeliveryStatus(ctx context.Context, seq uint64, status DeliveryStatus) (int64, error) {
 	// Only update if the status is different to ensure idempotency.
-	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ? AND delivery_status != ?`
+	var pendingSince any
+	if status == DeliveryStatusPending {
+		pendingSince = time.Now().UnixNano()
+	}
+	query := `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = ?
+		WHERE seq = ? AND delivery_status != ?`
 
-	res, err := w.db.ExecContext(ctx, query, status, seq, status)
+	res, err := w.db.ExecContext(ctx, query, status, pendingSince, seq, status)
 	if err != nil {
 		return 0, fmt.Errorf("failed to update delivery status: %w", err)
 	}
@@ -1945,7 +1995,13 @@ func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, 
 	if len(seqs) == 0 {
 		return 0, nil
 	}
-	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq=? AND delivery_status = ?`
+	var pendingSince any
+	if to == DeliveryStatusPending {
+		pendingSince = time.Now().UnixNano()
+	}
+	query := `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = ?
+		WHERE seq=? AND delivery_status = ?`
 	// Detach from stream cancellation so the batch can still commit.
 	baseCtx := context.WithoutCancel(ctx)
 	var txCtx context.Context
@@ -1971,7 +2027,7 @@ func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, 
 
 	var rowsAffected int64
 	for _, seq := range seqs {
-		result, err := stmt.ExecContext(txCtx, to, seq, from)
+		result, err := stmt.ExecContext(txCtx, to, pendingSince, seq, from)
 		if err != nil {
 			return 0, fmt.Errorf("transition telemetry frame %d from %d to %d: %w", seq, from, to, err)
 		}
@@ -2110,7 +2166,9 @@ func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string,
 		return TelemetryAckResult{}, fmt.Errorf("invalid telemetry ACK disposition %d", disposition)
 	}
 
-	update, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ? AND delivery_status = ?`, target, seq, current)
+	update, err := tx.ExecContext(ctx, `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = NULL
+		WHERE seq = ? AND delivery_status = ?`, target, seq, current)
 	if err != nil {
 		return TelemetryAckResult{}, fmt.Errorf("apply telemetry ACK sequence %d: %w", seq, err)
 	}
@@ -2138,25 +2196,49 @@ func (w *WAL) signalDataAvailable() {
 	}
 }
 
-// ResetPending resets frames that have been in 'Pending' state for longer than ttl.
-// This allows retrying frames that were marked as pending but never acked.
+// RequeueAllPending returns every entry still awaiting an ACK to the written
+// retry queue. Callers must first stop the stream receive loop so an exact ACK
+// cannot begin after teardown. Status-conditional updates preserve terminal
+// ACKs that committed before or while this statement waited for SQLite.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the update.
+//
+// Returns:
+//   - rowsAffected: counts pending entries returned to the retry queue.
+//   - error: reports a SQLite or context failure.
+func (w *WAL) RequeueAllPending(ctx context.Context) (int64, error) {
+	res, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = NULL
+		WHERE delivery_status = ?`, DeliveryStatusWritten, DeliveryStatusPending)
+	if err != nil {
+		return 0, fmt.Errorf("requeue pending telemetry frames: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect requeued pending telemetry frames: %w", err)
+	}
+	if rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, nil
+}
+
+// ResetPending returns entries whose durable pending epoch is older than ttl
+// to the written retry queue. Capture time is deliberately not used: replayed
+// frames may be old while their current network send is still active.
 func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error) {
 	if ttl <= 0 {
 		return 0, nil
 	}
 
-	// created_at is stored as unix nano
-	// We want rows where delivery_status = Pending AND created_at < (now - ttl)
-	// Note: created_at is when it was inserted, not when it was marked pending.
-	// Since we don't track "updated_at", we use "created_at" as a proxy.
-	// If a frame is pending and old enough, we retry it.
 	cutoff := time.Now().Add(-ttl).UnixNano()
 
 	query := `
 	UPDATE telemetry_frames 
-	SET delivery_status = ? 
+	SET delivery_status = ?, pending_since_unix_ns = NULL
 	WHERE delivery_status = ? 
-	AND created_at < ?
+	AND pending_since_unix_ns < ?
 	`
 
 	res, err := w.db.ExecContext(ctx, query, DeliveryStatusWritten, DeliveryStatusPending, cutoff)
@@ -2166,8 +2248,8 @@ func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error
 
 	rows, err := res.RowsAffected()
 
-	if rows != 0 {
-		w.signalChan <- struct{}{}
+	if rows > 0 {
+		w.signalDataAvailable()
 	}
 
 	return rows, err

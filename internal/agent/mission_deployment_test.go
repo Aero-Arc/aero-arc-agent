@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"math"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/aero-arc/aero-arc-protos/missiondigest"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/bluenviron/gomavlib/v3/pkg/message"
@@ -17,13 +19,33 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestValidateMissionCommandRejectsNonCanonicalFloat(t *testing.T) {
+func TestValidateMissionCommandModelsSignedCentimeterAltitude(t *testing.T) {
 	command := validMissionCommand(t, "command-1")
-	command.Plan.Items[0].AltitudeM = 100.1
+	command.Plan.Items[0].AltitudeM = float32(math.Copysign(0, -1))
 	setMissionDigest(t, command)
 	_, _, err := validateMissionCommand(command, time.Now())
-	if err == nil || !strings.Contains(err.Error(), "float32-canonical") {
+	if err == nil || !strings.Contains(err.Error(), "centimeter storage") {
 		t.Fatalf("validateMissionCommand() error = %v", err)
+	}
+	command.Plan.Items[0].AltitudeM = 20.1
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err != nil {
+		t.Fatalf("20.1m signed-centimeter altitude rejected: %v", err)
+	}
+}
+
+func TestMissionDigestUsesSharedSchemaOneGoldenVector(t *testing.T) {
+	plan := &agentv1.MissionPlan{SchemaVersion: 1, Items: []*agentv1.MissionItem{{
+		Sequence: 0, Frame: 0, Command: 16, Autocontinue: true,
+		LatitudeE7: -353632620, LongitudeE7: 1491652370, AltitudeM: 20.1,
+	}}}
+	const want = "6efa96b36af29a800d53ee7d7baf57d4b24f00d9ce2b408327281e74824acf4f"
+	if got, err := digestMissionPlan(plan); err != nil || got != want {
+		t.Fatalf("digestMissionPlan() = %q, %v; want %q", got, err, want)
+	}
+	canonical, err := missiondigest.CanonicalBytes(plan)
+	if err != nil || len(canonical) == 0 {
+		t.Fatalf("CanonicalBytes() = %x, %v", canonical, err)
 	}
 }
 
@@ -37,6 +59,15 @@ func TestMissionCurrentBitIsRejectedAndReadbackNormalized(t *testing.T) {
 	readback := protoMissionItem(&common.MessageMissionItemInt{Current: 1})
 	if readback.Current {
 		t.Fatal("dynamic autopilot current bit entered canonical readback")
+	}
+}
+
+func TestSchemaOneAcceptsOnlyGlobalFrameZero(t *testing.T) {
+	command := validMissionCommand(t, "frame-1")
+	command.Plan.Items[0].Frame = uint32(common.MAV_FRAME_GLOBAL_RELATIVE_ALT)
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err == nil || !strings.Contains(err.Error(), "unsupported frame") {
+		t.Fatalf("relative-alt frame validation error = %v", err)
 	}
 }
 
@@ -63,7 +94,7 @@ func TestCanonicalMissionParametersRejectNegativeZero(t *testing.T) {
 	}
 }
 
-func TestLegacyCoordinateRoundTripUsesArduPilotFloat32Storage(t *testing.T) {
+func TestLegacyCoordinateRestrictionAppliesOnlyToActualLegacyRequest(t *testing.T) {
 	const latitudeE7 int32 = -353632608
 	const longitudeE7 int32 = 1491652352
 	if !legacyCoordinateRoundTrips(latitudeE7) || !legacyCoordinateRoundTrips(longitudeE7) {
@@ -71,6 +102,12 @@ func TestLegacyCoordinateRoundTripUsesArduPilotFloat32Storage(t *testing.T) {
 	}
 	if legacyCoordinateRoundTrips(latitudeE7 + 1) {
 		t.Fatal("non-lossless adjacent latitude passed legacy float32 round-trip")
+	}
+	command := validMissionCommand(t, "int-coordinate-1")
+	command.Plan.Items[0].LatitudeE7 = latitudeE7 + 1
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err != nil {
+		t.Fatalf("MISSION_ITEM_INT coordinate rejected globally: %v", err)
 	}
 	target := &mavlinkTarget{systemID: 1, componentID: 1}
 	legacy, err := missionItemLegacy(target, &agentv1.MissionItem{LatitudeE7: latitudeE7, LongitudeE7: longitudeE7}, 1)
@@ -95,6 +132,9 @@ func TestMissionDeploymentRequiresExactAircraftOperationBinding(t *testing.T) {
 	}
 	if a.deployMAVLinkMission != nil {
 		t.Fatal("test transport unexpectedly installed")
+	}
+	if _, err := a.wal.LoadMissionDeployment(context.Background(), "binding-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("binding mismatch was admitted durably: %v", err)
 	}
 }
 
@@ -258,9 +298,79 @@ func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	}
 }
 
+func TestMissionDeploymentFirstSeenExpiredIsRejectedWithoutAdmissionOrEffect(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	command := validMissionCommand(t, "expired-first-seen-1")
+	command.IssuedAtUnixMs = time.Now().Add(-2 * time.Minute).UnixMilli()
+	command.ExpiresAtUnixMs = time.Now().Add(-time.Minute).UnixMilli()
+	a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool) (string, uint32, *uint32, error) {
+		t.Fatal("expired first-seen command reached MAVLink")
+		return "", 0, nil, nil
+	}
+	result := a.executeMissionDeployment(context.Background(), command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_REJECTED {
+		t.Fatalf("expired first-seen result = %+v", result)
+	}
+	if _, err := a.wal.LoadMissionDeployment(context.Background(), command.CommandId); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expired first-seen command was admitted: %v", err)
+	}
+}
+
+func TestExpiredUncertainDeploymentIsReadbackOnly(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		readback   string
+		wantStatus agentv1.MissionDeploymentResult_Status
+	}{
+		{name: "matching", readback: "requested", wantStatus: agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED},
+		{name: "mismatching", readback: "different", wantStatus: agentv1.MissionDeploymentResult_STATUS_ONBOARD_MISSION_MISMATCH},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			a, closeWAL := testMissionAgent(t)
+			defer closeWAL()
+			command := validMissionCommand(t, "expired-recovery-"+test.name)
+			command.IssuedAtUnixMs = time.Now().Add(-2 * time.Minute).UnixMilli()
+			command.ExpiresAtUnixMs = time.Now().Add(-time.Minute).UnixMilli()
+			payload, fingerprint, err := missionCommandIdentity(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
+				t.Fatalf("reserve uncertain command = %v, %v", created, err)
+			}
+			if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
+				t.Fatal(err)
+			}
+			// Recovery readback is effect-free and remains permitted after the
+			// operation context has moved on.
+			a.operationContext = &wal.OperationContext{AircraftID: "other-aircraft", FlightID: "other-flight", IntentID: "other-intent", IntentVersion: 2}
+			calls := 0
+			a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool) (string, uint32, *uint32, error) {
+				calls++
+				if !readbackOnly {
+					t.Fatal("expired uncertain command attempted a replacement upload")
+				}
+				if test.readback == "requested" {
+					return command.Binding.MissionDigest, 0, nil, nil
+				}
+				return strings.Repeat("0", 64), 0, nil, nil
+			}
+			result := a.executeMissionDeployment(context.Background(), command)
+			if result.Status != test.wantStatus || calls != 1 {
+				t.Fatalf("expired recovery result = %+v, calls=%d", result, calls)
+			}
+			replayed := a.executeMissionDeployment(context.Background(), command)
+			if !proto.Equal(result, replayed) || calls != 1 {
+				t.Fatalf("terminal expired recovery was not replayed: first=%+v replay=%+v calls=%d", result, replayed, calls)
+			}
+		})
+	}
+}
+
 func TestMAVLinkMissionUploadRequiresACKAndCanonicalReadback(t *testing.T) {
 	command := validMissionCommand(t, "protocol-1")
-	command.Plan.Items = append(command.Plan.Items, &agentv1.MissionItem{Sequence: 1, Frame: 3, Command: 16,
+	command.Plan.Items = append(command.Plan.Items, &agentv1.MissionItem{Sequence: 1, Frame: 0, Command: 16,
 		Autocontinue: true, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 110})
 	setMissionDigest(t, command)
 	now := time.Now()
@@ -361,7 +471,7 @@ func TestMAVLinkMissionUploadDoesNotAcceptMissingOrMismatchedACK(t *testing.T) {
 func TestMAVLinkReadbackAcceptsMaximumCanonicalPlanPlusHome(t *testing.T) {
 	plan := &agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: make([]*agentv1.MissionItem, maxMissionItems)}
 	for sequence := range plan.Items {
-		plan.Items[sequence] = &agentv1.MissionItem{Sequence: uint32(sequence), Frame: 3, Command: 16,
+		plan.Items[sequence] = &agentv1.MissionItem{Sequence: uint32(sequence), Frame: 0, Command: 16,
 			Autocontinue: true, LatitudeE7: 410000000 + int32(sequence), LongitudeE7: -870000000, AltitudeM: 100}
 	}
 	wantDigest, err := digestMissionPlan(plan)
@@ -420,7 +530,7 @@ func validMissionCommand(t *testing.T, commandID string) *agentv1.DeployMissionC
 		CommandId: commandID, IssuedAtUnixMs: now.Add(-time.Second).UnixMilli(), ExpiresAtUnixMs: now.Add(time.Minute).UnixMilli(),
 		Binding: &agentv1.MissionBinding{MissionId: "mission-1", MissionVersion: 1, DeploymentId: "deployment-1",
 			OperatorId: "operator-1", AircraftId: "aircraft-1", FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 1},
-		Plan: &agentv1.MissionPlan{SchemaVersion: 1, Items: []*agentv1.MissionItem{{Sequence: 0, Frame: 3,
+		Plan: &agentv1.MissionPlan{SchemaVersion: 1, Items: []*agentv1.MissionItem{{Sequence: 0, Frame: 0,
 			Command: 16, Autocontinue: true, LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 100}}},
 	}
 	setMissionDigest(t, command)

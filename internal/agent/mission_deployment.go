@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	agentv1 "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/aero-arc/aero-arc-protos/missiondigest"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
@@ -64,17 +66,23 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		result.Message = identityErr.Error()
 		return result
 	}
-	record, created, err := a.wal.ReserveMissionDeployment(ctx, command.CommandId, fingerprint, payload)
-	if err != nil {
-		if errors.Is(err, wal.ErrMissionDeploymentConflict) {
-			result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
-		} else {
-			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
-		}
-		result.Message = err.Error()
+
+	// Durable lookup precedes expiry and all other mutable admission checks so
+	// exact terminal replay and uncertain readback recovery remain available
+	// after the command's effect deadline.
+	record, loadErr := a.wal.LoadMissionDeployment(ctx, command.CommandId)
+	found := loadErr == nil
+	if loadErr != nil && !errors.Is(loadErr, sql.ErrNoRows) {
+		result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+		result.Message = loadErr.Error()
 		return result
 	}
-	if record.State == "terminal" {
+	if found && record.PayloadFingerprint != fingerprint {
+		result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
+		result.Message = wal.ErrMissionDeploymentConflict.Error()
+		return result
+	}
+	if found && record.State == "terminal" {
 		persisted := &agentv1.MissionDeploymentResult{}
 		if err := proto.Unmarshal(record.ResultPayload, persisted); err != nil {
 			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
@@ -83,20 +91,21 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		}
 		return persisted
 	}
-	recovery := !created && (record.State == "effect_started" || record.State == "outcome_unknown")
-	validationTime := time.Now()
-	if recovery && command.ExpiresAtUnixMs > 0 {
-		// Expiration fences the first effect, not reconciliation of an effect
-		// already durably marked uncertain.
-		validationTime = time.UnixMilli(command.ExpiresAtUnixMs - 1)
-	}
-	_, _, validationErr := validateMissionCommand(command, validationTime)
+
+	recovery := found && (record.State == "effect_started" || record.State == "outcome_unknown")
+	_, _, validationErr := validateMissionCommandAt(command, time.Now(), recovery)
 	if validationErr != nil {
 		result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
 		result.Message = validationErr.Error()
-		return a.persistMissionResult(ctx, fingerprint, result, false)
+		if found {
+			return a.persistMissionResult(ctx, fingerprint, result, false)
+		}
+		return result
 	}
 
+	// Holding the operation-context lock makes the exact binding fence stable
+	// from first admission through any new aircraft effect and verified success.
+	// Terminal replay and recovery readback above remain effect-free exemptions.
 	a.operationContextMu.Lock()
 	defer a.operationContextMu.Unlock()
 	a.stateMu.RLock()
@@ -112,7 +121,34 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 	if !recovery && !bindingMatches {
 		result.Status = agentv1.MissionDeploymentResult_STATUS_BINDING_MISMATCH
 		result.Message = "mission binding does not exactly match the active aircraft/flight/intent/version context"
-		return a.persistMissionResult(ctx, fingerprint, result, false)
+		if found {
+			return a.persistMissionResult(ctx, fingerprint, result, false)
+		}
+		return result
+	}
+
+	if !found {
+		var created bool
+		var err error
+		record, created, err = a.wal.ReserveMissionDeployment(ctx, command.CommandId, fingerprint, payload)
+		if err != nil {
+			if errors.Is(err, wal.ErrMissionDeploymentConflict) {
+				result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
+			} else {
+				result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+			}
+			result.Message = err.Error()
+			return result
+		}
+		if !created {
+			// Another process admitted this command after our lookup. Refuse to
+			// infer its in-flight state in this process; an exact retry will load
+			// and reconcile the durable record from the beginning.
+			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
+			result.Message = "mission command was concurrently admitted; retry exact command"
+			return result
+		}
+		found = true
 	}
 
 	if !a.tryBeginAircraftCommand() {
@@ -153,9 +189,14 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 			result.Message = "uncertain deployment reconciled by verified onboard mission readback"
 			return a.persistMissionResult(ctx, fingerprint, result, false)
 		}
+		if time.Now().UnixMilli() > command.ExpiresAtUnixMs {
+			result.Status = agentv1.MissionDeploymentResult_STATUS_ONBOARD_MISSION_MISMATCH
+			result.Message = "expired uncertain deployment does not match onboard mission; replacement upload is forbidden"
+			return a.persistMissionResult(ctx, fingerprint, result, false)
+		}
 		// A complete mismatch proves the prior attempt did not install the
-		// desired mission. A replacement is allowed only if its binding remains
-		// active and the aircraft is still safe below.
+		// desired mission. Before expiry, replacement is allowed only if its
+		// binding remains active and the aircraft is still safe below.
 		if !bindingMatches {
 			result.Status = agentv1.MissionDeploymentResult_STATUS_BINDING_MISMATCH
 			result.Message = "uncertain deployment was absent on readback, but its operation binding is no longer active"
@@ -280,6 +321,10 @@ func newMissionResult(command *agentv1.DeployMissionCommand) *agentv1.MissionDep
 }
 
 func validateMissionCommand(command *agentv1.DeployMissionCommand, now time.Time) ([]byte, string, error) {
+	return validateMissionCommandAt(command, now, false)
+}
+
+func validateMissionCommandAt(command *agentv1.DeployMissionCommand, now time.Time, allowExpired bool) ([]byte, string, error) {
 	if command == nil || strings.TrimSpace(command.CommandId) == "" || command.Binding == nil || command.Plan == nil {
 		return nil, "", errors.New("command_id, binding, and plan are required")
 	}
@@ -287,7 +332,7 @@ func validateMissionCommand(command *agentv1.DeployMissionCommand, now time.Time
 	if b.MissionId == "" || b.MissionVersion == 0 || b.DeploymentId == "" || b.OperatorId == "" || b.AircraftId == "" || b.FlightId == "" || b.IntentId == "" || b.IntentVersion == 0 {
 		return nil, "", errors.New("all mission binding identifiers and positive versions are required")
 	}
-	if command.ExpiresAtUnixMs <= 0 || now.UnixMilli() > command.ExpiresAtUnixMs || command.IssuedAtUnixMs <= 0 || command.IssuedAtUnixMs > command.ExpiresAtUnixMs {
+	if command.ExpiresAtUnixMs <= 0 || (!allowExpired && now.UnixMilli() > command.ExpiresAtUnixMs) || command.IssuedAtUnixMs <= 0 || command.IssuedAtUnixMs > command.ExpiresAtUnixMs {
 		return nil, "", errors.New("mission command timing is invalid or expired")
 	}
 	if command.Plan.SchemaVersion != missionSchemaVersion || len(command.Plan.Items) == 0 || len(command.Plan.Items) > maxMissionItems {
@@ -309,7 +354,7 @@ func validateMissionCommand(command *agentv1.DeployMissionCommand, now time.Time
 		if !canonicalMissionParameters(item) {
 			return nil, "", fmt.Errorf("mission item %d parameters do not match the ArduPilot canonical values for command %d", i, item.Command)
 		}
-		for _, value := range []float64{item.Param1, item.Param2, item.Param3, item.Param4, item.AltitudeM} {
+		for _, value := range []float64{item.Param1, item.Param2, item.Param3, item.Param4, float64(item.AltitudeM)} {
 			if math.IsNaN(value) || math.IsInf(value, 0) || float64(float32(value)) != value {
 				return nil, "", fmt.Errorf("mission item %d floating values must be finite and exactly float32-canonical", i)
 			}
@@ -317,20 +362,20 @@ func validateMissionCommand(command *agentv1.DeployMissionCommand, now time.Time
 		if item.LatitudeE7 < -900000000 || item.LatitudeE7 > 900000000 || item.LongitudeE7 < -1800000000 || item.LongitudeE7 > 1800000000 {
 			return nil, "", fmt.Errorf("mission item %d coordinates are out of range", i)
 		}
-		if !legacyCoordinateRoundTrips(item.LatitudeE7) || !legacyCoordinateRoundTrips(item.LongitudeE7) {
-			return nil, "", fmt.Errorf("mission item %d coordinates do not round-trip through ArduPilot legacy MISSION_ITEM float32 storage", i)
+		altitudeCMValue := math.Round(float64(item.AltitudeM) * 100)
+		if altitudeCMValue < math.MinInt32 || altitudeCMValue > math.MaxInt32 {
+			return nil, "", fmt.Errorf("mission item %d altitude must round-trip through ArduPilot centimeter storage", i)
 		}
-		altitudeCM := math.Round(item.AltitudeM * 100)
-		if altitudeCM < -8388608 || altitudeCM > 8388607 || float32(altitudeCM/100) != float32(item.AltitudeM) {
+		altitudeCM := int32(altitudeCMValue)
+		if math.Float32bits(float32(altitudeCM)/100) != math.Float32bits(item.AltitudeM) {
 			return nil, "", fmt.Errorf("mission item %d altitude must round-trip through ArduPilot centimeter storage", i)
 		}
 	}
-	planPayload, err := proto.MarshalOptions{Deterministic: true}.Marshal(command.Plan)
+	planDigest, err := missiondigest.Digest(command.Plan)
 	if err != nil {
-		return nil, "", fmt.Errorf("marshal canonical mission: %w", err)
+		return nil, "", fmt.Errorf("encode canonical mission: %w", err)
 	}
-	planDigest := sha256.Sum256(planPayload)
-	if b.MissionDigest != hex.EncodeToString(planDigest[:]) {
+	if b.MissionDigest != planDigest {
 		return nil, "", errors.New("mission_digest does not match the canonical mission plan")
 	}
 	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(command)
@@ -368,12 +413,7 @@ func missionCommandIdentity(command *agentv1.DeployMissionCommand) ([]byte, stri
 }
 
 func supportedMissionFrame(frame uint32) bool {
-	switch frame {
-	case 0, 3, 10:
-		return true
-	default:
-		return false
-	}
+	return frame == uint32(common.MAV_FRAME_GLOBAL)
 }
 
 func supportedMissionCommand(command uint32) bool {
