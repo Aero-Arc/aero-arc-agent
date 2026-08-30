@@ -94,7 +94,10 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 		}
 		return digest, 0, nil, nil
 	}
-	home, err := a.readbackMAVLinkHome(ctx, target, events)
+	if plan == nil || len(plan.Items) == 0 {
+		return "", 0, nil, errors.New("replacement mission requires at least one canonical item")
+	}
+	home, err := a.readbackMAVLinkHome(ctx, target, events, plan.Items[0])
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("pre-upload HOME readback: %w", err)
 	}
@@ -236,7 +239,7 @@ func (a *Agent) readbackMAVLinkMission(ctx context.Context, target *mavlinkTarge
 	return digestMissionPlan(&agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: canonical})
 }
 
-func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) (*agentv1.MissionItem, error) {
+func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, emptyMissionPlaceholder *agentv1.MissionItem) (*agentv1.MissionItem, error) {
 	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish HOME readback epoch: %w", err)
 	}
@@ -263,7 +266,18 @@ func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, 
 				}
 				resetMissionResponseTimer(timeout, responseTimeout)
 				if value.Count == 0 {
-					return nil, errors.New("ArduPilot mission readback omitted HOME at wire sequence 0")
+					if emptyMissionPlaceholder == nil {
+						return nil, errors.New("ArduPilot mission is empty and no HOME bootstrap placeholder is available")
+					}
+					if err := a.cancelMissionReadback(target); err != nil {
+						return nil, fmt.Errorf("cancel empty HOME-only mission readback: %w", err)
+					}
+					// ArduPilot reserves wire index zero for HOME. When its stored
+					// mission is empty, accepting item zero causes ArduPilot to write
+					// its authoritative AHRS home and ignore the item's content. A
+					// validated canonical item is therefore a safe protocol placeholder;
+					// the same item is sent again at wire index one as real mission data.
+					return emptyMissionPlaceholder, nil
 				}
 				countReceived = true
 				if err := a.requestMissionItem(target, 0); err != nil {

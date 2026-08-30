@@ -689,6 +689,84 @@ func TestMAVLinkMissionUploadReadsHomeFromLargerExistingMission(t *testing.T) {
 	}
 }
 
+func TestMAVLinkMissionUploadBootstrapsArduPilotHomeFromEmptyMission(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		name := "first attempt"
+		if recovery {
+			name = "pre-expiry recovery"
+		}
+		t.Run(name, func(t *testing.T) {
+			a, closeWAL := testMissionAgent(t)
+			defer closeWAL()
+			a.options = &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}
+			command := validMissionCommand(t, "empty-home-"+strings.ReplaceAll(name, " ", "-"))
+			if recovery {
+				payload, fingerprint, err := missionCommandIdentity(command)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
+					t.Fatalf("reserve uncertain command = %v, %v", created, err)
+				}
+				if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
+					t.Fatal(err)
+				}
+			}
+			a.deployMAVLinkMission = a.executeMAVLinkMissionDeployment
+			target := a.mavlinkTarget
+			home := &agentv1.MissionItem{Frame: 0, Command: 16, Autocontinue: true,
+				LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
+			emptyReadbacks := 1
+			if recovery {
+				emptyReadbacks = 2
+			}
+			listRequests := 0
+			uploadedItems := make([]*common.MessageMissionItemInt, 0, 2)
+			a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+				a.mavlinkMu.Lock()
+				events := a.pendingMissionEvents
+				a.mavlinkMu.Unlock()
+				switch value := outbound.(type) {
+				case *common.MessageMissionRequestList:
+					listRequests++
+					count := uint16(0)
+					if listRequests > emptyReadbacks {
+						count = 2
+					}
+					events <- &common.MessageMissionCount{Count: count, MissionType: common.MAV_MISSION_TYPE_MISSION}
+				case *common.MessageMissionCount:
+					if value.Count != 2 {
+						t.Fatalf("replacement wire count = %d, want 2", value.Count)
+					}
+					events <- &common.MessageMissionRequestInt{Seq: 0, MissionType: common.MAV_MISSION_TYPE_MISSION}
+					events <- &common.MessageMissionRequestInt{Seq: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+				case *common.MessageMissionItemInt:
+					copyValue := *value
+					uploadedItems = append(uploadedItems, &copyValue)
+					if len(uploadedItems) == 2 {
+						events <- &common.MessageMissionAck{Type: common.MAV_MISSION_ACCEPTED, MissionType: common.MAV_MISSION_TYPE_MISSION}
+					}
+				case *common.MessageMissionRequestInt:
+					item := home
+					if value.Seq == 1 {
+						item = command.Plan.Items[0]
+					}
+					events <- missionItemINT(target, item, value.Seq)
+				}
+				return nil
+			}
+			result := a.executeMissionDeployment(context.Background(), command)
+			if result.Status != agentv1.MissionDeploymentResult_STATUS_APPLIED || result.OnboardMissionDigest != command.Binding.MissionDigest {
+				t.Fatalf("empty HOME replacement result = %+v", result)
+			}
+			if len(uploadedItems) != 2 || uploadedItems[0].Seq != 0 || uploadedItems[1].Seq != 1 ||
+				uploadedItems[0].X != command.Plan.Items[0].LatitudeE7 || uploadedItems[1].X != command.Plan.Items[0].LatitudeE7 {
+				t.Fatalf("HOME bootstrap upload items = %+v", uploadedItems)
+			}
+		})
+	}
+}
+
 func TestMAVLinkRecoveryTreatsInvalidMissionCountsAsDefinitiveMismatch(t *testing.T) {
 	for _, test := range []struct {
 		name  string
