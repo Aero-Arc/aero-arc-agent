@@ -221,7 +221,7 @@ func (a *Agent) readbackMAVLinkMission(ctx context.Context, target *mavlinkTarge
 		return "", err
 	}
 	if len(wireItems) == 0 {
-		return "", errors.New("ArduPilot mission readback omitted HOME at wire sequence 0")
+		return "", fmt.Errorf("%w: onboard wire mission is empty", errOnboardMismatch)
 	}
 	canonical := make([]*agentv1.MissionItem, 0, len(wireItems)-1)
 	for sequence, item := range wireItems[1:] {
@@ -303,18 +303,18 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 				if value.MissionType != common.MAV_MISSION_TYPE_MISSION {
 					continue
 				}
-				if value.Count > maxWireMissionItems {
+				if value.Count == 0 || value.Count > maxWireMissionItems {
 					if err := a.cancelMissionReadback(target); err != nil {
-						return nil, fmt.Errorf("cancel oversized mission readback: %w", err)
+						return nil, fmt.Errorf("cancel invalid mission readback with wire item count %d: %w", value.Count, err)
+					}
+					if value.Count == 0 {
+						return nil, fmt.Errorf("%w: onboard wire mission is empty", errOnboardMismatch)
 					}
 					return nil, fmt.Errorf("%w: onboard wire item count %d exceeds canonical maximum %d", errOnboardMismatch, value.Count, maxWireMissionItems)
 				}
 				count = int(value.Count)
 				nextSequence = 0
 				items = make([]*agentv1.MissionItem, count)
-				if count == 0 {
-					return items, nil
-				}
 				if err := a.requestMissionItem(target, 0); err != nil {
 					return nil, err
 				}

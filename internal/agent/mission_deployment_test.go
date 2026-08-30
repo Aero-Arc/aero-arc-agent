@@ -305,6 +305,37 @@ func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	}
 }
 
+func TestMissionDeploymentUnknownRetryReplacesDefinitiveMismatchBeforeExpiry(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	command := validMissionCommand(t, "uncertain-empty-replacement-1")
+	payload, fingerprint, err := missionCommandIdentity(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
+		t.Fatalf("reserve uncertain command = %v, %v", created, err)
+	}
+	if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	readbackFlags := []bool{}
+	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
+		readbackFlags = append(readbackFlags, readbackOnly)
+		if readbackOnly {
+			// A zero MISSION_COUNT is translated to this definitive sentinel by
+			// the MAVLink adapter, allowing safe pre-expiry replacement.
+			return "", 0, nil, errOnboardMismatch
+		}
+		ack := uint32(common.MAV_MISSION_ACCEPTED)
+		return command.Binding.MissionDigest, 1, &ack, nil
+	}
+	result := a.executeMissionDeployment(context.Background(), command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_APPLIED || !slices.Equal(readbackFlags, []bool{true, false}) {
+		t.Fatalf("pre-expiry mismatch recovery result = %+v, readback flags = %v", result, readbackFlags)
+	}
+}
+
 func TestConcurrentExactMissionRetryReloadsTerminalStateAfterLock(t *testing.T) {
 	a, closeWAL := testMissionAgent(t)
 	defer closeWAL()
@@ -378,7 +409,7 @@ func TestExpiredUncertainDeploymentIsReadbackOnly(t *testing.T) {
 	}{
 		{name: "matching", readback: "requested", wantStatus: agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED},
 		{name: "mismatching", readback: "different", wantStatus: agentv1.MissionDeploymentResult_STATUS_ONBOARD_MISSION_MISMATCH},
-		{name: "oversized", readbackErr: errOnboardMismatch, wantStatus: agentv1.MissionDeploymentResult_STATUS_ONBOARD_MISSION_MISMATCH},
+		{name: "invalid onboard count", readbackErr: errOnboardMismatch, wantStatus: agentv1.MissionDeploymentResult_STATUS_ONBOARD_MISSION_MISMATCH},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			a, closeWAL := testMissionAgent(t)
@@ -600,33 +631,43 @@ func TestMAVLinkMissionUploadReadsHomeFromLargerExistingMission(t *testing.T) {
 	}
 }
 
-func TestMAVLinkRecoveryTreatsOversizedMissionAsDefinitiveMismatch(t *testing.T) {
-	command := validMissionCommand(t, "oversized-recovery-1")
-	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
-	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Second}}
-	cancelledRead := false
-	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
-		a.mavlinkMu.Lock()
-		events := a.pendingMissionEvents
-		a.mavlinkMu.Unlock()
-		switch value := outbound.(type) {
-		case *common.MessageMissionRequestList:
-			events <- &common.MessageMissionCount{Count: uint16(maxWireMissionItems + 1), MissionType: common.MAV_MISSION_TYPE_MISSION}
-		case *common.MessageMissionRequestInt:
-			t.Fatalf("oversized recovery requested mission sequence %d", value.Seq)
-		case *common.MessageMissionAck:
-			if value.Type == common.MAV_MISSION_OPERATION_CANCELLED {
-				cancelledRead = true
+func TestMAVLinkRecoveryTreatsInvalidMissionCountsAsDefinitiveMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		count uint16
+	}{
+		{name: "empty", count: 0},
+		{name: "oversized", count: uint16(maxWireMissionItems + 1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := validMissionCommand(t, test.name+"-recovery-1")
+			target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+			a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Second}}
+			cancelledRead := false
+			a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+				a.mavlinkMu.Lock()
+				events := a.pendingMissionEvents
+				a.mavlinkMu.Unlock()
+				switch value := outbound.(type) {
+				case *common.MessageMissionRequestList:
+					events <- &common.MessageMissionCount{Count: test.count, MissionType: common.MAV_MISSION_TYPE_MISSION}
+				case *common.MessageMissionRequestInt:
+					t.Fatalf("invalid-count recovery requested mission sequence %d", value.Seq)
+				case *common.MessageMissionAck:
+					if value.Type == common.MAV_MISSION_OPERATION_CANCELLED {
+						cancelledRead = true
+					}
+				}
+				return nil
 			}
-		}
-		return nil
-	}
-	_, _, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, true, command.ExpiresAtUnixMs)
-	if !errors.Is(err, errOnboardMismatch) || errors.Is(err, errMissionOutcomeUnknown) {
-		t.Fatalf("oversized recovery readback error = %v, want definitive mismatch", err)
-	}
-	if !cancelledRead {
-		t.Fatal("oversized recovery did not cancel the partial mission readback")
+			_, _, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, true, command.ExpiresAtUnixMs)
+			if !errors.Is(err, errOnboardMismatch) || errors.Is(err, errMissionOutcomeUnknown) {
+				t.Fatalf("invalid-count recovery readback error = %v, want definitive mismatch", err)
+			}
+			if !cancelledRead {
+				t.Fatal("invalid-count recovery did not cancel the mission readback")
+			}
+		})
 	}
 }
 

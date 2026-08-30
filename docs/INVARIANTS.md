@@ -268,9 +268,9 @@ All blocking operations must be cancellable or time-bounded.
   whose canonical digest matches the requested plan. An ambiguous handoff,
   timeout, or incomplete readback is durably `OUTCOME_UNKNOWN`.
 - An uncertain retry always reads the onboard mission first. It reports already
-  applied when the digest matches. An onboard count above the canonical maximum
-  is a definitive mismatch after the partial read is cancelled, not an
-  indefinitely retryable timeout. Before expiry, a complete mismatch may
+  applied when the digest matches. An empty onboard mission or a count above the
+  canonical maximum is a definitive mismatch after the read is cancelled, not
+  an indefinitely retryable timeout. Before expiry, a complete mismatch may
   re-upload only behind a fresh exact operation binding plus disarmed/on-ground
   fences, and authority is rechecked at the actual `MISSION_COUNT` handoff
   boundary after HOME readback. After expiry, recovery is readback-only:
