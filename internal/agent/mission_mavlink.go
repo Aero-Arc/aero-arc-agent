@@ -425,6 +425,11 @@ func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTa
 }
 
 func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) ([]*agentv1.MissionItem, error) {
+	responseTimeout := a.aircraftCommandTimeout()
+	return a.readbackMAVLinkWireMissionWithin(ctx, target, events, responseTimeout, missionTransferOverallTimeout(responseTimeout, maxWireMissionItems+2))
+}
+
+func (a *Agent) readbackMAVLinkWireMissionWithin(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, responseTimeout, overallTimeout time.Duration) ([]*agentv1.MissionItem, error) {
 	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish full mission readback epoch: %w", err)
 	}
@@ -433,10 +438,9 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 	}); err != nil {
 		return nil, err
 	}
-	responseTimeout := a.aircraftCommandTimeout()
 	timeout := time.NewTimer(responseTimeout)
 	defer timeout.Stop()
-	overall := time.NewTimer(missionTransferOverallTimeout(responseTimeout, maxWireMissionItems+2))
+	overall := time.NewTimer(overallTimeout)
 	defer overall.Stop()
 	count := -1
 	var nextSequence uint16

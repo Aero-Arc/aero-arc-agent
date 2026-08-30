@@ -910,7 +910,10 @@ func TestMissionReadbackQuietBoundaryConsumesAlreadyQueuedEvent(t *testing.T) {
 
 func TestMAVLinkMissionReadbackHasFixedOverallTransferDeadline(t *testing.T) {
 	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
-	const responseTimeout = 5 * time.Millisecond
+	const (
+		responseTimeout = 100 * time.Millisecond
+		overallTimeout  = 300 * time.Millisecond
+	)
 	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: responseTimeout}}
 	events := make(chan message.Message, 8)
 	stopCounts := make(chan struct{})
@@ -918,7 +921,7 @@ func TestMAVLinkMissionReadbackHasFixedOverallTransferDeadline(t *testing.T) {
 		switch outbound.(type) {
 		case *common.MessageMissionRequestList:
 			go func() {
-				ticker := time.NewTicker(time.Millisecond)
+				ticker := time.NewTicker(5 * time.Millisecond)
 				defer ticker.Stop()
 				for {
 					select {
@@ -937,12 +940,12 @@ func TestMAVLinkMissionReadbackHasFixedOverallTransferDeadline(t *testing.T) {
 		return nil
 	}
 	started := time.Now()
-	_, err := a.readbackMAVLinkWireMission(context.Background(), target, events)
+	_, err := a.readbackMAVLinkWireMissionWithin(context.Background(), target, events, responseTimeout, overallTimeout)
 	close(stopCounts)
 	if err == nil || !strings.Contains(err.Error(), "overall transfer deadline") {
 		t.Fatalf("repeated-count readback error = %v", err)
 	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
+	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("repeated-count readback exceeded fixed deadline: %v", elapsed)
 	}
 }
