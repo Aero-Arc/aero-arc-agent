@@ -270,11 +270,14 @@ All blocking operations must be cancellable or time-bounded.
   traffic. Only a `MISSION_COUNT` received after that quiet boundary can start
   the new readback epoch or decide a durable reconciliation result. A fixed
   overall epoch deadline prevents continuous protocol noise from extending
-  this drain indefinitely.
+  this drain indefinitely, and timer expiry is accepted only after a
+  non-blocking drain confirms no already-queued event is competing with it.
 - Upload and download response timeouts measure idle protocol time, not total
   transfer duration. Every valid count, requested item, or ACK renews the idle
   window so a progressing maximum-size mission can complete on a slow serial
-  link; context cancellation still bounds the overall operation.
+  link. A separate fixed deadline, sized from the configured idle timeout and
+  maximum expected protocol steps, prevents repeated valid-looking traffic from
+  holding the aircraft-command and operation-context locks indefinitely.
 - Because the readback quiet window may outlive one-shot landed evidence, the
   Agent snapshots the exact selected target again after HOME acquisition and
   explicitly reacquires `EXTENDED_SYS_STATE` when needed before the upload

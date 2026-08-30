@@ -136,10 +136,16 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	responseTimeout := a.aircraftCommandTimeout()
 	idle := time.NewTimer(responseTimeout)
 	defer idle.Stop()
+	// Each wire response may legitimately be followed by an on-demand landed
+	// evidence acquisition with its own response-timeout window.
+	overall := time.NewTimer(missionTransferOverallTimeout(responseTimeout, 2*(len(plan.Items)+2)))
+	defer overall.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return "", uploaded, ackType, fmt.Errorf("%w: %v", errMissionOutcomeUnknown, ctx.Err())
+		case <-overall.C:
+			return "", uploaded, ackType, fmt.Errorf("%w: upload exceeded overall transfer deadline", errMissionOutcomeUnknown)
 		case <-idle.C:
 			return "", uploaded, ackType, fmt.Errorf("%w: upload timed out", errMissionOutcomeUnknown)
 		case event := <-events:
@@ -298,11 +304,15 @@ func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, 
 	responseTimeout := a.aircraftCommandTimeout()
 	timeout := time.NewTimer(responseTimeout)
 	defer timeout.Stop()
+	overall := time.NewTimer(missionTransferOverallTimeout(responseTimeout, 3))
+	defer overall.Stop()
 	countReceived := false
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-overall.C:
+			return nil, errors.New("mission HOME readback exceeded overall transfer deadline")
 		case <-timeout.C:
 			return nil, errors.New("mission HOME readback timed out")
 		case event := <-events:
@@ -365,6 +375,22 @@ func stopMissionResponseTimer(timer *time.Timer) {
 	}
 }
 
+func missionTransferOverallTimeout(responseTimeout time.Duration, protocolSteps int) time.Duration {
+	if protocolSteps < 1 {
+		protocolSteps = 1
+	}
+	return time.Duration(protocolSteps) * responseTimeout
+}
+
+func consumeReadyMissionEvent(events <-chan message.Message) bool {
+	select {
+	case <-events:
+		return true
+	default:
+		return false
+	}
+}
+
 // beginMissionReadbackEpoch terminates any earlier download and requires one
 // full response-timeout interval with no mission-protocol traffic before a new
 // MISSION_REQUEST_LIST is sent. MAVLink mission messages have no transaction
@@ -387,6 +413,10 @@ func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTa
 		case <-overall.C:
 			return errors.New("mission protocol did not quiesce before the readback epoch deadline")
 		case <-quiet.C:
+			if consumeReadyMissionEvent(events) {
+				resetMissionResponseTimer(quiet, quietPeriod)
+				continue
+			}
 			return nil
 		case <-events:
 			resetMissionResponseTimer(quiet, quietPeriod)
@@ -406,6 +436,8 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 	responseTimeout := a.aircraftCommandTimeout()
 	timeout := time.NewTimer(responseTimeout)
 	defer timeout.Stop()
+	overall := time.NewTimer(missionTransferOverallTimeout(responseTimeout, maxWireMissionItems+2))
+	defer overall.Stop()
 	count := -1
 	var nextSequence uint16
 	items := make([]*agentv1.MissionItem, 0)
@@ -413,6 +445,8 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-overall.C:
+			return nil, errors.New("mission readback exceeded overall transfer deadline")
 		case <-timeout.C:
 			return nil, errors.New("mission readback timed out")
 		case event := <-events:

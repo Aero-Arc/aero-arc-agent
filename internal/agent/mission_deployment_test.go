@@ -787,6 +787,56 @@ func TestMissionReadbackQuiescenceHasFixedOverallDeadline(t *testing.T) {
 	}
 }
 
+func TestMissionReadbackQuietBoundaryConsumesAlreadyQueuedEvent(t *testing.T) {
+	events := make(chan message.Message, 1)
+	events <- &common.MessageMissionCount{Count: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+	if !consumeReadyMissionEvent(events) {
+		t.Fatal("ready stale mission event was treated as an empty quiet boundary")
+	}
+	if consumeReadyMissionEvent(events) {
+		t.Fatal("empty mission event queue was reported ready")
+	}
+}
+
+func TestMAVLinkMissionReadbackHasFixedOverallTransferDeadline(t *testing.T) {
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	const responseTimeout = 5 * time.Millisecond
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: responseTimeout}}
+	events := make(chan message.Message, 8)
+	stopCounts := make(chan struct{})
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		switch outbound.(type) {
+		case *common.MessageMissionRequestList:
+			go func() {
+				ticker := time.NewTicker(time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-stopCounts:
+						return
+					case <-ticker.C:
+						select {
+						case events <- &common.MessageMissionCount{Count: 2, MissionType: common.MAV_MISSION_TYPE_MISSION}:
+						case <-stopCounts:
+							return
+						}
+					}
+				}
+			}()
+		}
+		return nil
+	}
+	started := time.Now()
+	_, err := a.readbackMAVLinkWireMission(context.Background(), target, events)
+	close(stopCounts)
+	if err == nil || !strings.Contains(err.Error(), "overall transfer deadline") {
+		t.Fatalf("repeated-count readback error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("repeated-count readback exceeded fixed deadline: %v", elapsed)
+	}
+}
+
 func TestMAVLinkMissionUploadReadsHomeFromLargerExistingMission(t *testing.T) {
 	command := validMissionCommand(t, "large-existing-mission-1")
 	now := time.Now()
