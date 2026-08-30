@@ -320,6 +320,10 @@ All blocking operations must be cancellable or time-bounded.
 - `APPLIED` and `ALREADY_APPLIED` require a complete onboard mission readback
   whose canonical digest matches the requested plan. An ambiguous handoff,
   timeout, or incomplete readback is durably `OUTCOME_UNKNOWN`.
+- `uploaded_item_count` reports canonical items transferred by the execution
+  that produced the result: `APPLIED` reports the complete plan length, while
+  readback-only `ALREADY_APPLIED` reports zero. Terminal replay preserves the
+  original count.
 - Every durably admitted non-terminal retry, including a `prepared` record with
   no known effect, reads the onboard mission first. This preserves recovery if
   the Agent verifies a match and crashes before storing the terminal result. It

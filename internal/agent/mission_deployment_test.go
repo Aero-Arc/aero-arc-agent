@@ -392,8 +392,8 @@ func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 		t.Fatalf("first status = %v", first.Status)
 	}
 	second := a.executeMissionDeployment(context.Background(), command)
-	if second.Status != agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED {
-		t.Fatalf("second status = %v", second.Status)
+	if second.Status != agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED || second.UploadedItemCount != 0 {
+		t.Fatalf("second recovery result = %+v", second)
 	}
 	if len(readbackFlags) != 2 || readbackFlags[0] || !readbackFlags[1] {
 		t.Fatalf("readback flags = %v, want [false true]", readbackFlags)
