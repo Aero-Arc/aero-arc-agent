@@ -223,6 +223,9 @@ All blocking operations must be cancellable or time-bounded.
 - A deployment command is durably fingerprinted before any MAVLink effect.
   Reusing its ID with another payload is rejected; an exact terminal retry
   replays the stored result.
+- Durable command IDs share one namespace across operation-context mutations
+  and mission deployments. Reusing an ID across command kinds is rejected
+  transactionally before either journal can admit the conflicting command.
 - Deployment fails closed unless the active operation context exactly matches
   aircraft, flight, intent, and intent version, and fresh autopilot samples
   independently show both disarmed and on-ground state.

@@ -27,6 +27,11 @@ func TestValidateMissionCommandModelsSignedCentimeterAltitude(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "centimeter storage") {
 		t.Fatalf("validateMissionCommand() error = %v", err)
 	}
+	command.Plan.Items[0].AltitudeM = 16.8
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err == nil || !strings.Contains(err.Error(), "centimeter storage") {
+		t.Fatalf("16.8m truncating-centimeter validation error = %v", err)
+	}
 	command.Plan.Items[0].AltitudeM = 20.1
 	setMissionDigest(t, command)
 	if _, _, err := validateMissionCommand(command, time.Now()); err != nil {

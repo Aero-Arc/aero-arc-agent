@@ -148,7 +148,6 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 			result.Message = "mission command was concurrently admitted; retry exact command"
 			return result
 		}
-		found = true
 	}
 
 	if !a.tryBeginAircraftCommand() {
@@ -362,8 +361,12 @@ func validateMissionCommandAt(command *agentv1.DeployMissionCommand, now time.Ti
 		if item.LatitudeE7 < -900000000 || item.LatitudeE7 > 900000000 || item.LongitudeE7 < -1800000000 || item.LongitudeE7 > 1800000000 {
 			return nil, "", fmt.Errorf("mission item %d coordinates are out of range", i)
 		}
-		altitudeCMValue := math.Round(float64(item.AltitudeM) * 100)
-		if altitudeCMValue < math.MinInt32 || altitudeCMValue > math.MaxInt32 {
+		// ArduPilot converts the transported float32 metres to signed
+		// centimetres with float32 multiplication followed by truncation toward
+		// zero. Model that exact pipeline before comparing readback bits; using
+		// rounding would admit values such as 16.8m that normalize to 16.79m.
+		altitudeCMValue := item.AltitudeM * 100
+		if float64(altitudeCMValue) < math.MinInt32 || float64(altitudeCMValue) > math.MaxInt32 {
 			return nil, "", fmt.Errorf("mission item %d altitude must round-trip through ArduPilot centimeter storage", i)
 		}
 		altitudeCM := int32(altitudeCMValue)

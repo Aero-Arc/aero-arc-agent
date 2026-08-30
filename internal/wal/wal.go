@@ -786,6 +786,14 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, finger
 		return false, fmt.Errorf("begin operation command: %w", err)
 	}
 	defer tx.Rollback()
+	var missionExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM mission_deployments WHERE command_id = ?)`, commandID).Scan(&missionExists); err != nil {
+		return false, fmt.Errorf("check operation command ID namespace: %w", err)
+	}
+	if missionExists {
+		return false, ErrOperationCommandConflict
+	}
 
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO operation_context_commands(command_id, processed_at, command_kind, payload_fingerprint) VALUES(?, ?, ?, ?)`, commandID, time.Now().UnixNano(), kind, fingerprint)
 	if err != nil {
@@ -861,8 +869,21 @@ func (w *WAL) ReserveMissionDeployment(ctx context.Context, commandID, fingerpri
 	if commandID == "" || fingerprint == "" || len(payload) == 0 {
 		return MissionDeploymentRecord{}, false, errors.New("mission command ID, fingerprint, and payload are required")
 	}
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("begin mission deployment reservation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var operationExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM operation_context_commands WHERE command_id = ?)`, commandID).Scan(&operationExists); err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("check mission command ID namespace: %w", err)
+	}
+	if operationExists {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
 	now := time.Now().UnixNano()
-	result, err := w.db.ExecContext(ctx, `INSERT OR IGNORE INTO mission_deployments
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO mission_deployments
 		(command_id, payload_fingerprint, command_payload, state, created_at, updated_at)
 		VALUES(?, ?, ?, 'prepared', ?, ?)`, commandID, fingerprint, payload, now, now)
 	if err != nil {
@@ -872,13 +893,20 @@ func (w *WAL) ReserveMissionDeployment(ctx context.Context, commandID, fingerpri
 	if err != nil {
 		return MissionDeploymentRecord{}, false, fmt.Errorf("inspect mission deployment reservation: %w", err)
 	}
-	record, err := w.LoadMissionDeployment(ctx, commandID)
-	if err != nil {
-		return MissionDeploymentRecord{}, false, err
+	var record MissionDeploymentRecord
+	if err := tx.QueryRowContext(ctx, `SELECT command_id, payload_fingerprint, command_payload, state,
+		COALESCE(result_payload, X'') FROM mission_deployments WHERE command_id = ?`, commandID).
+		Scan(&record.CommandID, &record.PayloadFingerprint, &record.CommandPayload, &record.State, &record.ResultPayload); err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("load reserved mission deployment: %w", err)
 	}
 	if record.PayloadFingerprint != fingerprint {
 		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
 	}
+	if err := tx.Commit(); err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("commit mission deployment reservation: %w", err)
+	}
+	record.CommandPayload = append([]byte(nil), record.CommandPayload...)
+	record.ResultPayload = append([]byte(nil), record.ResultPayload...)
 	return record, rows == 1, nil
 }
 

@@ -182,7 +182,11 @@ func TestInitDBMigratesPendingTimestampsTransactionallyAndIdempotently(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close migrated telemetry rows: %v", err)
+		}
+	}()
 	for sequence := int64(1); rows.Next(); sequence++ {
 		var seq int64
 		var pendingSince sql.NullInt64
@@ -320,6 +324,37 @@ func TestMissionDeploymentJournalIsImmutableAndDurable(t *testing.T) {
 	}
 	if err := w.StoreMissionDeploymentResult(ctx, "command-1", "fingerprint-1", []byte("regression"), true); err == nil {
 		t.Fatal("terminal mission deployment regressed to outcome_unknown")
+	}
+}
+
+func TestDurableCommandIDsCannotCrossOperationAndMissionKinds(t *testing.T) {
+	w := mustNewWAL(t)
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+	ctx := context.Background()
+	operation := OperationContext{AircraftID: "aircraft-1", FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 1}
+	if applied, err := w.SetOperationContext(ctx, "shared-operation-first", operation); err != nil || !applied {
+		t.Fatalf("SetOperationContext() = %v, %v", applied, err)
+	}
+	if _, _, err := w.ReserveMissionDeployment(ctx, "shared-operation-first", "fingerprint-1", []byte("mission-1")); !errors.Is(err, ErrMissionDeploymentConflict) {
+		t.Fatalf("mission reuse of operation ID error = %v", err)
+	}
+	if _, err := w.LoadMissionDeployment(ctx, "shared-operation-first"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-kind mission row exists: %v", err)
+	}
+
+	if _, created, err := w.ReserveMissionDeployment(ctx, "shared-mission-first", "fingerprint-2", []byte("mission-2")); err != nil || !created {
+		t.Fatalf("ReserveMissionDeployment() = %v, %v", created, err)
+	}
+	if applied, err := w.SetOperationContext(ctx, "shared-mission-first", operation); !errors.Is(err, ErrOperationCommandConflict) || applied {
+		t.Fatalf("operation reuse of mission ID = %v, %v", applied, err)
+	}
+	record, err := w.LoadMissionDeployment(ctx, "shared-mission-first")
+	if err != nil || record.PayloadFingerprint != "fingerprint-2" || record.State != "prepared" {
+		t.Fatalf("mission record after collision = %+v, %v", record, err)
 	}
 }
 
