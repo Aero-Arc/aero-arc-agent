@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +32,14 @@ const (
 	walShutdownReserve                      = 10 * time.Second
 	agentShutdownTimeout                    = defaultTelemetryPersistenceDrainTimeout + walShutdownReserve
 	streamTeardownTimeout                   = 2 * time.Second
+	defaultTelemetryMaxInflight             = int64(100)
+	maximumTelemetryMaxInflight             = int64(10_000)
+	telemetryACKFlushInterval               = 10 * time.Millisecond
+	telemetryACKQueueCapacity               = 1024
+	defaultTelemetryACKProgressTimeout      = 15 * time.Second
 )
+
+var errTelemetryACKProgressTimeout = errors.New("telemetry ACK progress timed out with a full in-flight window")
 
 type telemetryStreamOwnerContextKey struct{}
 
@@ -41,6 +50,119 @@ func withTelemetryStreamOwner(ctx context.Context, owner string) context.Context
 func telemetryStreamOwner(ctx context.Context) string {
 	owner, _ := ctx.Value(telemetryStreamOwnerContextKey{}).(string)
 	return owner
+}
+
+type telemetryStreamWindowContextKey struct{}
+
+type telemetryStreamWindow struct {
+	permits         chan struct{}
+	progress        chan struct{}
+	progressTimeout time.Duration
+}
+
+func withTelemetryStreamWindow(ctx context.Context, maximum int64) context.Context {
+	if maximum <= 0 {
+		maximum = defaultTelemetryMaxInflight
+	}
+	if maximum > maximumTelemetryMaxInflight {
+		maximum = maximumTelemetryMaxInflight
+	}
+	return context.WithValue(ctx, telemetryStreamWindowContextKey{}, &telemetryStreamWindow{
+		permits:         make(chan struct{}, int(maximum)),
+		progress:        make(chan struct{}, 1),
+		progressTimeout: defaultTelemetryACKProgressTimeout,
+	})
+}
+
+func telemetryWindow(ctx context.Context) *telemetryStreamWindow {
+	window, _ := ctx.Value(telemetryStreamWindowContextKey{}).(*telemetryStreamWindow)
+	return window
+}
+
+func acquireTelemetryPermit(ctx context.Context) error {
+	window := telemetryWindow(ctx)
+	if window == nil {
+		return nil
+	}
+	for {
+		select {
+		case window.permits <- struct{}{}:
+			if len(window.permits) == cap(window.permits) {
+				// Progress observed before this acquisition cannot satisfy the new
+				// full-window epoch.
+				select {
+				case <-window.progress:
+				default:
+				}
+			}
+			return nil
+		default:
+		}
+
+		timeout := window.progressTimeout
+		if timeout <= 0 {
+			timeout = defaultTelemetryACKProgressTimeout
+		}
+		timer := time.NewTimer(timeout)
+		select {
+		case <-window.progress:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			// A durable ACK released capacity; retry the acquisition.
+			continue
+		case <-timer.C:
+			return errTelemetryACKProgressTimeout
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		}
+	}
+}
+
+func releaseTelemetryPermit(ctx context.Context) {
+	window := telemetryWindow(ctx)
+	if window == nil {
+		return
+	}
+	select {
+	case <-window.permits:
+		select {
+		case window.progress <- struct{}{}:
+		default:
+		}
+	default:
+		// A duplicate terminal ACK has no corresponding live permit.
+	}
+}
+
+func waitForFullTelemetryWindowProgress(ctx context.Context) error {
+	window := telemetryWindow(ctx)
+	if window == nil || len(window.permits) < cap(window.permits) {
+		return nil
+	}
+	timeout := window.progressTimeout
+	if timeout <= 0 {
+		timeout = defaultTelemetryACKProgressTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-window.progress:
+		return nil
+	case <-timer.C:
+		return errTelemetryACKProgressTimeout
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type Agent struct {
@@ -105,6 +227,8 @@ type Agent struct {
 	ingestCount          atomic.Uint64
 	sendCount            atomic.Uint64
 	telemetryDropCount   atomic.Uint64
+	telemetryRejectCount atomic.Uint64
+	telemetryMaxInflight atomic.Int64
 	telemetryBatchActive atomic.Int32
 	telemetryBatchMu     sync.Mutex
 	telemetryBatchOwners map[string]int
@@ -437,11 +561,7 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 
 				tFrame, err := a.buildTelemetryFrame(frameEvt)
 				if err != nil {
-					slog.LogAttrs(
-						ctx, slog.LevelError,
-						"failed_to_process_frame",
-						slog.String("error", err.Error()),
-					)
+					a.rejectTelemetryFrame(ctx, frameEvt, err)
 					continue
 				}
 				select {
@@ -450,7 +570,7 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 					dropped := a.telemetryDropCount.Add(1)
 					// Log the first drop and then exponentially to keep an
 					// overload from becoming a second source of backpressure.
-					if dropped == 1 || dropped&(dropped-1) == 0 {
+					if shouldLogExponential(dropped) {
 						slog.LogAttrs(ctx, slog.LevelError, "telemetry_persistence_queue_full",
 							slog.Uint64("dropped_total", dropped),
 							slog.Int("queue_capacity", queueSize),
@@ -480,6 +600,47 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 				continue
 			}
 		}
+	}
+}
+
+func (a *Agent) rejectTelemetryFrame(ctx context.Context, frame *gomavlib.EventFrame, err error) {
+	rejected := a.telemetryRejectCount.Add(1)
+	dropped := a.telemetryDropCount.Add(1)
+	if !shouldLogExponential(rejected) {
+		return
+	}
+	attrs := []slog.Attr{
+		slog.String("error", err.Error()),
+		slog.Uint64("rejected_total", rejected),
+		slog.Uint64("dropped_total", dropped),
+	}
+	if frame != nil && frame.Message() != nil {
+		attrs = append(attrs,
+			slog.Uint64("msg_id", uint64(frame.Message().GetID())),
+			slog.String("msg_name", fmt.Sprintf("%T", frame.Message())),
+		)
+	}
+	if isNonFiniteJSONError(err) {
+		attrs = append(attrs, slog.String("reason", "non_finite_json_value"))
+	}
+	slog.LogAttrs(ctx, slog.LevelError, "telemetry_frame_rejected", attrs...)
+}
+
+func shouldLogExponential(count uint64) bool {
+	return count > 0 && (count == 1 || count&(count-1) == 0)
+}
+
+func isNonFiniteJSONError(err error) bool {
+	var unsupported *json.UnsupportedValueError
+	if !errors.As(err, &unsupported) || !unsupported.Value.IsValid() {
+		return false
+	}
+	switch unsupported.Value.Kind() {
+	case reflect.Float32, reflect.Float64:
+		value := unsupported.Value.Float()
+		return math.IsNaN(value) || math.IsInf(value, 0)
+	default:
+		return false
 	}
 }
 
@@ -530,6 +691,9 @@ func (a *Agent) buildTelemetryFrame(frame *gomavlib.EventFrame) (*agentv1.Teleme
 	msg := frame.Message()
 	payload, err := json.Marshal(msg)
 	if err != nil {
+		if isNonFiniteJSONError(err) {
+			return nil, fmt.Errorf("telemetry message %T contains a non-finite JSON value: %w", msg, err)
+		}
 		return nil, fmt.Errorf("failed to marshal frame message: %w", err)
 	}
 
@@ -644,6 +808,14 @@ func (a *Agent) register(ctx context.Context) error {
 	if response.GetSessionId() == "" {
 		return errors.New("relay registration returned an empty session ID")
 	}
+	maximum := response.GetMaxInflight()
+	if maximum <= 0 {
+		maximum = defaultTelemetryMaxInflight
+	}
+	if maximum > maximumTelemetryMaxInflight {
+		maximum = maximumTelemetryMaxInflight
+	}
+	a.telemetryMaxInflight.Store(maximum)
 	a.stateMu.Lock()
 	a.sessionID = response.GetSessionId()
 	a.stateMu.Unlock()
@@ -655,6 +827,17 @@ func (a *Agent) register(ctx context.Context) error {
 	)
 
 	return nil
+}
+
+func (a *Agent) configuredTelemetryMaxInflight() int64 {
+	maximum := a.telemetryMaxInflight.Load()
+	if maximum <= 0 {
+		return defaultTelemetryMaxInflight
+	}
+	if maximum > maximumTelemetryMaxInflight {
+		return maximumTelemetryMaxInflight
+	}
+	return maximum
 }
 
 // openTelemetryStream opens the bidi telemetry stream.
@@ -695,15 +878,47 @@ func (a *Agent) openTelemetryStream(ctx context.Context) (grpc.BidiStreamingClie
 	return stream, nil
 }
 
-// runStreamLoop handles the receive side of the telemetry stream. Outbound
-// sends will be wired in a later iteration once the queue is implemented.
+type relayStreamReceive struct {
+	message *agentv1.RelayStreamMessage
+	err     error
+}
+
+// runAckLoop drains Relay messages independently from bounded, durable ACK
+// commits. This prevents a burst of successful telemetry ACKs from placing
+// operation-context or aircraft control messages behind one SQLite FULL commit
+// per frame.
 func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
 	commandCtx, cancelCommands := context.WithCancel(ctx)
+	ackCtx, cancelACKs := context.WithCancel(ctx)
 	var commandWG sync.WaitGroup
 	commandErrors := make(chan error, 1)
+	ackQueue := make(chan *agentv1.TelemetryAck, telemetryACKQueueCapacity)
+	ackDone := make(chan error, 1)
+	var ackWG sync.WaitGroup
+	ackWG.Add(1)
+	go func() {
+		defer ackWG.Done()
+		ackDone <- a.runTelemetryACKWorker(ackCtx, ackQueue)
+	}()
+	received := make(chan relayStreamReceive, 64)
+	go func() {
+		for {
+			message, err := stream.Recv()
+			select {
+			case received <- relayStreamReceive{message: message, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 	defer func() {
 		cancelCommands()
+		cancelACKs()
 		commandWG.Wait()
+		ackWG.Wait()
 	}()
 	for {
 		select {
@@ -711,12 +926,28 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 			return ctx.Err()
 		case err := <-commandErrors:
 			return err
-		default:
-			message, err := stream.Recv()
-			if err != nil {
-				return err
+		case err := <-ackDone:
+			return err
+		case incoming := <-received:
+			if incoming.err != nil {
+				close(ackQueue)
+				if ackErr := <-ackDone; ackErr != nil {
+					return errors.Join(incoming.err, ackErr)
+				}
+				return incoming.err
 			}
-
+			message := incoming.message
+			if ack := message.GetTelemetryAck(); ack != nil {
+				select {
+				case ackQueue <- ack:
+				case err := <-ackDone:
+					return err
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
+			}
+			var err error
 			if command := message.GetAircraftCommand(); command != nil {
 				err = a.dispatchAircraftCommand(commandCtx, stream, command, &commandWG, commandErrors)
 			} else if mission := message.GetDeployMission(); mission != nil {
@@ -725,6 +956,78 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 				err = a.handleRelayMessage(ctx, stream, message)
 			}
 			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (a *Agent) runTelemetryACKWorker(ctx context.Context, acknowledgments <-chan *agentv1.TelemetryAck) error {
+	owner := telemetryStreamOwner(ctx)
+	batchLimit := int(a.configuredTelemetryMaxInflight())
+	if batchLimit <= 0 || batchLimit > telemetryACKQueueCapacity {
+		batchLimit = int(defaultTelemetryMaxInflight)
+	}
+	ticker := time.NewTicker(telemetryACKFlushInterval)
+	defer ticker.Stop()
+	batch := make([]wal.TelemetryDeliveredAck, 0, batchLimit)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if owner == "" {
+			for _, ack := range batch {
+				if err := a.handleTelemetryAck(ctx, &agentv1.TelemetryAck{Seq: ack.Sequence, FrameId: ack.FrameID, Status: agentv1.TelemetryAck_STATUS_OK}); err != nil {
+					return err
+				}
+			}
+			batch = batch[:0]
+			return nil
+		}
+		results, err := a.wal.ApplyDeliveredTelemetryAckBatchOwned(ctx, batch, owner)
+		if err != nil {
+			return fmt.Errorf("apply delivered telemetry ACK batch: %w", err)
+		}
+		for index, result := range results {
+			if !result.CorrelatedByFrameID {
+				slog.LogAttrs(ctx, slog.LevelDebug, "telemetry_ack_seq_only", slog.Uint64("seq", batch[index].Sequence))
+			}
+			if result.Changed {
+				releaseTelemetryPermit(ctx)
+			}
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ack, ok := <-acknowledgments:
+			if !ok {
+				return flush()
+			}
+			if ack == nil || ack.GetSeq() == 0 {
+				return fmt.Errorf("%w: ACK and non-zero sequence are required", ErrInvalidTelemetryAck)
+			}
+			if ack.GetStatus() == agentv1.TelemetryAck_STATUS_OK {
+				batch = append(batch, wal.TelemetryDeliveredAck{Sequence: ack.GetSeq(), FrameID: ack.GetFrameId()})
+				if len(batch) >= batchLimit {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if err := flush(); err != nil {
+				return err
+			}
+			if err := a.handleTelemetryAck(ctx, ack); err != nil {
+				return err
+			}
+		case <-ticker.C:
+			if err := flush(); err != nil {
 				return err
 			}
 		}
@@ -871,6 +1174,9 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 		// wal_id, so deployed peers can only correlate by stream-scoped WAL seq.
 		slog.LogAttrs(ctx, slog.LevelDebug, "telemetry_ack_seq_only", slog.Uint64("seq", ack.GetSeq()))
 	}
+	if result.Changed {
+		releaseTelemetryPermit(ctx)
+	}
 	switch ack.GetStatus() {
 	case agentv1.TelemetryAck_STATUS_TEMPORARY_ERROR, agentv1.TelemetryAck_STATUS_RETRY_WITH_BACKOFF:
 		return fmt.Errorf("%w: sequence %d: %s", ErrTelemetryRetry, ack.GetSeq(), ack.GetError())
@@ -931,33 +1237,41 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 		if len(outbound) == 0 {
 			return errors.New("WAL batch contained no decodable telemetry frames")
 		}
-		// 3. Reserve each frame immediately before its Send. This preserves the
-		// fast-ACK ordering fence without aging not-yet-sent peers while gRPC flow
-		// control blocks an earlier frame. Active owner tracking prevents cleanup
-		// from stealing this stream's rows without suppressing recovery for peers.
+		// 3. Reserve the ordered batch in one FULL-synchronous SQLite transaction.
+		// Durable owner tracking keeps cleanup from stealing any row while Send is
+		// active, so one fsync can preserve the ACK-before-send fence for the whole
+		// batch without letting historical replay throttle live state indefinitely.
 		a.beginTelemetryBatch(owner)
+		var rows int64
+		var markErr error
+		if owner != "" {
+			rows, markErr = a.wal.MarkPendingBatchOwned(ctx, ids, owner)
+		} else {
+			rows, markErr = a.wal.MarkPendingBatch(ctx, ids)
+		}
+		if markErr != nil || rows != int64(len(ids)) {
+			a.endTelemetryBatch(owner)
+			if markErr == nil {
+				markErr = fmt.Errorf("changed %d of %d entries", rows, len(ids))
+			}
+			return fmt.Errorf("reserve telemetry batch pending: %w", markErr)
+		}
 		sentIDs := make([]uint64, 0, len(ids))
 		var batchErr error
+		acquiredPermits := 0
 		for index, frame := range outbound {
-			var rows int64
-			var markErr error
-			if owner != "" {
-				rows, markErr = a.wal.MarkPendingBatchOwned(ctx, []uint64{ids[index]}, owner)
-			} else {
-				rows, markErr = a.wal.MarkPendingBatch(ctx, []uint64{ids[index]})
-			}
-			if markErr != nil || rows != 1 {
-				if markErr == nil {
-					markErr = fmt.Errorf("changed %d of 1 entries", rows)
-				}
-				batchErr = fmt.Errorf("mark telemetry frame %d pending: %w", ids[index], markErr)
+			if err := acquireTelemetryPermit(ctx); err != nil {
+				batchErr = err
 				break
 			}
+			acquiredPermits++
 			sentIDs = append(sentIDs, ids[index])
 			a.sendMu.Lock()
 			err := stream.Send(frame.message)
 			a.sendMu.Unlock()
 			if err != nil {
+				releaseTelemetryPermit(ctx)
+				acquiredPermits--
 				slog.LogAttrs(ctx, slog.LevelError, "telemetry_frame_send_error", slog.String("error", err.Error()))
 				batchErr = err
 				break
@@ -977,17 +1291,29 @@ func (a *Agent) handleTelemetryFrames(ctx context.Context, stream grpc.BidiStrea
 				batchErr = fmt.Errorf("refresh telemetry batch pending epochs: %w", refreshErr)
 			}
 		}
+		if batchErr == nil {
+			// A full advertised window must observe a durably committed ACK before
+			// the stream is allowed to remain idle. Otherwise a connected but silent
+			// Relay would keep every owner-fenced row pending forever.
+			batchErr = waitForFullTelemetryWindowProgress(ctx)
+		}
 		if batchErr != nil {
-			// Return only rows that this sender actually reserved. Later peers are
-			// still written, while concurrent terminal ACK states win.
+			// Return the entire reserved batch, including peers not yet handed to
+			// gRPC. Concurrent terminal ACK states for sent rows still win.
 			var resetErr error
+			var resetRows int64
 			if owner != "" {
-				_, resetErr = a.wal.MarkWrittenBatchOwned(ctx, sentIDs, owner)
+				resetRows, resetErr = a.wal.MarkWrittenBatchOwned(ctx, ids, owner)
 			} else {
-				_, resetErr = a.wal.MarkWrittenBatch(ctx, sentIDs)
+				resetRows, resetErr = a.wal.MarkWrittenBatch(ctx, ids)
 			}
 			if resetErr != nil {
 				batchErr = errors.Join(batchErr, fmt.Errorf("return failed telemetry batch to retry: %w", resetErr))
+			} else {
+				for released := int64(0); released < resetRows && acquiredPermits > 0; released++ {
+					releaseTelemetryPermit(ctx)
+					acquiredPermits--
+				}
 			}
 		}
 		a.endTelemetryBatch(owner)
@@ -1111,9 +1437,10 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
+		connCtx = withTelemetryStreamWindow(connCtx, a.configuredTelemetryMaxInflight())
 
 		// 3. Open telemetry stream.
-		stream, err := a.openStreamFn(ctx)
+		stream, err := a.openStreamFn(connCtx)
 		if err != nil {
 			slog.LogAttrs(
 				ctx, slog.LevelError,

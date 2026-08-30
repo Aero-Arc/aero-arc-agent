@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -2405,6 +2406,57 @@ func TestPendingStreamOwnershipFencesOverlappingTeardownAndSenderCleanup(t *test
 	}
 	if result, err := w.ApplyTelemetryAckOwned(ctx, ids[1], "", TelemetryAckDelivered, "", "replacement-stream"); err != nil || !result.Changed {
 		t.Fatalf("replacement exact ACK = %#v, %v", result, err)
+	}
+}
+
+func TestDeliveredTelemetryACKBatchOwnedIsAtomicIdentityCheckedAndIdempotent(t *testing.T) {
+	w := mustNewWAL(t)
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("close WAL: %v", err)
+		}
+	}()
+	ctx := context.Background()
+	ids := make([]uint64, 4)
+	for index := range ids {
+		id, err := w.Append(ctx, &agentv1.TelemetryFrame{AgentId: "agent-1", SentAtUnixNs: int64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[index] = uint64(id)
+	}
+	if rows, err := w.MarkPendingBatchOwned(ctx, ids, "stream-1"); err != nil || rows != int64(len(ids)) {
+		t.Fatalf("reserve owned batch = %d, %v", rows, err)
+	}
+	frameID := fmt.Sprintf("7:agent-1:%d:%d", 1, ids[0])
+	results, err := w.ApplyDeliveredTelemetryAckBatchOwned(ctx, []TelemetryDeliveredAck{
+		{Sequence: ids[0], FrameID: frameID},
+		{Sequence: ids[1]},
+		{Sequence: ids[1]}, // duplicate within the same transaction is idempotent
+	}, "stream-1")
+	if err != nil || len(results) != 3 || !results[0].Changed || !results[1].Changed || results[2].Changed || !results[0].CorrelatedByFrameID {
+		t.Fatalf("delivered batch = %#v, %v", results, err)
+	}
+
+	// A later identity failure must roll back the valid transition before it.
+	if _, err := w.ApplyDeliveredTelemetryAckBatchOwned(ctx, []TelemetryDeliveredAck{
+		{Sequence: ids[2]},
+		{Sequence: ids[3], FrameID: "wrong"},
+	}, "stream-1"); !errors.Is(err, ErrTelemetryFrameIdentityMismatch) {
+		t.Fatalf("identity failure = %v", err)
+	}
+	if outstanding, err := w.CountOutstanding(ctx); err != nil || outstanding != 2 {
+		t.Fatalf("outstanding after rolled-back batch = %d, %v; want 2", outstanding, err)
+	}
+	if _, err := w.ApplyDeliveredTelemetryAckBatchOwned(ctx, []TelemetryDeliveredAck{{Sequence: ids[2]}}, "another-stream"); !errors.Is(err, ErrTelemetryAckConflict) {
+		t.Fatalf("cross-owner batch = %v", err)
+	}
+	results, err = w.ApplyDeliveredTelemetryAckBatchOwned(ctx, []TelemetryDeliveredAck{{Sequence: ids[2]}, {Sequence: ids[3]}}, "stream-1")
+	if err != nil || len(results) != 2 || !results[0].Changed || !results[1].Changed {
+		t.Fatalf("replayed exact batch = %#v, %v", results, err)
+	}
+	if outstanding, err := w.CountOutstanding(ctx); err != nil || outstanding != 0 {
+		t.Fatalf("final outstanding = %d, %v; want 0", outstanding, err)
 	}
 }
 

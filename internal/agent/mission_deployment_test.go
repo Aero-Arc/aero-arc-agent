@@ -124,6 +124,16 @@ func TestValidateMissionCommandModelsSignedCentimeterAltitude(t *testing.T) {
 	if _, _, err := validateMissionCommand(command, time.Now()); err != nil {
 		t.Fatalf("20.1m signed-centimeter altitude rejected: %v", err)
 	}
+	command.Plan.Items[0].AltitudeM = float32(21474836)
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err == nil || !strings.Contains(err.Error(), "centimeter storage") {
+		t.Fatalf("positive int32 centimeter overflow validation error = %v", err)
+	}
+	command.Plan.Items[0].AltitudeM = float32(-21474838)
+	setMissionDigest(t, command)
+	if _, _, err := validateMissionCommand(command, time.Now()); err == nil || !strings.Contains(err.Error(), "centimeter storage") {
+		t.Fatalf("negative int32 centimeter overflow validation error = %v", err)
+	}
 }
 
 func TestMissionDigestUsesSharedSchemaOneGoldenVector(t *testing.T) {
@@ -536,6 +546,60 @@ func TestExpiredUncertainDeploymentIsReadbackOnly(t *testing.T) {
 			replayed := a.executeMissionDeployment(context.Background(), command)
 			if !proto.Equal(result, replayed) || calls != 1 {
 				t.Fatalf("terminal expired recovery was not replayed: first=%+v replay=%+v calls=%d", result, replayed, calls)
+			}
+		})
+	}
+}
+
+func TestExpiredPreparedDeploymentRecoversMatchingReadbackAfterTerminalPersistenceGap(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		readback   string
+		wantStatus agentv1.MissionDeploymentResult_Status
+	}{
+		{name: "matching", readback: "requested", wantStatus: agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED},
+		{name: "mismatching", readback: "different", wantStatus: agentv1.MissionDeploymentResult_STATUS_ONBOARD_MISSION_MISMATCH},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			a, closeWAL := testMissionAgent(t)
+			defer closeWAL()
+			command := validMissionCommand(t, "expired-prepared-"+test.name)
+			command.IssuedAtUnixMs = time.Now().Add(-2 * time.Minute).UnixMilli()
+			command.ExpiresAtUnixMs = time.Now().Add(-time.Minute).UnixMilli()
+			payload, fingerprint, err := missionCommandIdentity(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// This prepared record models a crash or terminal-persistence failure
+			// after an initial effect-free readback verified the onboard mission.
+			if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
+				t.Fatalf("reserve prepared command = %v, %v", created, err)
+			}
+			a.operationContext = &wal.OperationContext{AircraftID: "other-aircraft", FlightID: "other-flight", IntentID: "other-intent", IntentVersion: 2}
+			calls := 0
+			a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
+				calls++
+				if !readbackOnly {
+					t.Fatal("expired prepared command attempted an upload")
+				}
+				if test.readback == "requested" {
+					return command.Binding.MissionDigest, 0, nil, nil
+				}
+				return strings.Repeat("0", 64), 0, nil, nil
+			}
+			result := a.executeMissionDeployment(context.Background(), command)
+			if result.GetStatus() != test.wantStatus || calls != 1 {
+				t.Fatalf("prepared recovery = %+v, calls=%d", result, calls)
+			}
+			replay := a.executeMissionDeployment(context.Background(), proto.Clone(command).(*agentv1.DeployMissionCommand))
+			if !proto.Equal(result, replay) || calls != 1 {
+				t.Fatalf("prepared terminal replay = %+v, calls=%d", replay, calls)
+			}
+			conflict := proto.Clone(command).(*agentv1.DeployMissionCommand)
+			conflict.Plan.Items[0].AltitudeM = 20.2
+			setMissionDigest(t, conflict)
+			if conflicted := a.executeMissionDeployment(context.Background(), conflict); conflicted.GetStatus() != agentv1.MissionDeploymentResult_STATUS_REJECTED || calls != 1 {
+				t.Fatalf("prepared conflicting payload = %+v, calls=%d", conflicted, calls)
 			}
 		})
 	}

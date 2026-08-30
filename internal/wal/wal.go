@@ -1993,6 +1993,33 @@ func (w *WAL) CountUndelivered(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+// CountOutstanding returns all non-terminal telemetry awaiting Relay
+// acceptance, including both written retry work and stream-owned pending rows.
+// Durable quarantine records are excluded.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the read-only query.
+//
+// Returns:
+//   - count: is the total written-plus-pending delivery backlog.
+//   - error: reports a SQLite or context failure.
+func (w *WAL) CountOutstanding(ctx context.Context) (int64, error) {
+	query := `
+	SELECT COUNT(1)
+	FROM telemetry_frames
+	WHERE delivery_status IN (?, ?)
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
+	`
+	var count int64
+	if err := w.db.QueryRowContext(ctx, query, DeliveryStatusWritten, DeliveryStatusPending).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count outstanding frames: %w", err)
+	}
+	return count, nil
+}
+
 // WaitForData blocks until new data is signaled or the context is cancelled.
 func (w *WAL) WaitForData(ctx context.Context) error {
 	select {
@@ -2145,11 +2172,11 @@ func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, 
 	baseCtx := context.WithoutCancel(ctx)
 	var txCtx context.Context
 	var cancel context.CancelFunc
-	if deadline, ok := ctx.Deadline(); ok {
-		txCtx, cancel = context.WithDeadline(baseCtx, deadline)
-	} else {
-		txCtx, cancel = context.WithTimeout(baseCtx, 2*time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
 	}
+	txCtx, cancel = context.WithDeadline(baseCtx, deadline)
 	defer cancel()
 
 	tx, err := w.db.BeginTx(txCtx, nil)
@@ -2297,6 +2324,109 @@ func (w *WAL) ApplyTelemetryAckOwned(ctx context.Context, seq uint64, frameID st
 		return TelemetryAckResult{}, errors.New("telemetry pending owner is required")
 	}
 	return w.applyTelemetryAck(ctx, seq, frameID, disposition, reason, owner)
+}
+
+// ApplyDeliveredTelemetryAckBatchOwned atomically validates and commits a
+// bounded group of successful Relay ACKs for one live telemetry stream. Every
+// non-terminal row must still be pending for owner; any invalid identity,
+// sequence, state, or ownership rolls the entire group back. Matching duplicate
+// delivered ACKs remain idempotent.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal so a FULL
+//     synchronous commit already started may finish during stream teardown. If
+//     ctx has no deadline, the transaction receives an independent two-second
+//     timeout.
+//   - acks: supplies non-zero WAL sequences and optional deployed frame IDs in
+//     receive order; an empty slice is a successful no-op.
+//   - owner: is the required non-empty token of the stream that received every ACK.
+//
+// Returns:
+//   - results: has one entry per ACK in input order and reports whether each
+//     pending row changed or was already delivered.
+//   - error: reports an empty owner, missing/mismatched identity, owner or state
+//     conflict through ErrTelemetryAckConflict, transaction deadline, commit,
+//     or SQLite failure. On error no ACK in the batch is committed.
+func (w *WAL) ApplyDeliveredTelemetryAckBatchOwned(ctx context.Context, acks []TelemetryDeliveredAck, owner string) ([]TelemetryAckResult, error) {
+	if owner == "" {
+		return nil, errors.New("telemetry pending owner is required")
+	}
+	if len(acks) == 0 {
+		return []TelemetryAckResult{}, nil
+	}
+
+	baseCtx := context.WithoutCancel(ctx)
+	var txCtx context.Context
+	var cancel context.CancelFunc
+	deadline := time.Now().Add(2 * time.Second)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	txCtx, cancel = context.WithDeadline(baseCtx, deadline)
+	defer cancel()
+
+	tx, err := w.db.BeginTx(txCtx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin delivered telemetry ACK batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	results := make([]TelemetryAckResult, 0, len(acks))
+	for _, ack := range acks {
+		if ack.Sequence == 0 {
+			return nil, fmt.Errorf("%w: sequence is zero", ErrTelemetryFrameNotFound)
+		}
+		var payload []byte
+		var current DeliveryStatus
+		var pendingOwner sql.NullString
+		if err := tx.QueryRowContext(txCtx, `SELECT payload, delivery_status, pending_owner FROM telemetry_frames WHERE seq = ?`, ack.Sequence).Scan(&payload, &current, &pendingOwner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, fmt.Errorf("%w: sequence %d", ErrTelemetryFrameNotFound, ack.Sequence)
+			}
+			return nil, fmt.Errorf("load delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+		}
+
+		result := TelemetryAckResult{PreviousStatus: current, CorrelatedByFrameID: ack.FrameID != ""}
+		if ack.FrameID != "" {
+			frame := &agentv1.TelemetryFrame{}
+			if err := proto.Unmarshal(payload, frame); err != nil {
+				return nil, fmt.Errorf("decode delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+			}
+			expected := fmt.Sprintf("%d:%s:%d:%d", len(frame.GetAgentId()), frame.GetAgentId(), frame.GetSentAtUnixNs(), ack.Sequence)
+			if ack.FrameID != expected {
+				return nil, fmt.Errorf("%w: sequence %d expected %q got %q", ErrTelemetryFrameIdentityMismatch, ack.Sequence, expected, ack.FrameID)
+			}
+		}
+		if current == DeliveryStatusDelivered {
+			results = append(results, result)
+			continue
+		}
+		if current != DeliveryStatusPending {
+			return nil, fmt.Errorf("%w: sequence %d status %d cannot become delivered", ErrTelemetryAckConflict, ack.Sequence, current)
+		}
+		if !pendingOwner.Valid || pendingOwner.String != owner {
+			return nil, fmt.Errorf("%w: sequence %d is owned by another telemetry stream", ErrTelemetryAckConflict, ack.Sequence)
+		}
+		update, err := tx.ExecContext(txCtx, `UPDATE telemetry_frames
+			SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
+			WHERE seq = ? AND delivery_status = ? AND pending_owner = ?`, DeliveryStatusDelivered, ack.Sequence, DeliveryStatusPending, owner)
+		if err != nil {
+			return nil, fmt.Errorf("apply delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+		}
+		rows, err := update.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("inspect delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+		}
+		if rows != 1 {
+			return nil, fmt.Errorf("%w: sequence %d changed concurrently", ErrTelemetryAckConflict, ack.Sequence)
+		}
+		result.Changed = true
+		results = append(results, result)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit delivered telemetry ACK batch: %w", err)
+	}
+	return results, nil
 }
 
 func (w *WAL) applyTelemetryAck(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason, owner string) (TelemetryAckResult, error) {

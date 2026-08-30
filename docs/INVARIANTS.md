@@ -35,6 +35,11 @@ durability tradeoff.
 - Frames are only marked as delivered after an explicit ACK from the relay
 - The guarantee begins when a frame reaches SQLite or a synced spool file, not
   when it first enters the asynchronous memory queue
+- A source message containing NaN or infinity cannot be represented by the
+  JSON telemetry payload and is rejected as one counted pre-admission drop; it
+  is never mutated into plausible data or allowed to block later valid state.
+  Rejection diagnostics identify the message type but log only on exponentially
+  spaced counts so a repeated bad sensor value cannot become a log storm.
 - A Relay ACK confirms admission by the official telemetry consumer; it does
   not prove that every downstream sink has durably committed the frame
 
@@ -56,9 +61,12 @@ Distributed systems favor correctness and durability over strict deduplication g
 - Pending frames may be retried indefinitely. Their TTL starts from a durable
   written-to-pending send epoch, never from the frame's capture time, because
   replayed telemetry can be old while its current send is still active.
-- Batch senders reserve each row immediately before its own network Send.
-  Cleanup cannot reset rows while a live batch owns them, and successful batch
-  completion renews the ACK window for every row that remains pending.
+- Batch senders atomically reserve each bounded FIFO batch under one durable
+  stream owner before the first network Send. This preserves ACK-before-send
+  ordering without one FULL-synchronous SQLite commit per frame. Cleanup cannot
+  reset rows while that owner has an active Send; a failed batch returns every
+  still-pending peer to written, and successful completion renews the ACK window
+  for every row that remains pending.
 - Every pending row durably records the unique stream lifecycle that reserved
   it. Stream ACK, sender cleanup, refresh, and quiesced teardown transitions
   match that owner, so a later stream cannot expose or regress rows still
@@ -68,6 +76,17 @@ Distributed systems favor correctness and durability over strict deduplication g
   backoff and reconnect instead of silently ending Relay activity. TTL cleanup
   excludes only owners with a currently active send; one wedged old sender does
   not suppress recovery of expired pending rows owned by later streams.
+- The sender never exceeds the Relay-advertised `max_inflight` frame count.
+  Successful ACKs are identity- and owner-validated in bounded atomic batches;
+  permits are released only after that terminal SQLite commit. ACK persistence
+  runs behind a bounded worker so an ACK burst cannot queue operation-context,
+  mission, or aircraft-control messages behind one FULL commit per frame.
+  A completely full window must show durable ACK progress within 15 seconds;
+  otherwise the Agent fails that stream so quiesced owner cleanup can requeue
+  its pending rows instead of fencing them forever.
+- Operational backlog is `outstanding_count` (written plus pending), not only
+  `undelivered_count` (written). Pending rows remain real work until their
+  terminal ACK batch commits.
 
 The deployed ACK contract contains `seq` and an optional `frame_id`, but not
 `wal_id`. Current Relay versions omit `frame_id`, so deployed correlation is
@@ -298,8 +317,10 @@ All blocking operations must be cancellable or time-bounded.
 - `APPLIED` and `ALREADY_APPLIED` require a complete onboard mission readback
   whose canonical digest matches the requested plan. An ambiguous handoff,
   timeout, or incomplete readback is durably `OUTCOME_UNKNOWN`.
-- An uncertain retry always reads the onboard mission first. It reports already
-  applied when the digest matches. An empty onboard mission or a count above the
+- Every durably admitted non-terminal retry, including a `prepared` record with
+  no known effect, reads the onboard mission first. This preserves recovery if
+  the Agent verifies a match and crashes before storing the terminal result. It
+  reports already applied when the digest matches. An empty onboard mission or a count above the
   canonical maximum is a definitive mismatch after the read is cancelled, not
   an indefinitely retryable timeout. Before expiry, a complete mismatch may
   re-upload only behind a fresh exact operation binding plus disarmed/on-ground

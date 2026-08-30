@@ -27,3 +27,10 @@ type TelemetryAckResult struct {
 	CorrelatedByFrameID bool
 	PreviousStatus      DeliveryStatus
 }
+
+// TelemetryDeliveredAck identifies one successful Relay telemetry ACK for a
+// batch transition to delivered.
+type TelemetryDeliveredAck struct {
+	Sequence uint64
+	FrameID  string
+}

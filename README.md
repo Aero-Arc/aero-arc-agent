@@ -115,6 +115,15 @@ The agent performs three key tasks:
   operator inspection instead of silently discarding it or retrying a poison
   frame forever. ACK mutations are conditional so fast or contradictory ACKs
   cannot regress a terminal row.
+- The Agent honors Relay `max_inflight` as a hard stream window. It reserves a
+  bounded FIFO WAL batch in one transaction and commits successful ACKs in
+  bounded owner/identity-checked transactions, releasing stream capacity only
+  after the durable terminal commit. A separate bounded ACK worker keeps
+  operation-context, mission, and aircraft-control messages responsive during
+  telemetry bursts. `telemetry_stats.outstanding_count` reports written plus
+  pending backlog; `undelivered_count` alone excludes in-flight pending rows.
+  A full window with no durable ACK progress for 15 seconds fails the stream
+  and returns its owner-scoped pending rows to retry during normal teardown.
 - `AppendAsync` first transfers an immutable copy into a bounded memory queue.
   The copy becomes crash-durable when its batch reaches SQLite or a synced
   spool file. Graceful shutdown attempts to spool the accepted queue, while an
@@ -134,6 +143,9 @@ The agent performs three key tasks:
   included in `dropped_total` and logged.
 - Malformed legacy rows and spool files are quarantined so their bytes and
   diagnostics remain available without blocking later valid telemetry.
+- MAVLink messages containing NaN or infinity are rejected before WAL
+  admission, counted in `dropped_total`, and diagnosed at exponentially spaced
+  counts. The Agent never rewrites non-finite source data into a plausible value.
 - Relay mission deployments use the same durable edge discipline: the Agent
   fingerprints the immutable command in SQLite, requires an exact active
   aircraft/flight/intent binding plus fresh disarmed/on-ground MAVLink evidence,

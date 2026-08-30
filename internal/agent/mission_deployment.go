@@ -152,7 +152,13 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		return persisted
 	}
 
-	recovery := found && (record.State == "effect_started" || record.State == "outcome_unknown")
+	// Every durable non-terminal admission, including prepared, is eligible for
+	// effect-free readback reconciliation after expiry. A process may have
+	// verified a matching onboard mission and crashed before persisting the
+	// terminal result; treating prepared as first-seen would then discard the
+	// durable fingerprint and make an exact expired retry unrecoverable.
+	recovery := found
+	effectStarted := found && (record.State == "effect_started" || record.State == "outcome_unknown")
 	_, _, validationErr := validateMissionCommandAt(command, time.Now(), recovery)
 	if validationErr != nil {
 		result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
@@ -280,7 +286,7 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		result.Message = "fresh authoritative MAVLink evidence must show the aircraft disarmed and on ground"
 		return result
 	}
-	if !recovery {
+	if !effectStarted {
 		if err := a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint); err != nil {
 			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
 			result.Message = err.Error()
@@ -420,7 +426,10 @@ func validateMissionCommandAt(command *agentv1.DeployMissionCommand, now time.Ti
 		// centimetres with float32 multiplication followed by truncation toward
 		// zero. Model that exact pipeline before comparing readback bits; using
 		// rounding would admit values such as 16.8m that normalize to 16.79m.
-		altitudeCMValue := item.AltitudeM * 100
+		altitudeCMValue := float32(item.AltitudeM) * float32(100)
+		// Check the float32 product before conversion. In particular,
+		// float32(21474836)*100 is 2147483648, which is outside int32 even
+		// though the source metre value itself appears below MaxInt32/100.
 		if float64(altitudeCMValue) < math.MinInt32 || float64(altitudeCMValue) > math.MaxInt32 {
 			return nil, "", fmt.Errorf("mission item %d altitude must round-trip through ArduPilot centimeter storage", i)
 		}
