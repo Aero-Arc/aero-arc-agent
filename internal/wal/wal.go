@@ -2057,7 +2057,21 @@ func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error
 }
 
 // MarkPendingBatchOwned atomically reserves written entries for exactly one
-// live telemetry stream. owner must be unique for that stream lifecycle.
+// live telemetry stream. The all-or-nothing transition records both a fresh
+// pending epoch and the owner before any network send.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal, allowing
+//     an in-flight reservation to finish during stream teardown. Without a
+//     deadline, the detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that must all still be written; an empty slice
+//     is a successful no-op.
+//   - owner: is the required non-empty token unique to one stream lifecycle.
+//
+// Returns:
+//   - rowsAffected: equals len(seqs) after a successful non-empty reservation.
+//   - error: reports an empty owner, any sequence not in written state through
+//     ErrTelemetryAckConflict, or a transaction, deadline, or SQLite failure.
 func (w *WAL) MarkPendingBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
 	if owner == "" {
 		return 0, errors.New("telemetry pending owner is required")
@@ -2072,7 +2086,20 @@ func (w *WAL) RefreshPendingBatch(ctx context.Context, seqs []uint64) (int64, er
 	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false, true, "", "")
 }
 
-// RefreshPendingBatchOwned renews only rows still pending for owner.
+// RefreshPendingBatchOwned renews the durable ACK epoch only for entries that
+// remain pending for the specified stream, without regressing terminal ACKs or
+// touching rows re-owned by another stream.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal. Without a
+//     deadline, the detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that may remain pending for owner; missing,
+//     terminal, written, and differently owned entries are skipped atomically.
+//   - owner: is the required non-empty stream lifecycle token to match.
+//
+// Returns:
+//   - rowsAffected: counts entries whose pending epoch was renewed.
+//   - error: reports an empty owner or a transaction, deadline, or SQLite failure.
 func (w *WAL) RefreshPendingBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
 	if owner == "" {
 		return 0, errors.New("telemetry pending owner is required")
@@ -2173,6 +2200,19 @@ func (w *WAL) MarkWrittenBatch(ctx context.Context, seqs []uint64) (int64, error
 
 // MarkWrittenBatchOwned returns only entries still pending for owner to the
 // retry queue. A delayed sender cannot regress rows re-reserved by a later stream.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal, allowing
+//     sender cleanup to finish after stream cancellation. Without a deadline,
+//     the detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that may remain pending for owner; terminal,
+//     written, missing, and differently owned entries are skipped atomically.
+//   - owner: is the required non-empty stream lifecycle token to match.
+//
+// Returns:
+//   - rowsAffected: counts matching pending entries returned to written and
+//     signaled for retry.
+//   - error: reports an empty owner or a transaction, deadline, or SQLite failure.
 func (w *WAL) MarkWrittenBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
 	if owner == "" {
 		return 0, errors.New("telemetry pending owner is required")
@@ -2224,6 +2264,22 @@ func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string,
 // ApplyTelemetryAckOwned applies a stream ACK only while the pending row still
 // belongs to that stream. Duplicate terminal ACKs remain idempotent after the
 // owner is cleared.
+//
+// Parameters:
+//   - ctx: controls cancellation and the complete SQLite ACK transaction.
+//   - seq: identifies the Agent-local durable WAL row and must be non-zero.
+//   - frameID: when present, must match the deployed Relay v1 identity derived
+//     from the durable payload.
+//   - disposition: selects delivered, retry, or permanent-quarantine handling.
+//   - reason: records Relay diagnostics for a permanent rejection.
+//   - owner: is the required non-empty token of the stream that received the ACK.
+//
+// Returns:
+//   - result: reports prior state, idempotency, and frame-ID correlation. A
+//     matching duplicate terminal ACK is idempotent even though its owner was cleared.
+//   - error: reports an empty owner, missing/mismatched frame identity, owner or
+//     state conflict through ErrTelemetryAckConflict, invalid disposition,
+//     context cancellation, or a SQLite failure.
 func (w *WAL) ApplyTelemetryAckOwned(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason, owner string) (TelemetryAckResult, error) {
 	if owner == "" {
 		return TelemetryAckResult{}, errors.New("telemetry pending owner is required")
@@ -2361,6 +2417,15 @@ func (w *WAL) RequeueAllPending(ctx context.Context) (int64, error) {
 
 // RequeuePendingOwner returns only the rows owned by a quiesced stream. Rows
 // fenced by an older sender are never exposed to a later stream teardown.
+//
+// Parameters:
+//   - ctx: controls cancellation and the owner-conditional SQLite update.
+//   - owner: is the required non-empty token of the fully quiesced stream.
+//
+// Returns:
+//   - rowsAffected: counts matching pending rows returned to written and
+//     signaled for retry; rows in every other state or owner are skipped.
+//   - error: reports an empty owner, context cancellation, or a SQLite failure.
 func (w *WAL) RequeuePendingOwner(ctx context.Context, owner string) (int64, error) {
 	if owner == "" {
 		return 0, errors.New("telemetry pending owner is required")
