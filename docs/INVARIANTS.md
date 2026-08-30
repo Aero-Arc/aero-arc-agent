@@ -258,6 +258,10 @@ All blocking operations must be cancellable or time-bounded.
 - A repeated valid `MISSION_COUNT` restarts readback sequence progress and item
   storage together at wire sequence zero; stale items from the previous
   transfer epoch cannot leave holes in canonical readback.
+- Before every HOME-only or full mission download, the Agent cancels any prior
+  transfer and observes a full mission-response timeout with no mission-protocol
+  traffic. Only a `MISSION_COUNT` received after that quiet boundary can start
+  the new readback epoch or decide a durable reconciliation result.
 - The first ArduPilot slice requires `autocontinue=true`, positive-zero
   parameters except LAND param4 exactly `+1`, and float32 altitude that
   round-trips bit-for-bit through ArduPilot signed-centimeter storage. Canonical

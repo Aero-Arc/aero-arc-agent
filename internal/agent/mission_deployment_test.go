@@ -671,6 +671,48 @@ func TestMAVLinkRecoveryTreatsInvalidMissionCountsAsDefinitiveMismatch(t *testin
 	}
 }
 
+func TestMAVLinkRecoveryDrainsStaleCountBeforeNewReadbackEpoch(t *testing.T) {
+	command := validMissionCommand(t, "stale-count-recovery-1")
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}}
+	cancelCount := 0
+	requestListCount := 0
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		a.mavlinkMu.Lock()
+		events := a.pendingMissionEvents
+		a.mavlinkMu.Unlock()
+		switch value := outbound.(type) {
+		case *common.MessageMissionAck:
+			if value.Type == common.MAV_MISSION_OPERATION_CANCELLED {
+				cancelCount++
+				if cancelCount == 1 {
+					// This belongs to the prior timed-out request. It arrives only
+					// after the retry has installed its new event channel.
+					events <- &common.MessageMissionCount{Count: 0, MissionType: common.MAV_MISSION_TYPE_MISSION}
+				}
+			}
+		case *common.MessageMissionRequestList:
+			requestListCount++
+			events <- &common.MessageMissionCount{Count: 2, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			item := &agentv1.MissionItem{Frame: 0, Command: 16, Autocontinue: true,
+				LatitudeE7: -353632608, LongitudeE7: 1491652352, AltitudeM: 200}
+			if value.Seq == 1 {
+				item = command.Plan.Items[0]
+			}
+			events <- missionItemINT(target, item, value.Seq)
+		}
+		return nil
+	}
+	digest, _, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, true, command.ExpiresAtUnixMs)
+	if err != nil || digest != command.Binding.MissionDigest {
+		t.Fatalf("readback after stale count = digest %q, err %v; want %q", digest, err, command.Binding.MissionDigest)
+	}
+	if cancelCount != 1 || requestListCount != 1 {
+		t.Fatalf("readback epoch cancel count = %d, request-list count = %d; want 1, 1", cancelCount, requestListCount)
+	}
+}
+
 func TestMAVLinkReadbackAcceptsMaximumCanonicalPlanPlusHome(t *testing.T) {
 	plan := &agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: make([]*agentv1.MissionItem, maxMissionItems)}
 	for sequence := range plan.Items {
@@ -716,20 +758,23 @@ func TestMAVLinkReadbackRestartsAfterRepeatedMissionCount(t *testing.T) {
 	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
 	home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
 	events := make(chan message.Message, 8)
-	events <- &common.MessageMissionCount{Count: 3, MissionType: common.MAV_MISSION_TYPE_MISSION}
-	events <- missionItemINT(target, home, 0)
-	// ArduPilot may restart the transfer after partial progress. An item queued
-	// for the old epoch must not advance the restarted transfer or leave holes.
-	events <- &common.MessageMissionCount{Count: 3, MissionType: common.MAV_MISSION_TYPE_MISSION}
-	events <- missionItemINT(target, plan.Items[0], 1)
-	events <- missionItemINT(target, home, 0)
-	events <- missionItemINT(target, plan.Items[0], 1)
-	events <- missionItemINT(target, plan.Items[1], 2)
 
 	requested := make([]uint16, 0, 5)
-	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Second}}
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}}
 	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
-		if request, ok := outbound.(*common.MessageMissionRequestInt); ok {
+		switch request := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			events <- &common.MessageMissionCount{Count: 3, MissionType: common.MAV_MISSION_TYPE_MISSION}
+			events <- missionItemINT(target, home, 0)
+			// ArduPilot may restart the transfer after partial progress. An item
+			// queued for the old epoch must not advance the restarted transfer or
+			// leave holes.
+			events <- &common.MessageMissionCount{Count: 3, MissionType: common.MAV_MISSION_TYPE_MISSION}
+			events <- missionItemINT(target, plan.Items[0], 1)
+			events <- missionItemINT(target, home, 0)
+			events <- missionItemINT(target, plan.Items[0], 1)
+			events <- missionItemINT(target, plan.Items[1], 2)
+		case *common.MessageMissionRequestInt:
 			requested = append(requested, request.Seq)
 		}
 		return nil

@@ -233,6 +233,9 @@ func (a *Agent) readbackMAVLinkMission(ctx context.Context, target *mavlinkTarge
 }
 
 func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) (*agentv1.MissionItem, error) {
+	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+		return nil, fmt.Errorf("establish HOME readback epoch: %w", err)
+	}
 	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
 		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
 	}); err != nil {
@@ -280,7 +283,41 @@ func (a *Agent) cancelMissionReadback(target *mavlinkTarget) error {
 	})
 }
 
+// beginMissionReadbackEpoch terminates any earlier download and requires one
+// full response-timeout interval with no mission-protocol traffic before a new
+// MISSION_REQUEST_LIST is sent. MAVLink mission messages have no transaction
+// identifier, so a delayed count from a timed-out request is otherwise
+// indistinguishable from the response to the next request and could decide a
+// durable recovery result.
+func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) error {
+	if err := a.cancelMissionReadback(target); err != nil {
+		return fmt.Errorf("cancel prior mission readback: %w", err)
+	}
+	quietPeriod := a.aircraftCommandTimeout()
+	quiet := time.NewTimer(quietPeriod)
+	defer quiet.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-quiet.C:
+			return nil
+		case <-events:
+			if !quiet.Stop() {
+				select {
+				case <-quiet.C:
+				default:
+				}
+			}
+			quiet.Reset(quietPeriod)
+		}
+	}
+}
+
 func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) ([]*agentv1.MissionItem, error) {
+	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+		return nil, fmt.Errorf("establish full mission readback epoch: %w", err)
+	}
 	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
 		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
 	}); err != nil {
