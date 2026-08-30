@@ -33,10 +33,13 @@ const (
 	agentShutdownTimeout                    = defaultTelemetryPersistenceDrainTimeout + walShutdownReserve
 	streamTeardownTimeout                   = 2 * time.Second
 	defaultTelemetryMaxInflight             = int64(100)
-	maximumTelemetryMaxInflight             = int64(10_000)
 	telemetryACKFlushInterval               = 10 * time.Millisecond
+	maximumTelemetryACKBatchSize            = 100
 	telemetryACKQueueCapacity               = 1024
-	defaultTelemetryACKProgressTimeout      = 15 * time.Second
+	// Keep the effective window within the ACK queue so a Relay-compliant ACK
+	// burst cannot block the sole control-dispatch loop.
+	maximumTelemetryMaxInflight        = int64(telemetryACKQueueCapacity)
+	defaultTelemetryACKProgressTimeout = 15 * time.Second
 )
 
 var errTelemetryACKProgressTimeout = errors.New("telemetry ACK progress timed out with a full in-flight window")
@@ -965,7 +968,7 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 func (a *Agent) runTelemetryACKWorker(ctx context.Context, acknowledgments <-chan *agentv1.TelemetryAck) error {
 	owner := telemetryStreamOwner(ctx)
 	batchLimit := int(a.configuredTelemetryMaxInflight())
-	if batchLimit <= 0 || batchLimit > telemetryACKQueueCapacity {
+	if batchLimit <= 0 || batchLimit > maximumTelemetryACKBatchSize {
 		batchLimit = int(defaultTelemetryMaxInflight)
 	}
 	ticker := time.NewTicker(telemetryACKFlushInterval)

@@ -77,6 +77,9 @@ Distributed systems favor correctness and durability over strict deduplication g
   excludes only owners with a currently active send; one wedged old sender does
   not suppress recovery of expired pending rows owned by later streams.
 - The sender never exceeds the Relay-advertised `max_inflight` frame count.
+  The Agent may select a smaller bound and caps the effective window at the
+  bounded ACK queue capacity, so every legal ACK burst can be enqueued without
+  blocking the sole control-dispatch loop.
   Successful ACKs are identity- and owner-validated in bounded atomic batches;
   permits are released only after that terminal SQLite commit. ACK persistence
   runs behind a bounded worker so an ACK burst cannot queue operation-context,

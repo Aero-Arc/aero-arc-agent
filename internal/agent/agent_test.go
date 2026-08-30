@@ -1156,6 +1156,10 @@ func TestRegister(t *testing.T) {
 	if got := a.configuredTelemetryMaxInflight(); got != 37 {
 		t.Fatalf("configured max_inflight = %d, want 37", got)
 	}
+	a.telemetryMaxInflight.Store(10_000)
+	if got := a.configuredTelemetryMaxInflight(); got != telemetryACKQueueCapacity {
+		t.Fatalf("oversized max_inflight = %d, want ACK queue capacity %d", got, telemetryACKQueueCapacity)
+	}
 
 	// Test failure case
 	a.gateway = nil

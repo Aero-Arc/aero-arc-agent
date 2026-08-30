@@ -115,8 +115,10 @@ The agent performs three key tasks:
   operator inspection instead of silently discarding it or retrying a poison
   frame forever. ACK mutations are conditional so fast or contradictory ACKs
   cannot regress a terminal row.
-- The Agent honors Relay `max_inflight` as a hard stream window. It reserves a
-  bounded FIFO WAL batch in one transaction and commits successful ACKs in
+- The Agent honors Relay `max_inflight` as a hard stream window, capped at its
+  bounded ACK queue capacity (selecting a smaller value remains within the
+  Relay recommendation). It reserves a bounded FIFO WAL batch in one
+  transaction and commits successful ACKs in
   bounded owner/identity-checked transactions, releasing stream capacity only
   after the durable terminal commit. A separate bounded ACK worker keeps
   operation-context, mission, and aircraft-control messages responsive during
