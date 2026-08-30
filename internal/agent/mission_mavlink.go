@@ -102,6 +102,10 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 		return "", 0, nil, fmt.Errorf("pre-upload HOME readback: %w", err)
 	}
 
+	target, err = a.refreshMissionUploadSafetyEvidence(ctx, target)
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("refresh post-HOME upload safety evidence: %w", err)
+	}
 	if err := a.ensureMissionUploadSafe(target); err != nil {
 		return "", 0, nil, err
 	}
@@ -207,6 +211,29 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 			}
 		}
 	}
+}
+
+func (a *Agent) refreshMissionUploadSafetyEvidence(ctx context.Context, expected *mavlinkTarget) (*mavlinkTarget, error) {
+	a.mavlinkMu.Lock()
+	current := a.mavlinkTarget
+	if current == nil || expected == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID {
+		a.mavlinkMu.Unlock()
+		return nil, errors.New("selected autopilot target changed during HOME readback")
+	}
+	target := *current
+	a.mavlinkMu.Unlock()
+	now := time.Now()
+	if target.heartbeatAt.IsZero() || now.Sub(target.heartbeatAt) > missionEvidenceTTL {
+		return nil, errors.New("fresh authoritative MAVLink heartbeat evidence is required after HOME readback")
+	}
+	if target.landedStateAt.IsZero() || now.Sub(target.landedStateAt) > missionEvidenceTTL {
+		refreshed, err := a.acquireFreshLandedState(ctx, &target)
+		if err != nil {
+			return nil, fmt.Errorf("acquire authoritative on-ground evidence after HOME readback: %w", err)
+		}
+		target = *refreshed
+	}
+	return &target, nil
 }
 
 func (a *Agent) ensureMissionUploadSafe(expected *mavlinkTarget) error {
@@ -327,10 +354,14 @@ func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTa
 	quietPeriod := a.aircraftCommandTimeout()
 	quiet := time.NewTimer(quietPeriod)
 	defer quiet.Stop()
+	overall := time.NewTimer(2 * quietPeriod)
+	defer overall.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-overall.C:
+			return errors.New("mission protocol did not quiesce before the readback epoch deadline")
 		case <-quiet.C:
 			return nil
 		case <-events:

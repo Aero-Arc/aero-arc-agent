@@ -648,6 +648,88 @@ func TestMAVLinkMissionUploadRechecksExpiryAtMissionCountBoundary(t *testing.T) 
 	}
 }
 
+func TestMAVLinkMissionUploadRefreshesLandedEvidenceAfterHomeReadback(t *testing.T) {
+	command := validMissionCommand(t, "post-home-landed-refresh-1")
+	now := time.Now()
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
+		landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now.Add(-missionEvidenceTTL + 10*time.Millisecond)}
+	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, Autocontinue: true,
+		LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
+	landedRefreshes := 0
+	a.writeMAVLinkCommand = func(channel *gomavlib.Channel, request *common.MessageCommandLong) error {
+		if channel != target.channel || request.Command != common.MAV_CMD_REQUEST_MESSAGE || request.Param1 != 245 {
+			t.Fatalf("post-HOME landed-state request = %+v", request)
+		}
+		landedRefreshes++
+		a.observeMAVLinkLandedState(channel, target.systemID, target.componentID, common.MAV_LANDED_STATE_ON_GROUND)
+		return nil
+	}
+	errReplacementObserved := errors.New("replacement count observed")
+	replacementStarted := false
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		a.mavlinkMu.Lock()
+		events := a.pendingMissionEvents
+		a.mavlinkMu.Unlock()
+		switch value := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			events <- &common.MessageMissionCount{Count: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			events <- missionItemINT(target, home, value.Seq)
+		case *common.MessageMissionCount:
+			replacementStarted = true
+			return errReplacementObserved
+		}
+		return nil
+	}
+	_, _, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false, command.ExpiresAtUnixMs)
+	if !errors.Is(err, errMissionOutcomeUnknown) || !strings.Contains(err.Error(), errReplacementObserved.Error()) {
+		t.Fatalf("post-HOME refreshed upload error = %v", err)
+	}
+	if landedRefreshes != 1 || !replacementStarted {
+		t.Fatalf("post-HOME landed refreshes=%d replacement started=%v, want 1 and true", landedRefreshes, replacementStarted)
+	}
+}
+
+func TestMissionReadbackQuiescenceHasFixedOverallDeadline(t *testing.T) {
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: 10 * time.Millisecond}}
+	events := make(chan message.Message, 32)
+	stopNoise := make(chan struct{})
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		ack, ok := outbound.(*common.MessageMissionAck)
+		if !ok || ack.Type != common.MAV_MISSION_OPERATION_CANCELLED {
+			t.Fatalf("quiescence preamble = %+v", outbound)
+		}
+		go func() {
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopNoise:
+					return
+				case <-ticker.C:
+					select {
+					case events <- &common.MessageMissionCount{Count: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}:
+					case <-stopNoise:
+						return
+					}
+				}
+			}
+		}()
+		return nil
+	}
+	started := time.Now()
+	err := a.beginMissionReadbackEpoch(context.Background(), target, events)
+	close(stopNoise)
+	if err == nil || !strings.Contains(err.Error(), "did not quiesce") {
+		t.Fatalf("noisy quiescence error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("noisy quiescence exceeded fixed deadline: %v", elapsed)
+	}
+}
+
 func TestMAVLinkMissionUploadReadsHomeFromLargerExistingMission(t *testing.T) {
 	command := validMissionCommand(t, "large-existing-mission-1")
 	now := time.Now()
