@@ -13,6 +13,12 @@ import (
 	"github.com/bluenviron/gomavlib/v3/pkg/message"
 )
 
+type missionTransactionTarget struct {
+	channel     *gomavlib.Channel
+	systemID    uint8
+	componentID uint8
+}
+
 func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
 	if frame == nil {
 		return
@@ -27,7 +33,7 @@ func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
 		return
 	}
 	a.mavlinkMu.Lock()
-	target := a.mavlinkTarget
+	target := a.pendingMissionTarget
 	events := a.pendingMissionEvents
 	matched := target != nil && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
 	a.mavlinkMu.Unlock()
@@ -75,11 +81,15 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 		return "", 0, nil, errors.New("another MAVLink mission transaction is active")
 	}
 	a.pendingMissionEvents = events
+	a.pendingMissionTarget = &missionTransactionTarget{
+		channel: target.channel, systemID: target.systemID, componentID: target.componentID,
+	}
 	a.mavlinkMu.Unlock()
 	defer func() {
 		a.mavlinkMu.Lock()
 		if a.pendingMissionEvents == events {
 			a.pendingMissionEvents = nil
+			a.pendingMissionTarget = nil
 		}
 		a.mavlinkMu.Unlock()
 	}()

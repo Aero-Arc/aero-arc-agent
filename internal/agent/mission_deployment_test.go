@@ -16,10 +16,49 @@ import (
 	"github.com/aero-arc/aero-arc-protos/missiondigest"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/bluenviron/gomavlib/v3/pkg/frame"
 	"github.com/bluenviron/gomavlib/v3/pkg/message"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestMissionProtocolEventsRemainBoundToTransactionTarget(t *testing.T) {
+	oldChannel := &gomavlib.Channel{}
+	newChannel := &gomavlib.Channel{}
+	events := make(chan message.Message, 2)
+	a := &Agent{
+		mavlinkTarget:        &mavlinkTarget{channel: oldChannel, systemID: 1, componentID: 1},
+		pendingMissionEvents: events,
+		pendingMissionTarget: &missionTransactionTarget{channel: oldChannel, systemID: 1, componentID: 1},
+	}
+
+	a.observeMAVLinkHeartbeat(newChannel, 2, 1, false)
+	missionCount := func(channel *gomavlib.Channel, systemID uint8) *gomavlib.EventFrame {
+		return &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{
+			SystemID: systemID, ComponentID: 1,
+			Message: &common.MessageMissionCount{
+				TargetSystem: mavlinkSourceSystemID, TargetComponent: mavlinkSourceComponentID,
+				Count: 2, MissionType: common.MAV_MISSION_TYPE_MISSION,
+			},
+		}}
+	}
+	a.observeMissionProtocolMessage(missionCount(newChannel, 2))
+	select {
+	case got := <-events:
+		t.Fatalf("newly selected target event reached old transaction: %T", got)
+	default:
+	}
+
+	a.observeMissionProtocolMessage(missionCount(oldChannel, 1))
+	select {
+	case got := <-events:
+		if _, ok := got.(*common.MessageMissionCount); !ok {
+			t.Fatalf("old transaction event type = %T", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original transaction target event was not delivered")
+	}
+}
 
 func TestValidateMissionCommandModelsSignedCentimeterAltitude(t *testing.T) {
 	command := validMissionCommand(t, "command-1")

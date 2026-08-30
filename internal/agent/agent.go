@@ -83,6 +83,7 @@ type Agent struct {
 	mavlinkLandedStateSeq uint64
 	pendingMAVLinkCommand *pendingMAVLinkCommand
 	pendingMissionEvents  chan message.Message
+	pendingMissionTarget  *missionTransactionTarget
 	aircraftAckAmbiguous  bool
 	// aircraftAckAmbiguousSince starts a transport-quiescence epoch at the
 	// first continuously processed target-channel event after matching ACK
