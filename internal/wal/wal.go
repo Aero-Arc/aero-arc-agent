@@ -2082,6 +2082,18 @@ func (w *WAL) MarkPendingBatchOwned(ctx context.Context, seqs []uint64, owner st
 // RefreshPendingBatch renews the durable send epoch for entries that remain
 // pending after a stream sender finishes its batch. Concurrent terminal ACKs
 // are excluded by the pending-state predicate and never regress.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal, allowing
+//     the refresh to finish during stream teardown. Without a deadline, the
+//     detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that may remain pending; missing, written, and
+//     terminal entries are skipped atomically, and an empty slice is a no-op.
+//
+// Returns:
+//   - rowsAffected: counts sequence entries whose durable pending epoch was
+//     renewed; it is zero when none remain pending.
+//   - error: reports a transaction, deadline, commit, or SQLite failure.
 func (w *WAL) RefreshPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
 	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false, true, "", "")
 }
@@ -2449,6 +2461,16 @@ func (w *WAL) RequeuePendingOwner(ctx context.Context, owner string) (int64, err
 // ResetPending returns entries whose durable pending epoch is older than ttl
 // to the written retry queue. Capture time is deliberately not used: replayed
 // frames may be old while their current network send is still active.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the SQLite update.
+//   - ttl: is the maximum pending age; a non-positive duration is a successful
+//     no-op. Callers must separately fence any live sender ownership.
+//
+// Returns:
+//   - rowsAffected: counts expired pending entries returned to written and
+//     signaled for retry.
+//   - error: reports a SQLite row-count, update, or context failure.
 func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error) {
 	if ttl <= 0 {
 		return 0, nil
