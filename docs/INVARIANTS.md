@@ -35,6 +35,11 @@ durability tradeoff.
 - Frames are only marked as delivered after an explicit ACK from the relay
 - The guarantee begins when a frame reaches SQLite or a synced spool file, not
   when it first enters the asynchronous memory queue
+- A source message containing NaN or infinity cannot be represented by the
+  JSON telemetry payload and is rejected as one counted pre-admission drop; it
+  is never mutated into plausible data or allowed to block later valid state.
+  Rejection diagnostics identify the message type but log only on exponentially
+  spaced counts so a repeated bad sensor value cannot become a log storm.
 - A Relay ACK confirms admission by the official telemetry consumer; it does
   not prove that every downstream sink has durably committed the frame
 
@@ -45,9 +50,53 @@ Distributed systems favor correctness and durability over strict deduplication g
 
 ### 1.3 ACKs Are the Only Source of Truth for Delivery
 
-- A frame is considered delivered **only** after the relay acknowledges it
-- Pending frames may be retried indefinitely
-- Stuck pending frames may be reset after a TTL and retried
+- A frame is considered delivered **only** after the relay acknowledges that
+  exact pending frame with `STATUS_OK`
+- `STATUS_TEMPORARY_ERROR` and `STATUS_RETRY_WITH_BACKOFF` return the frame to
+  the written queue and reconnect through the normal transport backoff
+- `STATUS_PERMANENT_ERROR` never means delivered: the Agent atomically preserves
+  the original payload and Relay diagnostic in durable quarantine
+- ACK transitions are monotonic. A late contradictory ACK must not move a
+  delivered or quarantined row back into the retry queue
+- Pending frames may be retried indefinitely. Their TTL starts from a durable
+  written-to-pending send epoch, never from the frame's capture time, because
+  replayed telemetry can be old while its current send is still active.
+- Batch senders atomically reserve each bounded FIFO batch under one durable
+  stream owner before the first network Send. This preserves ACK-before-send
+  ordering without one FULL-synchronous SQLite commit per frame. Cleanup cannot
+  reset rows while that owner has an active Send; a failed batch returns every
+  still-pending peer to written, and successful completion renews the ACK window
+  for every row that remains pending.
+- Every pending row durably records the unique stream lifecycle that reserved
+  it. Stream ACK, sender cleanup, refresh, and quiesced teardown transitions
+  match that owner, so a later stream cannot expose or regress rows still
+  fenced by an older timed-out sender. Status-conditional updates preserve
+  terminal ACKs that already committed. If a worker misses the bounded teardown
+  deadline, its rows remain fenced, but the supervised transport loop continues
+  backoff and reconnect instead of silently ending Relay activity. TTL cleanup
+  excludes only owners with a currently active send; one wedged old sender does
+  not suppress recovery of expired pending rows owned by later streams.
+- The sender never exceeds the Relay-advertised `max_inflight` frame count.
+  The Agent may select a smaller bound and caps the effective window at the
+  bounded ACK queue capacity, so every legal ACK burst can be enqueued without
+  blocking the sole control-dispatch loop.
+  Successful ACKs are identity- and owner-validated in bounded atomic batches;
+  permits are released only after that terminal SQLite commit. ACK persistence
+  runs behind a bounded worker so an ACK burst cannot queue operation-context,
+  mission, or aircraft-control messages behind one FULL commit per frame.
+  A completely full window must show durable ACK progress within 15 seconds;
+  otherwise the Agent fails that stream so quiesced owner cleanup can requeue
+  its pending rows instead of fencing them forever.
+- Operational backlog is `outstanding_count` (written plus pending), not only
+  `undelivered_count` (written). Pending rows remain real work until their
+  terminal ACK batch commits.
+
+The deployed ACK contract contains `seq` and an optional `frame_id`, but not
+`wal_id`. Current Relay versions omit `frame_id`, so deployed correlation is
+limited to the authenticated stream and Agent-local sequence. When `frame_id`
+is present, the Agent validates it against the durable payload before mutation.
+A future protocol revision must echo `(wal_id, seq)` to make correlation complete
+across WAL generations without relying on stream lifetime.
 
 **Rationale:**  
 The relay is the downstream system of record for delivery confirmation.
@@ -200,7 +249,99 @@ All blocking operations must be cancellable or time-bounded.
 
 ---
 
-## 5. Non-Goals (Explicit)
+## 5. Mission Deployment Invariants
+
+- A deployment command is durably fingerprinted before any MAVLink effect.
+  Reusing its ID with another payload is rejected; an exact terminal retry
+  replays the stored result.
+- Mission deployment dispatch admits at most one worker before spawning. A
+  concurrent Relay burst receives immediate retryable results rather than
+  accumulating goroutines blocked on the deployment/context lock, so stream
+  cancellation and teardown remain bounded.
+- Durable command IDs share one namespace across operation-context mutations
+  and mission deployments. Reusing an ID across command kinds is rejected
+  transactionally before either journal can admit the conflicting command.
+- Deployment fails closed unless the active operation context exactly matches
+  aircraft, flight, intent, and intent version, and fresh autopilot samples
+  independently show both disarmed and on-ground state.
+- If ArduPilot has not streamed fresh `EXTENDED_SYS_STATE`, the Agent issues one
+  target-bound `MAV_CMD_REQUEST_MESSAGE` for message 245 and waits within the
+  command timeout for a newer sample from that exact channel/system/component.
+  Timeout or target movement still fails closed; absence never implies landed.
+- Schema v1 accepts at most 200 contiguous `MAV_FRAME_GLOBAL` (frame `0`)
+  mission items and only waypoint (`16`), land (`21`), and takeoff (`22`)
+  commands. The shared Protos `missiondigest` encoder, rather than protobuf
+  wire serialization, defines the cross-runtime canonical bytes and SHA-256.
+- Canonical mission items require `current=false`. The Agent normalizes
+  readback `current` to false because ArduPilot derives that bit from the live
+  execution cursor rather than immutable stored mission content.
+- Canonical plans exclude ArduPilot's volatile wire-sequence-zero HOME record.
+  Before replacement, a HOME-only read requests sequence zero without applying
+  the incoming-plan item limit to the existing onboard mission, then explicitly
+  cancels that partial download. If the existing count is zero, the adapter uses
+  the first validated canonical item as ArduPilot's ignored wire-zero bootstrap
+  placeholder; ArduPilot writes its authoritative AHRS home, and the item is
+  sent again at wire one as mission data. Otherwise the adapter reuses HOME.
+  It excludes HOME from `uploaded_item_count`, then drops HOME and shifts
+  sequences back before readback digest verification.
+- An accepted mission ACK can end an upload epoch only after that epoch handed
+  off every requested wire item, including HOME. An accepted ACK buffered from
+  an older timed-out upload must not trigger premature readback or a terminal
+  mismatch for a partially replaced list.
+- A repeated valid `MISSION_COUNT` restarts readback sequence progress and item
+  storage together at wire sequence zero; stale items from the previous
+  transfer epoch cannot leave holes in canonical readback.
+- Before every HOME-only or full mission download, the Agent cancels any prior
+  transfer and observes a full mission-response timeout with no mission-protocol
+  traffic. Only a `MISSION_COUNT` received after that quiet boundary can start
+  the new readback epoch or decide a durable reconciliation result. A fixed
+  overall epoch deadline prevents continuous protocol noise from extending
+  this drain indefinitely, and timer expiry is accepted only after a
+  non-blocking drain confirms no already-queued event is competing with it.
+- Upload and download response timeouts measure idle protocol time, not total
+  transfer duration. Every valid count, requested item, or ACK renews the idle
+  window so a progressing maximum-size mission can complete on a slow serial
+  link. A separate fixed deadline, sized from the configured idle timeout and
+  maximum expected protocol steps, prevents repeated valid-looking traffic from
+  holding the aircraft-command and operation-context locks indefinitely.
+- Because the readback quiet window may outlive one-shot landed evidence, the
+  Agent snapshots the exact selected target again after HOME acquisition and
+  explicitly reacquires `EXTENDED_SYS_STATE` when needed before the upload
+  safety and expiry fences. Every valid item request repeats that exact-target,
+  fresh-heartbeat, disarmed, and on-ground fence before handing off the item;
+  a progressing long upload reacquires one-shot landed evidence whenever it
+  ages out instead of either assuming safety or failing permanently on staleness.
+- The first ArduPilot slice requires `autocontinue=true`, positive-zero
+  parameters except LAND param4 exactly `+1`, and float32 altitude that
+  round-trips bit-for-bit through ArduPilot signed-centimeter storage. Canonical
+  E7 coordinates are authoritative and remain exact over `MISSION_ITEM_INT`;
+  float-coordinate losslessness is checked only when an autopilot actually
+  requests the legacy `MISSION_ITEM` fallback.
+- `APPLIED` and `ALREADY_APPLIED` require a complete onboard mission readback
+  whose canonical digest matches the requested plan. An ambiguous handoff,
+  timeout, or incomplete readback is durably `OUTCOME_UNKNOWN`.
+- `uploaded_item_count` reports canonical items transferred by the execution
+  that produced the result: `APPLIED` reports the complete plan length, while
+  readback-only `ALREADY_APPLIED` reports zero. Terminal replay preserves the
+  original count.
+- Every durably admitted non-terminal retry, including a `prepared` record with
+  no known effect, reads the onboard mission first. This preserves recovery if
+  the Agent verifies a match and crashes before storing the terminal result. It
+  reports already applied when the digest matches. An empty onboard mission or a count above the
+  canonical maximum is a definitive mismatch after the read is cancelled, not
+  an indefinitely retryable timeout. Before expiry, a complete mismatch may
+  re-upload only behind a fresh exact operation binding plus disarmed/on-ground
+  fences, and authority is rechecked at the actual `MISSION_COUNT` handoff
+  boundary after HOME readback. After expiry, recovery is readback-only:
+  mismatch is terminal and can never replace the onboard mission. First-seen
+  expired commands are rejected without durable admission, while exact
+  terminal replay remains available.
+- Mission deployment replaces the stored mission only. It does not arm, start,
+  advance, or complete a flight.
+
+---
+
+## 6. Non-Goals (Explicit)
 
 The following are **not goals** of the Aero Arc Agent v0.1:
 
@@ -212,7 +353,7 @@ The following are **not goals** of the Aero Arc Agent v0.1:
 
 ---
 
-## 6. Invariant Changes
+## 7. Invariant Changes
 
 Any change that violates one or more invariants **must** include:
 

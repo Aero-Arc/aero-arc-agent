@@ -109,6 +109,23 @@ The agent performs three key tasks:
   cursor; already-persisted frames keep their original cursor on retry.
 - Relay ACKs provide at-least-once admission semantics. Retries are expected,
   and end-to-end exactly-once storage is not claimed.
+- Only `STATUS_OK` marks the exact pending WAL row delivered. Retryable ACKs
+  return it to the durable send queue and reconnect with backoff. Permanent
+  rejection moves the payload and Relay diagnostic to durable quarantine for
+  operator inspection instead of silently discarding it or retrying a poison
+  frame forever. ACK mutations are conditional so fast or contradictory ACKs
+  cannot regress a terminal row.
+- The Agent honors Relay `max_inflight` as a hard stream window, capped at its
+  bounded ACK queue capacity (selecting a smaller value remains within the
+  Relay recommendation). It reserves a bounded FIFO WAL batch in one
+  transaction and commits successful ACKs in
+  bounded owner/identity-checked transactions, releasing stream capacity only
+  after the durable terminal commit. A separate bounded ACK worker keeps
+  operation-context, mission, and aircraft-control messages responsive during
+  telemetry bursts. `telemetry_stats.outstanding_count` reports written plus
+  pending backlog; `undelivered_count` alone excludes in-flight pending rows.
+  A full window with no durable ACK progress for 15 seconds fails the stream
+  and returns its owner-scoped pending rows to retry during normal teardown.
 - `AppendAsync` first transfers an immutable copy into a bounded memory queue.
   The copy becomes crash-durable when its batch reaches SQLite or a synced
   spool file. Graceful shutdown attempts to spool the accepted queue, while an
@@ -128,6 +145,18 @@ The agent performs three key tasks:
   included in `dropped_total` and logged.
 - Malformed legacy rows and spool files are quarantined so their bytes and
   diagnostics remain available without blocking later valid telemetry.
+- MAVLink messages containing NaN or infinity are rejected before WAL
+  admission, counted in `dropped_total`, and diagnosed at exponentially spaced
+  counts. The Agent never rewrites non-finite source data into a plausible value.
+- Relay mission deployments use the same durable edge discipline: the Agent
+  fingerprints the immutable command in SQLite, requires an exact active
+  aircraft/flight/intent binding plus fresh disarmed/on-ground MAVLink evidence,
+  uploads with the MAVLink mission protocol, and verifies a canonical onboard
+  readback digest before reporting success. Ambiguous writes are recorded as
+  `OUTCOME_UNKNOWN`; an exact retry reconciles by readback before it may upload
+  again. The ArduPilot adapter keeps wire-sequence-zero HOME outside the
+  canonical plan and normalizes the dynamic `current` cursor bit before digest
+  verification. This slice installs a mission but intentionally does not start it.
 
 ## Configuration
 

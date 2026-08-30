@@ -39,6 +39,21 @@ const lifecycleShutdownGrace = 5 * time.Second
 // with a different command kind or payload.
 var ErrOperationCommandConflict = errors.New("operation command ID reused with a different payload")
 
+// ErrMissionDeploymentConflict reports reuse of a durable mission command ID
+// with a different immutable command payload.
+var ErrMissionDeploymentConflict = errors.New("mission deployment command ID reused with a different payload")
+
+var (
+	// ErrTelemetryFrameNotFound reports an ACK for no durable WAL sequence.
+	ErrTelemetryFrameNotFound = errors.New("telemetry ACK sequence does not exist")
+	// ErrTelemetryFrameIdentityMismatch reports an ACK frame ID that does not
+	// identify the durable payload stored at its sequence.
+	ErrTelemetryFrameIdentityMismatch = errors.New("telemetry ACK frame identity does not match WAL entry")
+	// ErrTelemetryAckConflict reports a status that cannot follow the entry's
+	// current durable delivery state without regressing or discarding evidence.
+	ErrTelemetryAckConflict = errors.New("telemetry ACK conflicts with WAL delivery state")
+)
+
 const (
 	spoolFileMagic           = "AEROARC-SPOOL\x00\x01"
 	spoolIDLength            = 36
@@ -213,10 +228,13 @@ func initDB(db *sql.DB) error {
 		seq INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at INTEGER NOT NULL,
 		payload BLOB NOT NULL,
-		delivery_status INTEGER NOT NULL DEFAULT 0
+		delivery_status INTEGER NOT NULL DEFAULT 0,
+		pending_since_unix_ns INTEGER,
+		pending_owner TEXT
 	);
 	CREATE TABLE IF NOT EXISTS operation_context (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
+		aircraft_id TEXT NOT NULL DEFAULT '',
 		flight_id TEXT NOT NULL,
 		intent_id TEXT NOT NULL,
 		intent_version INTEGER NOT NULL,
@@ -227,6 +245,15 @@ func initDB(db *sql.DB) error {
 		processed_at INTEGER NOT NULL,
 		command_kind TEXT NOT NULL DEFAULT '',
 		payload_fingerprint TEXT NOT NULL DEFAULT ''
+	);
+	CREATE TABLE IF NOT EXISTS mission_deployments (
+		command_id TEXT PRIMARY KEY,
+		payload_fingerprint TEXT NOT NULL,
+		command_payload BLOB NOT NULL,
+		state TEXT NOT NULL CHECK (state IN ('prepared', 'effect_started', 'outcome_unknown', 'terminal')),
+		result_payload BLOB,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS wal_metadata (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -255,10 +282,18 @@ func initDB(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
+	if err := ensureTelemetryPendingSince(db); err != nil {
+		return err
+	}
+	if err := ensureTelemetryPendingOwner(db); err != nil {
+		return err
+	}
 
 	indexQuery := `
 	CREATE INDEX IF NOT EXISTS idx_telemetry_undelivered
 	ON telemetry_frames (delivery_status, seq);
+	CREATE INDEX IF NOT EXISTS idx_telemetry_pending_age
+	ON telemetry_frames (delivery_status, pending_since_unix_ns);
 	CREATE INDEX IF NOT EXISTS idx_telemetry_frame_quarantine_newest
 	ON telemetry_frame_quarantine (quarantined_at DESC, seq DESC);
 	`
@@ -272,7 +307,94 @@ func initDB(db *sql.DB) error {
 	if err := ensureOperationCommandFingerprint(db); err != nil {
 		return err
 	}
+	if err := ensureOperationContextAircraftID(db); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+// ensureTelemetryPendingSince adds the durable send-epoch timestamp to WALs
+// created by older Agent versions. The schema change and backfill share one
+// transaction so startup never exposes a partially migrated delivery state.
+// Legacy pending rows inherit their capture time and may therefore be eligible
+// for immediate retry after startup; no sender from the previous process can
+// still own them. Non-pending rows never retain a pending timestamp.
+func ensureTelemetryPendingSince(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin telemetry pending timestamp migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('telemetry_frames') WHERE name = 'pending_since_unix_ns'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect telemetry pending timestamp schema: %w", err)
+	}
+	if count == 0 {
+		if _, err := tx.Exec(`ALTER TABLE telemetry_frames ADD COLUMN pending_since_unix_ns INTEGER`); err != nil {
+			return fmt.Errorf("add telemetry pending timestamp: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE telemetry_frames
+		SET pending_since_unix_ns = created_at
+		WHERE delivery_status = ? AND pending_since_unix_ns IS NULL`, DeliveryStatusPending); err != nil {
+		return fmt.Errorf("backfill telemetry pending timestamps: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE telemetry_frames
+		SET pending_since_unix_ns = NULL
+		WHERE delivery_status != ? AND pending_since_unix_ns IS NOT NULL`, DeliveryStatusPending); err != nil {
+		return fmt.Errorf("repair non-pending telemetry timestamps: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit telemetry pending timestamp migration: %w", err)
+	}
+	return nil
+}
+
+// ensureTelemetryPendingOwner adds the durable stream-ownership fence used by
+// send, teardown, and ACK transitions. Legacy pending rows intentionally keep
+// a NULL owner: no sender from the previous process survives startup, and the
+// pending-age migration makes those rows safely recoverable through TTL reset.
+// The schema repair is transactional and idempotent.
+func ensureTelemetryPendingOwner(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin telemetry pending owner migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('telemetry_frames') WHERE name = 'pending_owner'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect telemetry pending owner schema: %w", err)
+	}
+	if count == 0 {
+		if _, err := tx.Exec(`ALTER TABLE telemetry_frames ADD COLUMN pending_owner TEXT`); err != nil {
+			return fmt.Errorf("add telemetry pending owner: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE telemetry_frames
+		SET pending_owner = NULL
+		WHERE delivery_status != ? AND pending_owner IS NOT NULL`, DeliveryStatusPending); err != nil {
+		return fmt.Errorf("repair non-pending telemetry owners: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit telemetry pending owner migration: %w", err)
+	}
+	return nil
+}
+
+func ensureOperationContextAircraftID(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('operation_context') WHERE name = 'aircraft_id'`).Scan(&count); err != nil {
+		return fmt.Errorf("inspect operation context schema: %w", err)
+	}
+	if count != 0 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE operation_context ADD COLUMN aircraft_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("add operation context aircraft_id: %w", err)
+	}
 	return nil
 }
 
@@ -516,7 +638,8 @@ func migrateLegacyFrameBatch(ctx context.Context, db *sql.DB, generationID strin
 				item.seq, time.Now().UnixNano(), item.quarantineReason, item.originalDeliveryStatus); err != nil {
 				return legacyMigrationState{}, fmt.Errorf("quarantine malformed legacy WAL frame %d: %w", item.seq, err)
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ?`,
+			if _, err := tx.ExecContext(ctx, `UPDATE telemetry_frames
+				SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL WHERE seq = ?`,
 				DeliveryStatusQuarantined, item.seq); err != nil {
 				return legacyMigrationState{}, fmt.Errorf("mark malformed legacy WAL frame %d quarantined: %w", item.seq, err)
 			}
@@ -591,8 +714,11 @@ func (w *WAL) GenerationID() string {
 	return w.generationID
 }
 
-// OperationContext is the capture-time flight attribution persisted by the agent.
+// OperationContext is the capture-time aircraft, flight, and intent attribution
+// persisted by the agent. AircraftID may be empty for legacy telemetry context,
+// but mission deployment must fail closed unless it is present.
 type OperationContext struct {
+	AircraftID    string
 	FlightID      string
 	IntentID      string
 	IntentVersion uint32
@@ -602,8 +728,8 @@ type OperationContext struct {
 func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool, error) {
 	var value OperationContext
 	var version int64
-	err := w.db.QueryRowContext(ctx, `SELECT flight_id, intent_id, intent_version FROM operation_context WHERE id = 1`).
-		Scan(&value.FlightID, &value.IntentID, &version)
+	err := w.db.QueryRowContext(ctx, `SELECT aircraft_id, flight_id, intent_id, intent_version FROM operation_context WHERE id = 1`).
+		Scan(&value.AircraftID, &value.FlightID, &value.IntentID, &version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return OperationContext{}, false, nil
 	}
@@ -636,12 +762,18 @@ func (w *WAL) LoadOperationContext(ctx context.Context) (OperationContext, bool,
 //     reuse with another kind or payload, context cancellation, or a SQLite
 //     transaction, query, mutation, or commit failure.
 func (w *WAL) SetOperationContext(ctx context.Context, commandID string, value OperationContext) (bool, error) {
-	fingerprint := operationCommandFingerprint("set", value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
+	var fingerprint string
+	if value.AircraftID == "" {
+		// Preserve exact retry identity for pre-aircraft_id context producers.
+		fingerprint = operationCommandFingerprint("set", value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
+	} else {
+		fingerprint = operationCommandFingerprint("set-v2", value.AircraftID, value.FlightID, value.IntentID, fmt.Sprint(value.IntentVersion))
+	}
 	return w.applyOperationCommand(ctx, commandID, "set", fingerprint, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO operation_context(id, flight_id, intent_id, intent_version, updated_at)
-			VALUES(1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET flight_id=excluded.flight_id,
-			intent_id=excluded.intent_id, intent_version=excluded.intent_version, updated_at=excluded.updated_at`,
-			value.FlightID, value.IntentID, value.IntentVersion, time.Now().UnixNano())
+		_, err := tx.ExecContext(ctx, `INSERT INTO operation_context(id, aircraft_id, flight_id, intent_id, intent_version, updated_at)
+			VALUES(1, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET aircraft_id=excluded.aircraft_id,
+			flight_id=excluded.flight_id, intent_id=excluded.intent_id, intent_version=excluded.intent_version, updated_at=excluded.updated_at`,
+			value.AircraftID, value.FlightID, value.IntentID, value.IntentVersion, time.Now().UnixNano())
 		return err
 	})
 }
@@ -691,6 +823,14 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, finger
 		return false, fmt.Errorf("begin operation command: %w", err)
 	}
 	defer tx.Rollback()
+	var missionExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM mission_deployments WHERE command_id = ?)`, commandID).Scan(&missionExists); err != nil {
+		return false, fmt.Errorf("check operation command ID namespace: %w", err)
+	}
+	if missionExists {
+		return false, ErrOperationCommandConflict
+	}
 
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO operation_context_commands(command_id, processed_at, command_kind, payload_fingerprint) VALUES(?, ?, ?, ?)`, commandID, time.Now().UnixNano(), kind, fingerprint)
 	if err != nil {
@@ -735,6 +875,172 @@ func operationCommandFingerprint(parts ...string) string {
 		_, _ = hash.Write([]byte(part))
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// MissionDeploymentRecord is the durable state of a mission deployment command.
+// CommandPayload and ResultPayload are private copies owned by the caller.
+type MissionDeploymentRecord struct {
+	CommandID          string
+	PayloadFingerprint string
+	CommandPayload     []byte
+	State              string
+	ResultPayload      []byte
+}
+
+// ReserveMissionDeployment durably records an immutable mission command before
+// any autopilot interaction. Exact retries return the existing record; an ID
+// reused with another fingerprint returns ErrMissionDeploymentConflict.
+//
+// Parameters:
+//   - ctx: bounds the durable SQLite reservation and reload.
+//   - commandID: is the stable cross-service idempotency key.
+//   - fingerprint: identifies the deterministic immutable command payload.
+//   - payload: contains the deterministic command bytes retained for audit.
+//
+// Returns:
+//   - record: is the newly stored or previously durable command state.
+//   - created: is true only for the first durable reservation.
+//   - error: reports invalid input, conflicting ID reuse, cancellation, or a
+//     SQLite write/read failure.
+func (w *WAL) ReserveMissionDeployment(ctx context.Context, commandID, fingerprint string, payload []byte) (MissionDeploymentRecord, bool, error) {
+	if commandID == "" || fingerprint == "" || len(payload) == 0 {
+		return MissionDeploymentRecord{}, false, errors.New("mission command ID, fingerprint, and payload are required")
+	}
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("begin mission deployment reservation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var operationExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM operation_context_commands WHERE command_id = ?)`, commandID).Scan(&operationExists); err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("check mission command ID namespace: %w", err)
+	}
+	if operationExists {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
+	now := time.Now().UnixNano()
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO mission_deployments
+		(command_id, payload_fingerprint, command_payload, state, created_at, updated_at)
+		VALUES(?, ?, ?, 'prepared', ?, ?)`, commandID, fingerprint, payload, now, now)
+	if err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("reserve mission deployment: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("inspect mission deployment reservation: %w", err)
+	}
+	var record MissionDeploymentRecord
+	if err := tx.QueryRowContext(ctx, `SELECT command_id, payload_fingerprint, command_payload, state,
+		COALESCE(result_payload, X'') FROM mission_deployments WHERE command_id = ?`, commandID).
+		Scan(&record.CommandID, &record.PayloadFingerprint, &record.CommandPayload, &record.State, &record.ResultPayload); err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("load reserved mission deployment: %w", err)
+	}
+	if record.PayloadFingerprint != fingerprint {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return MissionDeploymentRecord{}, false, fmt.Errorf("commit mission deployment reservation: %w", err)
+	}
+	record.CommandPayload = append([]byte(nil), record.CommandPayload...)
+	record.ResultPayload = append([]byte(nil), record.ResultPayload...)
+	return record, rows == 1, nil
+}
+
+// LoadMissionDeployment returns one durable mission deployment record.
+//
+// Parameters:
+//   - ctx: bounds the SQLite lookup.
+//   - commandID: selects the durable idempotency record.
+//
+// Returns:
+//   - record: owns private copies of the command and result payload bytes.
+//   - error: reports a missing command, cancellation, or a SQLite read failure.
+func (w *WAL) LoadMissionDeployment(ctx context.Context, commandID string) (MissionDeploymentRecord, error) {
+	var record MissionDeploymentRecord
+	err := w.db.QueryRowContext(ctx, `SELECT command_id, payload_fingerprint, command_payload, state,
+		COALESCE(result_payload, X'') FROM mission_deployments WHERE command_id = ?`, commandID).
+		Scan(&record.CommandID, &record.PayloadFingerprint, &record.CommandPayload, &record.State, &record.ResultPayload)
+	if err != nil {
+		return MissionDeploymentRecord{}, fmt.Errorf("load mission deployment: %w", err)
+	}
+	record.CommandPayload = append([]byte(nil), record.CommandPayload...)
+	record.ResultPayload = append([]byte(nil), record.ResultPayload...)
+	return record, nil
+}
+
+// MarkMissionDeploymentEffectStarted commits the write-intent fence before the
+// first MAVLink mission message is handed to the transport.
+//
+// Parameters:
+//   - ctx: bounds the durable state transition.
+//   - commandID: selects the reserved mission command.
+//   - fingerprint: prevents a reused ID from mutating another command row.
+//
+// Returns:
+//   - error: reports identity conflict, cancellation, or a SQLite write failure.
+func (w *WAL) MarkMissionDeploymentEffectStarted(ctx context.Context, commandID, fingerprint string) error {
+	return w.updateMissionDeployment(ctx, commandID, fingerprint, "effect_started", nil)
+}
+
+// StoreMissionDeploymentResult durably records a terminal or uncertain result.
+// uncertain distinguishes a retryable readback-first state from a terminal one.
+//
+// Parameters:
+//   - ctx: bounds the durable state transition.
+//   - commandID: selects the reserved mission command.
+//   - fingerprint: prevents a reused ID from mutating another command row.
+//   - resultPayload: is the deterministic serialized deployment result.
+//   - uncertain: retains a readback-first recovery state when true; false makes
+//     the result terminal and replayable.
+//
+// Returns:
+//   - error: reports invalid result bytes, identity conflict, cancellation, or
+//     a SQLite write failure.
+func (w *WAL) StoreMissionDeploymentResult(ctx context.Context, commandID, fingerprint string, resultPayload []byte, uncertain bool) error {
+	state := "terminal"
+	if uncertain {
+		state = "outcome_unknown"
+	}
+	if len(resultPayload) == 0 {
+		return errors.New("mission deployment result payload is required")
+	}
+	return w.updateMissionDeployment(ctx, commandID, fingerprint, state, resultPayload)
+}
+
+func (w *WAL) updateMissionDeployment(ctx context.Context, commandID, fingerprint, state string, result []byte) error {
+	var allowed string
+	switch state {
+	case "effect_started":
+		allowed = "state = 'prepared'"
+	case "outcome_unknown":
+		allowed = "state IN ('effect_started', 'outcome_unknown')"
+	case "terminal":
+		allowed = "state IN ('prepared', 'effect_started', 'outcome_unknown')"
+	default:
+		return fmt.Errorf("invalid mission deployment state %q", state)
+	}
+	res, err := w.db.ExecContext(ctx, `UPDATE mission_deployments SET state = ?, result_payload = ?, updated_at = ?
+		WHERE command_id = ? AND payload_fingerprint = ? AND `+allowed, state, result, time.Now().UnixNano(), commandID, fingerprint)
+	if err != nil {
+		return fmt.Errorf("update mission deployment: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect mission deployment update: %w", err)
+	}
+	if rows != 1 {
+		var storedFingerprint, storedState string
+		if err := w.db.QueryRowContext(ctx, `SELECT payload_fingerprint, state FROM mission_deployments WHERE command_id = ?`, commandID).
+			Scan(&storedFingerprint, &storedState); err != nil {
+			return fmt.Errorf("load conflicting mission deployment state: %w", err)
+		}
+		if storedFingerprint != fingerprint {
+			return ErrMissionDeploymentConflict
+		}
+		return fmt.Errorf("mission deployment transition %s to %s is not allowed", storedState, state)
+	}
+	return nil
 }
 
 // AppendAsync validates and queues a private copy of a frame for durable
@@ -1687,6 +1993,33 @@ func (w *WAL) CountUndelivered(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+// CountOutstanding returns all non-terminal telemetry awaiting Relay
+// acceptance, including both written retry work and stream-owned pending rows.
+// Durable quarantine records are excluded.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the read-only query.
+//
+// Returns:
+//   - count: is the total written-plus-pending delivery backlog.
+//   - error: reports a SQLite or context failure.
+func (w *WAL) CountOutstanding(ctx context.Context) (int64, error) {
+	query := `
+	SELECT COUNT(1)
+	FROM telemetry_frames
+	WHERE delivery_status IN (?, ?)
+	AND NOT EXISTS (
+		SELECT 1 FROM telemetry_frame_quarantine
+		WHERE telemetry_frame_quarantine.seq = telemetry_frames.seq
+	)
+	`
+	var count int64
+	if err := w.db.QueryRowContext(ctx, query, DeliveryStatusWritten, DeliveryStatusPending).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count outstanding frames: %w", err)
+	}
+	return count, nil
+}
+
 // WaitForData blocks until new data is signaled or the context is cancelled.
 func (w *WAL) WaitForData(ctx context.Context) error {
 	select {
@@ -1699,9 +2032,15 @@ func (w *WAL) WaitForData(ctx context.Context) error {
 
 func (w *WAL) updateDeliveryStatus(ctx context.Context, seq uint64, status DeliveryStatus) (int64, error) {
 	// Only update if the status is different to ensure idempotency.
-	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq = ? AND delivery_status != ?`
+	var pendingSince any
+	if status == DeliveryStatusPending {
+		pendingSince = time.Now().UnixNano()
+	}
+	query := `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = ?, pending_owner = NULL
+		WHERE seq = ? AND delivery_status != ?`
 
-	res, err := w.db.ExecContext(ctx, query, status, seq, status)
+	res, err := w.db.ExecContext(ctx, query, status, pendingSince, seq, status)
 	if err != nil {
 		return 0, fmt.Errorf("failed to update delivery status: %w", err)
 	}
@@ -1728,9 +2067,9 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusPending)
 }
 
-// MarkPendingBatch marks already-sent WAL entries as awaiting Relay
-// acknowledgment in one transaction. Individual update failures are logged so
-// remaining entries can still be marked; the returned count is currently zero.
+// MarkPendingBatch atomically reserves written WAL entries for transmission
+// before any network send. Every sequence must still be written or the whole
+// transaction rolls back, preventing a concurrent terminal ACK from regressing.
 //
 // Parameters:
 //   - ctx: contributes its deadline but not its cancellation signal. Without a
@@ -1738,23 +2077,106 @@ func (w *WAL) MarkPending(ctx context.Context, seq uint64) (int64, error) {
 //   - seqs: identifies the sent WAL entries awaiting acknowledgment.
 //
 // Returns:
-//   - rowsAffected: is currently zero; callers must not use it as a batch count.
-//   - error: reports transaction setup or commit failure.
+//   - rowsAffected: equals len(seqs) after a successful non-empty transition.
+//   - error: reports a missing/non-written sequence, transaction, or commit failure.
 func (w *WAL) MarkPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
-	return w.updateDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending)
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusWritten, DeliveryStatusPending, true, false, "", "")
 }
 
-func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, status DeliveryStatus) (int64, error) {
-	query := `UPDATE telemetry_frames SET delivery_status = ? WHERE seq=? AND delivery_status != ?`
+// MarkPendingBatchOwned atomically reserves written entries for exactly one
+// live telemetry stream. The all-or-nothing transition records both a fresh
+// pending epoch and the owner before any network send.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal, allowing
+//     an in-flight reservation to finish during stream teardown. Without a
+//     deadline, the detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that must all still be written; an empty slice
+//     is a successful no-op.
+//   - owner: is the required non-empty token unique to one stream lifecycle.
+//
+// Returns:
+//   - rowsAffected: equals len(seqs) after a successful non-empty reservation.
+//   - error: reports an empty owner, any sequence not in written state through
+//     ErrTelemetryAckConflict, or a transaction, deadline, or SQLite failure.
+func (w *WAL) MarkPendingBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusWritten, DeliveryStatusPending, true, false, "", owner)
+}
+
+// RefreshPendingBatch renews the durable send epoch for entries that remain
+// pending after a stream sender finishes its batch. Concurrent terminal ACKs
+// are excluded by the pending-state predicate and never regress.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal, allowing
+//     the refresh to finish during stream teardown. Without a deadline, the
+//     detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that may remain pending; missing, written, and
+//     terminal entries are skipped atomically, and an empty slice is a no-op.
+//
+// Returns:
+//   - rowsAffected: counts sequence entries whose durable pending epoch was
+//     renewed; it is zero when none remain pending.
+//   - error: reports a transaction, deadline, commit, or SQLite failure.
+func (w *WAL) RefreshPendingBatch(ctx context.Context, seqs []uint64) (int64, error) {
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false, true, "", "")
+}
+
+// RefreshPendingBatchOwned renews the durable ACK epoch only for entries that
+// remain pending for the specified stream, without regressing terminal ACKs or
+// touching rows re-owned by another stream.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal. Without a
+//     deadline, the detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that may remain pending for owner; missing,
+//     terminal, written, and differently owned entries are skipped atomically.
+//   - owner: is the required non-empty stream lifecycle token to match.
+//
+// Returns:
+//   - rowsAffected: counts entries whose pending epoch was renewed.
+//   - error: reports an empty owner or a transaction, deadline, or SQLite failure.
+func (w *WAL) RefreshPendingBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	return w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusPending, false, true, owner, owner)
+}
+
+func (w *WAL) transitionDeliveryStatusBatch(ctx context.Context, seqs []uint64, from, to DeliveryStatus, requireAll, matchOwner bool, fromOwner, toOwner string) (int64, error) {
+	if len(seqs) == 0 {
+		return 0, nil
+	}
+	var pendingSince any
+	if to == DeliveryStatusPending {
+		pendingSince = time.Now().UnixNano()
+	}
+	var pendingOwner any
+	if to == DeliveryStatusPending && toOwner != "" {
+		pendingOwner = toOwner
+	}
+	query := `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = ?, pending_owner = ?
+		WHERE seq=? AND delivery_status = ?`
+	if matchOwner {
+		if fromOwner == "" {
+			query += ` AND pending_owner IS NULL`
+		} else {
+			query += ` AND pending_owner = ?`
+		}
+	}
 	// Detach from stream cancellation so the batch can still commit.
 	baseCtx := context.WithoutCancel(ctx)
 	var txCtx context.Context
 	var cancel context.CancelFunc
-	if deadline, ok := ctx.Deadline(); ok {
-		txCtx, cancel = context.WithDeadline(baseCtx, deadline)
-	} else {
-		txCtx, cancel = context.WithTimeout(baseCtx, 2*time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
 	}
+	txCtx, cancel = context.WithDeadline(baseCtx, deadline)
 	defer cancel()
 
 	tx, err := w.db.BeginTx(txCtx, nil)
@@ -1769,18 +2191,76 @@ func (w *WAL) updateDeliveryStatusBatch(ctx context.Context, seqs []uint64, stat
 	}
 	defer stmt.Close()
 
+	var rowsAffected int64
 	for _, seq := range seqs {
-		if _, err := stmt.ExecContext(txCtx, status, seq, status); err != nil {
-			slog.Error("failed to update delivery status", "error", err)
-			continue
+		args := []any{to, pendingSince, pendingOwner, seq, from}
+		if matchOwner && fromOwner != "" {
+			args = append(args, fromOwner)
 		}
+		result, err := stmt.ExecContext(txCtx, args...)
+		if err != nil {
+			return 0, fmt.Errorf("transition telemetry frame %d from %d to %d: %w", seq, from, to, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("inspect telemetry frame %d transition: %w", seq, err)
+		}
+		if requireAll && rows != 1 {
+			return 0, fmt.Errorf("%w: sequence %d was not in required status %d", ErrTelemetryAckConflict, seq, from)
+		}
+		rowsAffected += rows
 	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return 0, nil
+	return rowsAffected, nil
+}
+
+// MarkWrittenBatch returns pending entries to the written retry queue without
+// regressing entries concurrently acknowledged as delivered or quarantined.
+//
+// Parameters:
+//   - ctx: contributes its deadline while allowing the transaction to finish
+//     after stream cancellation.
+//   - seqs: identifies entries that may still be pending.
+//
+// Returns:
+//   - rowsAffected: counts pending entries moved back to written.
+//   - error: reports a transaction or SQLite failure.
+func (w *WAL) MarkWrittenBatch(ctx context.Context, seqs []uint64) (int64, error) {
+	rows, err := w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusWritten, false, true, "", "")
+	if err == nil && rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, err
+}
+
+// MarkWrittenBatchOwned returns only entries still pending for owner to the
+// retry queue. A delayed sender cannot regress rows re-reserved by a later stream.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal, allowing
+//     sender cleanup to finish after stream cancellation. Without a deadline,
+//     the detached transaction receives an independent two-second timeout.
+//   - seqs: identifies entries that may remain pending for owner; terminal,
+//     written, missing, and differently owned entries are skipped atomically.
+//   - owner: is the required non-empty stream lifecycle token to match.
+//
+// Returns:
+//   - rowsAffected: counts matching pending entries returned to written and
+//     signaled for retry.
+//   - error: reports an empty owner or a transaction, deadline, or SQLite failure.
+func (w *WAL) MarkWrittenBatchOwned(ctx context.Context, seqs []uint64, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	rows, err := w.transitionDeliveryStatusBatch(ctx, seqs, DeliveryStatusPending, DeliveryStatusWritten, false, true, owner, "")
+	if err == nil && rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, err
 }
 
 // MarkWritten moves one WAL entry to the written state when its state differs.
@@ -1796,36 +2276,388 @@ func (w *WAL) MarkWritten(ctx context.Context, seq uint64) (int64, error) {
 	return w.updateDeliveryStatus(ctx, seq, DeliveryStatusWritten)
 }
 
-// ResetPending resets frames that have been in 'Pending' state for longer than ttl.
-// This allows retrying frames that were marked as pending but never acked.
+// ApplyTelemetryAck atomically correlates one Relay ACK with its durable WAL
+// entry and applies a status-specific monotonic transition. Successful delivery
+// may only consume a pending entry. Retry returns pending evidence to written.
+// Permanent rejection preserves the payload and diagnostic in quarantine.
+// Duplicate ACKs with the same resulting state are idempotent; contradictory
+// late ACKs are rejected without mutating the row.
+//
+// Parameters:
+//   - ctx: controls the SQLite transaction.
+//   - seq: identifies the Agent-local durable WAL row and must be non-zero.
+//   - frameID: when present, must match the deployed Relay v1 identity derived
+//     from the stored Agent ID, capture time, and WAL sequence.
+//   - disposition: selects delivered, retry, or permanent-quarantine handling.
+//   - reason: records Relay diagnostics for a permanent rejection.
+//
+// Returns:
+//   - result: reports prior state, idempotency, and whether frame ID correlation
+//     was available in the ACK.
+//   - error: reports missing/mismatched identity, conflicting state, invalid
+//     disposition, context cancellation, or SQLite failure.
+func (w *WAL) ApplyTelemetryAck(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason string) (TelemetryAckResult, error) {
+	return w.applyTelemetryAck(ctx, seq, frameID, disposition, reason, "")
+}
+
+// ApplyTelemetryAckOwned applies a stream ACK only while the pending row still
+// belongs to that stream. Duplicate terminal ACKs remain idempotent after the
+// owner is cleared.
+//
+// Parameters:
+//   - ctx: controls cancellation and the complete SQLite ACK transaction.
+//   - seq: identifies the Agent-local durable WAL row and must be non-zero.
+//   - frameID: when present, must match the deployed Relay v1 identity derived
+//     from the durable payload.
+//   - disposition: selects delivered, retry, or permanent-quarantine handling.
+//   - reason: records Relay diagnostics for a permanent rejection.
+//   - owner: is the required non-empty token of the stream that received the ACK.
+//
+// Returns:
+//   - result: reports prior state, idempotency, and frame-ID correlation. A
+//     matching duplicate terminal ACK is idempotent even though its owner was cleared.
+//   - error: reports an empty owner, missing/mismatched frame identity, owner or
+//     state conflict through ErrTelemetryAckConflict, invalid disposition,
+//     context cancellation, or a SQLite failure.
+func (w *WAL) ApplyTelemetryAckOwned(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason, owner string) (TelemetryAckResult, error) {
+	if owner == "" {
+		return TelemetryAckResult{}, errors.New("telemetry pending owner is required")
+	}
+	return w.applyTelemetryAck(ctx, seq, frameID, disposition, reason, owner)
+}
+
+// ApplyDeliveredTelemetryAckBatchOwned atomically validates and commits a
+// bounded group of successful Relay ACKs for one live telemetry stream. Every
+// non-terminal row must still be pending for owner; any invalid identity,
+// sequence, state, or ownership rolls the entire group back. Matching duplicate
+// delivered ACKs remain idempotent.
+//
+// Parameters:
+//   - ctx: contributes its deadline but not its cancellation signal so a FULL
+//     synchronous commit already started may finish during stream teardown. If
+//     ctx has no deadline, the transaction receives an independent two-second
+//     timeout.
+//   - acks: supplies non-zero WAL sequences and optional deployed frame IDs in
+//     receive order; an empty slice is a successful no-op.
+//   - owner: is the required non-empty token of the stream that received every ACK.
+//
+// Returns:
+//   - results: has one entry per ACK in input order and reports whether each
+//     pending row changed or was already delivered.
+//   - error: reports an empty owner, missing/mismatched identity, owner or state
+//     conflict through ErrTelemetryAckConflict, transaction deadline, commit,
+//     or SQLite failure. On error no ACK in the batch is committed.
+func (w *WAL) ApplyDeliveredTelemetryAckBatchOwned(ctx context.Context, acks []TelemetryDeliveredAck, owner string) ([]TelemetryAckResult, error) {
+	if owner == "" {
+		return nil, errors.New("telemetry pending owner is required")
+	}
+	if len(acks) == 0 {
+		return []TelemetryAckResult{}, nil
+	}
+
+	baseCtx := context.WithoutCancel(ctx)
+	var txCtx context.Context
+	var cancel context.CancelFunc
+	deadline := time.Now().Add(2 * time.Second)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	txCtx, cancel = context.WithDeadline(baseCtx, deadline)
+	defer cancel()
+
+	tx, err := w.db.BeginTx(txCtx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin delivered telemetry ACK batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	results := make([]TelemetryAckResult, 0, len(acks))
+	for _, ack := range acks {
+		if ack.Sequence == 0 {
+			return nil, fmt.Errorf("%w: sequence is zero", ErrTelemetryFrameNotFound)
+		}
+		var payload []byte
+		var current DeliveryStatus
+		var pendingOwner sql.NullString
+		if err := tx.QueryRowContext(txCtx, `SELECT payload, delivery_status, pending_owner FROM telemetry_frames WHERE seq = ?`, ack.Sequence).Scan(&payload, &current, &pendingOwner); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, fmt.Errorf("%w: sequence %d", ErrTelemetryFrameNotFound, ack.Sequence)
+			}
+			return nil, fmt.Errorf("load delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+		}
+
+		result := TelemetryAckResult{PreviousStatus: current, CorrelatedByFrameID: ack.FrameID != ""}
+		if ack.FrameID != "" {
+			frame := &agentv1.TelemetryFrame{}
+			if err := proto.Unmarshal(payload, frame); err != nil {
+				return nil, fmt.Errorf("decode delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+			}
+			expected := fmt.Sprintf("%d:%s:%d:%d", len(frame.GetAgentId()), frame.GetAgentId(), frame.GetSentAtUnixNs(), ack.Sequence)
+			if ack.FrameID != expected {
+				return nil, fmt.Errorf("%w: sequence %d expected %q got %q", ErrTelemetryFrameIdentityMismatch, ack.Sequence, expected, ack.FrameID)
+			}
+		}
+		if current == DeliveryStatusDelivered {
+			results = append(results, result)
+			continue
+		}
+		if current != DeliveryStatusPending {
+			return nil, fmt.Errorf("%w: sequence %d status %d cannot become delivered", ErrTelemetryAckConflict, ack.Sequence, current)
+		}
+		if !pendingOwner.Valid || pendingOwner.String != owner {
+			return nil, fmt.Errorf("%w: sequence %d is owned by another telemetry stream", ErrTelemetryAckConflict, ack.Sequence)
+		}
+		update, err := tx.ExecContext(txCtx, `UPDATE telemetry_frames
+			SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
+			WHERE seq = ? AND delivery_status = ? AND pending_owner = ?`, DeliveryStatusDelivered, ack.Sequence, DeliveryStatusPending, owner)
+		if err != nil {
+			return nil, fmt.Errorf("apply delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+		}
+		rows, err := update.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("inspect delivered telemetry ACK sequence %d: %w", ack.Sequence, err)
+		}
+		if rows != 1 {
+			return nil, fmt.Errorf("%w: sequence %d changed concurrently", ErrTelemetryAckConflict, ack.Sequence)
+		}
+		result.Changed = true
+		results = append(results, result)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit delivered telemetry ACK batch: %w", err)
+	}
+	return results, nil
+}
+
+func (w *WAL) applyTelemetryAck(ctx context.Context, seq uint64, frameID string, disposition TelemetryAckDisposition, reason, owner string) (TelemetryAckResult, error) {
+	if seq == 0 {
+		return TelemetryAckResult{}, fmt.Errorf("%w: sequence is zero", ErrTelemetryFrameNotFound)
+	}
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("begin telemetry ACK transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var payload []byte
+	var current DeliveryStatus
+	var pendingOwner sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT payload, delivery_status, pending_owner FROM telemetry_frames WHERE seq = ?`, seq).Scan(&payload, &current, &pendingOwner); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d", ErrTelemetryFrameNotFound, seq)
+		}
+		return TelemetryAckResult{}, fmt.Errorf("load telemetry ACK sequence %d: %w", seq, err)
+	}
+	result := TelemetryAckResult{PreviousStatus: current, CorrelatedByFrameID: frameID != ""}
+	if owner != "" && current == DeliveryStatusPending && (!pendingOwner.Valid || pendingOwner.String != owner) {
+		return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d is owned by another telemetry stream", ErrTelemetryAckConflict, seq)
+	}
+	if frameID != "" {
+		frame := &agentv1.TelemetryFrame{}
+		if err = proto.Unmarshal(payload, frame); err != nil {
+			return TelemetryAckResult{}, fmt.Errorf("decode telemetry ACK sequence %d: %w", seq, err)
+		}
+		expected := fmt.Sprintf("%d:%s:%d:%d", len(frame.GetAgentId()), frame.GetAgentId(), frame.GetSentAtUnixNs(), seq)
+		if frameID != expected {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d expected %q got %q", ErrTelemetryFrameIdentityMismatch, seq, expected, frameID)
+		}
+	}
+
+	var target DeliveryStatus
+	switch disposition {
+	case TelemetryAckDelivered:
+		target = DeliveryStatusDelivered
+		if current == target {
+			return result, tx.Commit()
+		}
+		if current != DeliveryStatusPending {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d status %d cannot become delivered", ErrTelemetryAckConflict, seq, current)
+		}
+	case TelemetryAckRetry:
+		target = DeliveryStatusWritten
+		if current == target {
+			return result, tx.Commit()
+		}
+		if current != DeliveryStatusPending {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d status %d cannot retry", ErrTelemetryAckConflict, seq, current)
+		}
+	case TelemetryAckPermanentReject:
+		target = DeliveryStatusQuarantined
+		if current == target {
+			return result, tx.Commit()
+		}
+		if current != DeliveryStatusPending {
+			return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d status %d cannot be quarantined", ErrTelemetryAckConflict, seq, current)
+		}
+		if reason == "" {
+			reason = "Relay permanently rejected telemetry frame without a diagnostic"
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO telemetry_frame_quarantine(seq, quarantined_at, reason, original_delivery_status) VALUES(?, ?, ?, ?)`, seq, time.Now().UnixNano(), reason, current); err != nil {
+			return TelemetryAckResult{}, fmt.Errorf("quarantine permanently rejected telemetry frame %d: %w", seq, err)
+		}
+	default:
+		return TelemetryAckResult{}, fmt.Errorf("invalid telemetry ACK disposition %d", disposition)
+	}
+
+	update, err := tx.ExecContext(ctx, `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
+		WHERE seq = ? AND delivery_status = ?`, target, seq, current)
+	if err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("apply telemetry ACK sequence %d: %w", seq, err)
+	}
+	rows, err := update.RowsAffected()
+	if err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("inspect telemetry ACK sequence %d: %w", seq, err)
+	}
+	if rows != 1 {
+		return TelemetryAckResult{}, fmt.Errorf("%w: sequence %d changed concurrently", ErrTelemetryAckConflict, seq)
+	}
+	if err = tx.Commit(); err != nil {
+		return TelemetryAckResult{}, fmt.Errorf("commit telemetry ACK sequence %d: %w", seq, err)
+	}
+	result.Changed = true
+	if target == DeliveryStatusWritten {
+		w.signalDataAvailable()
+	}
+	return result, nil
+}
+
+func (w *WAL) signalDataAvailable() {
+	select {
+	case w.signalChan <- struct{}{}:
+	default:
+	}
+}
+
+// RequeueAllPending returns legacy unowned entries still awaiting an ACK to the
+// written retry queue. Callers must first stop the stream receive loop so an exact ACK
+// cannot begin after teardown. Status-conditional updates preserve terminal
+// ACKs that committed before or while this statement waited for SQLite.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the update.
+//
+// Returns:
+//   - rowsAffected: counts pending entries returned to the retry queue.
+//   - error: reports a SQLite or context failure.
+func (w *WAL) RequeueAllPending(ctx context.Context) (int64, error) {
+	res, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
+		WHERE delivery_status = ? AND pending_owner IS NULL`, DeliveryStatusWritten, DeliveryStatusPending)
+	if err != nil {
+		return 0, fmt.Errorf("requeue pending telemetry frames: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect requeued pending telemetry frames: %w", err)
+	}
+	if rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, nil
+}
+
+// RequeuePendingOwner returns only the rows owned by a quiesced stream. Rows
+// fenced by an older sender are never exposed to a later stream teardown.
+//
+// Parameters:
+//   - ctx: controls cancellation and the owner-conditional SQLite update.
+//   - owner: is the required non-empty token of the fully quiesced stream.
+//
+// Returns:
+//   - rowsAffected: counts matching pending rows returned to written and
+//     signaled for retry; rows in every other state or owner are skipped.
+//   - error: reports an empty owner, context cancellation, or a SQLite failure.
+func (w *WAL) RequeuePendingOwner(ctx context.Context, owner string) (int64, error) {
+	if owner == "" {
+		return 0, errors.New("telemetry pending owner is required")
+	}
+	res, err := w.db.ExecContext(ctx, `UPDATE telemetry_frames
+		SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
+		WHERE delivery_status = ? AND pending_owner = ?`, DeliveryStatusWritten, DeliveryStatusPending, owner)
+	if err != nil {
+		return 0, fmt.Errorf("requeue telemetry frames for owner %q: %w", owner, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect requeued telemetry frames for owner %q: %w", owner, err)
+	}
+	if rows > 0 {
+		w.signalDataAvailable()
+	}
+	return rows, nil
+}
+
+// ResetPending returns entries whose durable pending epoch is older than ttl
+// to the written retry queue. Capture time is deliberately not used: replayed
+// frames may be old while their current network send is still active.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the SQLite update.
+//   - ttl: is the maximum pending age; a non-positive duration is a successful
+//     no-op. Callers must separately fence any live sender ownership.
+//
+// Returns:
+//   - rowsAffected: counts expired pending entries returned to written and
+//     signaled for retry.
+//   - error: reports a SQLite row-count, update, or context failure.
 func (w *WAL) ResetPending(ctx context.Context, ttl time.Duration) (int64, error) {
+	return w.ResetPendingExcludingOwners(ctx, ttl, nil)
+}
+
+// ResetPendingExcludingOwners returns expired pending entries to written while
+// preserving every row owned by a currently active stream sender. This lets a
+// wedged old sender remain fenced without disabling recovery for later streams.
+//
+// Parameters:
+//   - ctx: controls cancellation and deadlines for the SQLite update.
+//   - ttl: is the maximum pending age; a non-positive duration is a successful
+//     no-op.
+//   - activeOwners: lists non-empty stream tokens whose pending rows must remain
+//     untouched; an empty slice applies normal TTL recovery to every owner.
+//
+// Returns:
+//   - rowsAffected: counts expired, non-excluded entries returned to written and
+//     signaled for retry.
+//   - error: reports an empty owner token, SQLite row-count or update failure,
+//     or context cancellation.
+func (w *WAL) ResetPendingExcludingOwners(ctx context.Context, ttl time.Duration, activeOwners []string) (int64, error) {
 	if ttl <= 0 {
 		return 0, nil
 	}
 
-	// created_at is stored as unix nano
-	// We want rows where delivery_status = Pending AND created_at < (now - ttl)
-	// Note: created_at is when it was inserted, not when it was marked pending.
-	// Since we don't track "updated_at", we use "created_at" as a proxy.
-	// If a frame is pending and old enough, we retry it.
 	cutoff := time.Now().Add(-ttl).UnixNano()
 
 	query := `
 	UPDATE telemetry_frames 
-	SET delivery_status = ? 
+	SET delivery_status = ?, pending_since_unix_ns = NULL, pending_owner = NULL
 	WHERE delivery_status = ? 
-	AND created_at < ?
-	`
+	AND pending_since_unix_ns < ?`
+	args := []any{DeliveryStatusWritten, DeliveryStatusPending, cutoff}
+	if len(activeOwners) > 0 {
+		query += ` AND (pending_owner IS NULL OR pending_owner NOT IN (`
+		for index, owner := range activeOwners {
+			if owner == "" {
+				return 0, errors.New("active telemetry pending owner is empty")
+			}
+			if index > 0 {
+				query += `, `
+			}
+			query += `?`
+			args = append(args, owner)
+		}
+		query += `))`
+	}
 
-	res, err := w.db.ExecContext(ctx, query, DeliveryStatusWritten, DeliveryStatusPending, cutoff)
+	res, err := w.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to reset pending frames: %w", err)
 	}
 
 	rows, err := res.RowsAffected()
 
-	if rows != 0 {
-		w.signalChan <- struct{}{}
+	if rows > 0 {
+		w.signalDataAvailable()
 	}
 
 	return rows, err
