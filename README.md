@@ -157,6 +157,10 @@ The agent performs three key tasks:
   again. The ArduPilot adapter keeps wire-sequence-zero HOME outside the
   canonical plan and normalizes the dynamic `current` cursor bit before digest
   verification. This slice installs a mission but intentionally does not start it.
+  A complete HOME-only readback means no operational mission is installed.
+  Legacy HOME uploads use a validated placeholder because ArduPilot retains
+  its own AHRS HOME; operational items still require lossless coordinates and
+  exact onboard digest verification.
 
 ## Configuration
 

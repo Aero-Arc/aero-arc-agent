@@ -195,6 +195,12 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 				if request.Seq > 0 {
 					item = plan.Items[request.Seq-1]
 				}
+				if request.Seq == 0 {
+					// ArduPilot ignores wire item zero and retains its AHRS HOME.
+					// Use a validated placeholder, as for empty-mission bootstrap,
+					// rather than requiring GPS HOME to round-trip through float32.
+					item = plan.Items[0]
+				}
 				legacyItem, err := missionItemLegacy(target, item, request.Seq)
 				if err != nil {
 					return "", uploaded, ackType, fmt.Errorf("%w: %v", errMissionOutcomeUnknown, err)
@@ -280,8 +286,11 @@ func (a *Agent) readbackMAVLinkMission(ctx context.Context, target *mavlinkTarge
 	if err != nil {
 		return "", err
 	}
-	if len(wireItems) == 0 {
-		return "", fmt.Errorf("%w: onboard wire mission is empty", errOnboardMismatch)
+	if len(wireItems) <= 1 {
+		// ArduPilot may retain HOME at wire index zero without any operational
+		// items. A complete HOME-only readback proves the requested mission is
+		// absent; it is not an ambiguous transport or digest failure.
+		return "", fmt.Errorf("%w: onboard mission has no operational items", errOnboardMismatch)
 	}
 	canonical := make([]*agentv1.MissionItem, 0, len(wireItems)-1)
 	for sequence, item := range wireItems[1:] {

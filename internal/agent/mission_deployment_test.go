@@ -605,6 +605,77 @@ func TestExpiredPreparedDeploymentRecoversMatchingReadbackAfterTerminalPersisten
 	}
 }
 
+func TestMAVLinkHomeOnlyReadbackIsDefinitiveMismatch(t *testing.T) {
+	command := validMissionCommand(t, "home-only-readback")
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Millisecond}}
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		switch value := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			a.pendingMissionEvents <- &common.MessageMissionCount{Count: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			if value.Seq != 0 {
+				t.Fatalf("requested operational item %d from HOME-only mission", value.Seq)
+			}
+			a.pendingMissionEvents <- missionItemINT(target, command.Plan.Items[0], 0)
+		case *common.MessageMissionCount, *common.MessageMissionItemInt:
+			t.Fatal("readback attempted to upload a mission")
+		}
+		return nil
+	}
+	digest, uploaded, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, true, command.ExpiresAtUnixMs)
+	if !errors.Is(err, errOnboardMismatch) || errors.Is(err, errMissionOutcomeUnknown) || digest != "" || uploaded != 0 {
+		t.Fatalf("HOME-only readback = digest %q, uploaded %d, err %v", digest, uploaded, err)
+	}
+}
+
+func TestMAVLinkLegacyUploadPreservesOperationalItemsWithPreciseHome(t *testing.T) {
+	command := validMissionCommand(t, "legacy-precise-home")
+	command.Plan.Items[0].LatitudeE7 = -353632608
+	command.Plan.Items[0].LongitudeE7 = 1491652352
+	setMissionDigest(t, command)
+	now := time.Now()
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1,
+		heartbeatAt: now, landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
+	a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: time.Millisecond}}
+	home := &agentv1.MissionItem{Frame: 0, Command: 16, Autocontinue: true,
+		LatitudeE7: -353632621, LongitudeE7: 1491652374, AltitudeM: 584}
+	if legacyCoordinateRoundTrips(home.LatitudeE7) {
+		t.Fatal("test requires HOME coordinates that cannot round-trip through legacy float32")
+	}
+	uploads := 0
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+		events := a.pendingMissionEvents
+		switch value := outbound.(type) {
+		case *common.MessageMissionRequestList:
+			events <- &common.MessageMissionCount{Count: 2, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionRequestInt:
+			item := home
+			if value.Seq > 0 {
+				item = command.Plan.Items[value.Seq-1]
+			}
+			events <- missionItemINT(target, item, value.Seq)
+		case *common.MessageMissionCount:
+			events <- &common.MessageMissionRequest{Seq: 0, MissionType: common.MAV_MISSION_TYPE_MISSION}
+			events <- &common.MessageMissionRequest{Seq: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+		case *common.MessageMissionItem:
+			if int32(value.X*float32(1e7)) != command.Plan.Items[0].LatitudeE7 ||
+				int32(value.Y*float32(1e7)) != command.Plan.Items[0].LongitudeE7 {
+				t.Fatalf("legacy upload changed canonical coordinates: %+v", value)
+			}
+			uploads++
+			if uploads == 2 {
+				events <- &common.MessageMissionAck{Type: common.MAV_MISSION_ACCEPTED, MissionType: common.MAV_MISSION_TYPE_MISSION}
+			}
+		}
+		return nil
+	}
+	digest, uploaded, _, err := a.executeMAVLinkMissionDeployment(context.Background(), target, command.Plan, false, command.ExpiresAtUnixMs)
+	if err != nil || digest != command.Binding.MissionDigest || uploaded != 1 || uploads != 2 {
+		t.Fatalf("legacy upload = digest %q, uploaded %d, wire items %d, err %v", digest, uploaded, uploads, err)
+	}
+}
+
 func TestMAVLinkMissionUploadRequiresACKAndCanonicalReadback(t *testing.T) {
 	command := validMissionCommand(t, "protocol-1")
 	command.Plan.Items = append(command.Plan.Items, &agentv1.MissionItem{Sequence: 1, Frame: 0, Command: 16,
