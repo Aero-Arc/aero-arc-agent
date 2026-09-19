@@ -21,11 +21,15 @@ const (
 )
 
 type mavlinkTarget struct {
-	channel           *gomavlib.Channel
-	systemID          uint8
-	componentID       uint8
-	heartbeatSequence uint64
-	armed             bool
+	channel             *gomavlib.Channel
+	systemID            uint8
+	componentID         uint8
+	heartbeatSequence   uint64
+	armed               bool
+	heartbeatAt         time.Time
+	landedState         common.MAV_LANDED_STATE
+	landedStateAt       time.Time
+	landedStateSequence uint64
 }
 
 type mavlinkCommandAck struct {
@@ -67,6 +71,7 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 	if frame == nil {
 		return
 	}
+	a.observeMissionProtocolMessage(frame)
 	switch message := frame.Message().(type) {
 	case *common.MessageHeartbeat:
 		if frame.ComponentID() == uint8(common.MAV_COMP_ID_AUTOPILOT1) && message.Type != common.MAV_TYPE_GCS {
@@ -79,8 +84,21 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 		// Generic progress must not expose a quiet epoch before this same event
 		// is consumed as potentially stale command evidence.
 		a.observeMAVLinkCommandAck(frame.Channel, frame.SystemID(), frame.ComponentID(), message)
+	case *common.MessageExtendedSysState:
+		a.observeMAVLinkLandedState(frame.Channel, frame.SystemID(), frame.ComponentID(), message.LandedState)
 	default:
 		a.observeMAVLinkEventProgress(frame.Channel)
+	}
+}
+
+func (a *Agent) observeMAVLinkLandedState(channel *gomavlib.Channel, systemID, componentID uint8, state common.MAV_LANDED_STATE) {
+	a.mavlinkMu.Lock()
+	defer a.mavlinkMu.Unlock()
+	if target := a.mavlinkTarget; target != nil && target.channel == channel && target.systemID == systemID && target.componentID == componentID {
+		a.mavlinkLandedStateSeq++
+		target.landedState = state
+		target.landedStateAt = time.Now()
+		target.landedStateSequence = a.mavlinkLandedStateSeq
 	}
 }
 
@@ -132,10 +150,17 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	}
 	a.mavlinkHeartbeatSeq++
 	sequence := a.mavlinkHeartbeatSeq
-	a.mavlinkTarget = &mavlinkTarget{
+	now := time.Now()
+	updated := &mavlinkTarget{
 		channel: channel, systemID: systemID, componentID: componentID,
-		heartbeatSequence: sequence, armed: armed,
+		heartbeatSequence: sequence, armed: armed, heartbeatAt: now,
 	}
+	if !targetChanged {
+		updated.landedState = previous.landedState
+		updated.landedStateAt = previous.landedStateAt
+		updated.landedStateSequence = previous.landedStateSequence
+	}
+	a.mavlinkTarget = updated
 	pending := a.pendingMAVLinkCommand
 	var stateChanges chan mavlinkArmedStateEvidence
 	var stateEvidence mavlinkArmedStateEvidence

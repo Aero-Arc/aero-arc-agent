@@ -49,6 +49,10 @@ func (a *Agent) runTelemetryStats(ctx context.Context, interval time.Duration) {
 			if err != nil {
 				slog.LogAttrs(ctx, slog.LevelWarn, "telemetry_stats_wal_count_error", slog.String("error", err.Error()))
 			}
+			outstanding, outstandingErr := a.wal.CountOutstanding(ctx)
+			if outstandingErr != nil {
+				slog.LogAttrs(ctx, slog.LevelWarn, "telemetry_stats_wal_outstanding_count_error", slog.String("error", outstandingErr.Error()))
+			}
 
 			slog.LogAttrs(
 				ctx, slog.LevelInfo,
@@ -57,6 +61,7 @@ func (a *Agent) runTelemetryStats(ctx context.Context, interval time.Duration) {
 				slog.Float64("send_rate_per_s", sendRate),
 				slog.Float64("dropped_rate_per_s", droppedRate),
 				slog.Int64("undelivered_count", undelivered),
+				slog.Int64("outstanding_count", outstanding),
 				slog.Uint64("ingest_total", ingestTotal),
 				slog.Uint64("sent_total", sentTotal),
 				slog.Uint64("dropped_total", droppedTotal),
