@@ -202,6 +202,8 @@ type Agent struct {
 	operationContext   *wal.OperationContext
 	sendMu             sync.Mutex
 
+	c2Mu                  sync.Mutex
+	c2Pending             *pendingC2
 	mavlinkMu             sync.Mutex
 	mavlinkTarget         *mavlinkTarget
 	mavlinkHeartbeatSeq   uint64
@@ -794,7 +796,8 @@ func (a *Agent) register(ctx context.Context) error {
 
 	agentID := identity.Resolve().FinalID
 	req := &agentv1.RegisterRequest{
-		AgentId: agentID,
+		AgentId:               agentID,
+		ExecutionCapabilities: []string{"mavlink_command_v1", "mission_upload_v1"},
 	}
 
 	slog.LogAttrs(
@@ -951,7 +954,9 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 				continue
 			}
 			var err error
-			if command := message.GetAircraftCommand(); command != nil {
+			if command := message.GetDurableCommand(); command != nil {
+				err = a.dispatchDurableCommand(commandCtx, stream, command, &commandWG, commandErrors)
+			} else if command := message.GetAircraftCommand(); command != nil {
 				err = a.dispatchAircraftCommand(commandCtx, stream, command, &commandWG, commandErrors)
 			} else if mission := message.GetDeployMission(); mission != nil {
 				err = a.dispatchMissionDeployment(commandCtx, stream, mission, &commandWG, commandErrors)

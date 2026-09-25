@@ -21,6 +21,8 @@ const (
 )
 
 type mavlinkTarget struct {
+	vehicleType         common.MAV_TYPE
+	autopilot           common.MAV_AUTOPILOT
 	channel             *gomavlib.Channel
 	systemID            uint8
 	componentID         uint8
@@ -71,11 +73,12 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 	if frame == nil {
 		return
 	}
+	a.observeC2Frame(frame)
 	a.observeMissionProtocolMessage(frame)
 	switch message := frame.Message().(type) {
 	case *common.MessageHeartbeat:
 		if frame.ComponentID() == uint8(common.MAV_COMP_ID_AUTOPILOT1) && message.Type != common.MAV_TYPE_GCS {
-			a.observeMAVLinkHeartbeat(frame.Channel, frame.SystemID(), frame.ComponentID(), message.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0)
+			a.observeMAVLinkHeartbeat(frame.Channel, frame.SystemID(), frame.ComponentID(), message.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0, uint32(message.Type), uint32(message.Autopilot))
 		} else {
 			a.observeMAVLinkEventProgress(frame.Channel)
 		}
@@ -135,7 +138,7 @@ func (a *Agent) rearmAircraftACKFenceLocked() {
 	a.aircraftAckLastProgressAt = time.Time{}
 }
 
-func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, componentID uint8, armed bool) {
+func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, componentID uint8, armed bool, profile ...uint32) {
 	a.mavlinkMu.Lock()
 	previous := a.mavlinkTarget
 	targetChanged := previous == nil || previous.channel != channel || previous.systemID != systemID || previous.componentID != componentID
@@ -159,6 +162,13 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 		updated.landedState = previous.landedState
 		updated.landedStateAt = previous.landedStateAt
 		updated.landedStateSequence = previous.landedStateSequence
+	}
+	if len(profile) == 2 {
+		updated.vehicleType = common.MAV_TYPE(profile[0])
+		updated.autopilot = common.MAV_AUTOPILOT(profile[1])
+	} else if !targetChanged {
+		updated.vehicleType = previous.vehicleType
+		updated.autopilot = previous.autopilot
 	}
 	a.mavlinkTarget = updated
 	pending := a.pendingMAVLinkCommand
@@ -502,6 +512,11 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 	if a.writeMAVLinkCommand == nil {
 		result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
 		result.Message = "MAVLink command writer is unavailable"
+		return result
+	}
+	if err := commandCtx.Err(); err != nil {
+		result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
+		result.Message = "command canceled before MAVLink handoff: " + err.Error()
 		return result
 	}
 	if err := a.writeMAVLinkCommand(target.channel, mavlinkCommand); err != nil {
