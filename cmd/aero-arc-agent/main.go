@@ -79,6 +79,11 @@ var agentCmd = cli.Command{
 			Usage: "WAL flush interval if batch queue doesn't fill up",
 		},
 		&cli.DurationFlag{
+			Name:    "mission-protocol-quiet-period",
+			Usage:   "Mission protocol silence required before readback (zero inherits aircraft-command-timeout)",
+			Sources: cli.EnvVars("AERO_ARC_MISSION_PROTOCOL_QUIET_PERIOD"),
+		},
+		&cli.DurationFlag{
 			Name:    "aircraft-command-timeout",
 			Value:   4 * time.Second,
 			Usage:   "Maximum time to wait for an autopilot command acknowledgement",

@@ -33,6 +33,9 @@ func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
 		return
 	}
 	a.mavlinkMu.Lock()
+	if current := a.mavlinkTarget; current != nil && current.channel == frame.Channel && current.systemID == frame.SystemID() && current.componentID == frame.ComponentID() {
+		a.protocolQuiet.mission = time.Now()
+	}
 	target := a.pendingMissionTarget
 	events := a.pendingMissionEvents
 	matched := target != nil && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
@@ -88,6 +91,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	defer func() {
 		a.mavlinkMu.Lock()
 		if a.pendingMissionEvents == events {
+			a.protocolQuiet.mission = time.Now()
 			a.pendingMissionEvents = nil
 			a.pendingMissionTarget = nil
 		}
@@ -301,7 +305,12 @@ func (a *Agent) readbackMAVLinkMission(ctx context.Context, target *mavlinkTarge
 	return digestMissionPlan(&agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: canonical})
 }
 
-func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, emptyMissionPlaceholder *agentv1.MissionItem) (*agentv1.MissionItem, error) {
+func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, emptyMissionPlaceholder *agentv1.MissionItem) (_ *agentv1.MissionItem, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			a.resetMissionQuiet()
+		}
+	}()
 	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish HOME readback epoch: %w", err)
 	}
@@ -400,17 +409,26 @@ func consumeReadyMissionEvent(events <-chan message.Message) bool {
 	}
 }
 
-// beginMissionReadbackEpoch terminates any earlier download and requires one
-// full response-timeout interval with no mission-protocol traffic before a new
+// beginMissionReadbackEpoch reuses a continuously observed idle interval or
+// terminates an earlier download and waits for protocol silence before a new
 // MISSION_REQUEST_LIST is sent. MAVLink mission messages have no transaction
 // identifier, so a delayed count from a timed-out request is otherwise
 // indistinguishable from the response to the next request and could decide a
 // durable recovery result.
 func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) error {
+	// Reuse an already-established idle epoch. On startup, target changes,
+	// traffic gaps or failed transfers the conservative cancellation path remains.
+	a.mavlinkMu.Lock()
+	idle := a.protocolQuietForLocked(target, 0, true, time.Now()) >= a.missionReadbackQuietPeriod()
+	a.protocolQuiet.mission = time.Now()
+	a.mavlinkMu.Unlock()
+	if idle && !consumeReadyMissionEvent(events) {
+		return nil
+	}
 	if err := a.cancelMissionReadback(target); err != nil {
 		return fmt.Errorf("cancel prior mission readback: %w", err)
 	}
-	quietPeriod := a.aircraftCommandTimeout()
+	quietPeriod := a.missionReadbackQuietPeriod()
 	quiet := time.NewTimer(quietPeriod)
 	defer quiet.Stop()
 	overall := time.NewTimer(2 * quietPeriod)
@@ -438,7 +456,12 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 	return a.readbackMAVLinkWireMissionWithin(ctx, target, events, responseTimeout, missionTransferOverallTimeout(responseTimeout, maxWireMissionItems+2))
 }
 
-func (a *Agent) readbackMAVLinkWireMissionWithin(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, responseTimeout, overallTimeout time.Duration) ([]*agentv1.MissionItem, error) {
+func (a *Agent) readbackMAVLinkWireMissionWithin(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, responseTimeout, overallTimeout time.Duration) (_ []*agentv1.MissionItem, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			a.resetMissionQuiet()
+		}
+	}()
 	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish full mission readback epoch: %w", err)
 	}
@@ -553,4 +576,14 @@ func boolByte(value bool) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// missionReadbackQuietPeriod separates stale-response fencing from the per-message
+// response timeout when explicitly configured. The default preserves the
+// previous guard duration, including installations with longer response timeouts.
+func (a *Agent) missionReadbackQuietPeriod() time.Duration {
+	if a.options != nil && a.options.MissionProtocolQuietPeriod > 0 {
+		return a.options.MissionProtocolQuietPeriod
+	}
+	return a.aircraftCommandTimeout()
 }

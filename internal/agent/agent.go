@@ -204,6 +204,7 @@ type Agent struct {
 
 	c2Mu                  sync.Mutex
 	c2Pending             *pendingC2
+	protocolQuiet         protocolQuiet
 	mavlinkMu             sync.Mutex
 	mavlinkTarget         *mavlinkTarget
 	mavlinkHeartbeatSeq   uint64

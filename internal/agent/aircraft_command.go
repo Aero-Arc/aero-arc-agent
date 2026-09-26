@@ -143,6 +143,7 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	previous := a.mavlinkTarget
 	targetChanged := previous == nil || previous.channel != channel || previous.systemID != systemID || previous.componentID != componentID
 	if targetChanged {
+		a.protocolQuiet = protocolQuiet{}
 		// A different transport target starts a new ACK-correlation domain. Even
 		// if the old target completed a quiet epoch, delayed ARM/DISARM evidence
 		// from before this selection cannot be correlated directly.

@@ -26,14 +26,15 @@ type AgentOptions struct {
 	ConsulToken   string
 	ConsulAgentID string
 
-	APIKey                 string
-	EventQueueSize         int
-	SkipTLSVerification    bool
-	WALPath                string
-	WALBatchSize           int64
-	WALFlushTimeout        time.Duration
-	AircraftCommandTimeout time.Duration
-	Debug                  bool
+	APIKey                     string
+	EventQueueSize             int
+	SkipTLSVerification        bool
+	WALPath                    string
+	WALBatchSize               int64
+	WALFlushTimeout            time.Duration
+	AircraftCommandTimeout     time.Duration
+	MissionProtocolQuietPeriod time.Duration
+	Debug                      bool
 }
 
 // GetAgentOptions builds Agent runtime options from CLI flags and the API-key
@@ -51,6 +52,9 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		return nil, ErrConsulUnsupported
 	}
 
+	if c.Duration("mission-protocol-quiet-period") < 0 {
+		return nil, fmt.Errorf("mission protocol quiet period must not be negative")
+	}
 	return &AgentOptions{
 		SerialPath:    c.String("serial-path"),
 		SerialBaud:    c.Int("serial-baud"),
@@ -58,15 +62,16 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		ServerPort:    c.Int("server-port"),
 		RelayTarget:   fmt.Sprintf("%s:%d", c.String("server-address"), c.Int("server-port")),
 
-		BackoffInitial:         c.Duration("backoff-initial"),
-		BackoffMax:             c.Duration("backoff-max"),
-		APIKey:                 os.Getenv("AERO_ARC_API_KEY"),
-		EventQueueSize:         c.Int("event-queue-size"),
-		WALPath:                c.String("wal-path"),
-		WALBatchSize:           c.Int64("wal-batch-size"),
-		WALFlushTimeout:        c.Duration("wal-flush-timeout"),
-		AircraftCommandTimeout: c.Duration("aircraft-command-timeout"),
-		SkipTLSVerification:    c.Bool("skip-tls-verification"),
-		Debug:                  c.Bool("debug"),
+		BackoffInitial:             c.Duration("backoff-initial"),
+		BackoffMax:                 c.Duration("backoff-max"),
+		APIKey:                     os.Getenv("AERO_ARC_API_KEY"),
+		EventQueueSize:             c.Int("event-queue-size"),
+		WALPath:                    c.String("wal-path"),
+		WALBatchSize:               c.Int64("wal-batch-size"),
+		WALFlushTimeout:            c.Duration("wal-flush-timeout"),
+		AircraftCommandTimeout:     c.Duration("aircraft-command-timeout"),
+		MissionProtocolQuietPeriod: c.Duration("mission-protocol-quiet-period"),
+		SkipTLSVerification:        c.Bool("skip-tls-verification"),
+		Debug:                      c.Bool("debug"),
 	}, nil
 }

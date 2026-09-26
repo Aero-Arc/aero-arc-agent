@@ -28,8 +28,12 @@ type pendingC2 struct {
 }
 
 func (a *Agent) observeC2Frame(frame *gomavlib.EventFrame) {
+	if frame == nil {
+		return
+	}
 	a.mavlinkMu.Lock()
 	defer a.mavlinkMu.Unlock()
+	a.trackProtocolQuietLocked(frame, time.Now())
 	p := a.c2Pending
 	current := a.mavlinkTarget
 	if current == nil || p == nil || current.channel != p.target.channel || current.systemID != p.target.systemID || current.componentID != p.target.componentID {
@@ -77,6 +81,10 @@ func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStre
 		if err = proto.Unmarshal(record.Evidence, e); err != nil {
 			return err
 		}
+
+		// A busy replay can report the current snapshot without starting another
+		// effect; the API may recover missing evidence on a later delivery.
+		e.DeliveryComplete = true
 		a.sendMu.Lock()
 		defer a.sendMu.Unlock()
 		return stream.Send(&pb.AgentStreamMessage{Payload: &pb.AgentStreamMessage_CommandEvidence{CommandEvidence: e}})
@@ -91,6 +99,8 @@ func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStre
 			_ = stream.Send(&pb.AgentStreamMessage{Payload: &pb.AgentStreamMessage_CommandEvidence{CommandEvidence: e}})
 		})
 		if err == nil {
+			e = proto.Clone(e).(*pb.CommandEvidence)
+			e.DeliveryComplete = true
 			a.sendMu.Lock()
 			err = stream.Send(&pb.AgentStreamMessage{Payload: &pb.AgentStreamMessage_CommandEvidence{CommandEvidence: e}})
 			a.sendMu.Unlock()
@@ -256,6 +266,9 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		return reject("command profile requires an ArduCopter vehicle")
 	}
 	if m.MissionPrecondition != nil {
+		if err = save("verifying_mission", "Verifying onboard mission", "agent", false); err != nil {
+			return nil, err
+		}
 		if a.deployMAVLinkMission == nil {
 			return reject("mission readback unavailable")
 		}
@@ -295,6 +308,10 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 			return nil, err
 		}
 		effectCtx, cancelEffect := context.WithDeadline(ctx, time.UnixMilli(c.ExpiresAtUnixMs))
+		if err = save("awaiting_ack", "Awaiting autopilot ACK", "agent", true); err != nil {
+			cancelEffect()
+			return nil, err
+		}
 		result := a.executePreparedAircraftCommand(effectCtx, prepared)
 		cancelEffect()
 		switch result.Status {
@@ -311,6 +328,9 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	}
 	if err = a.waitC2Quiet(ctx, pending, c.ExpiresAtUnixMs); err != nil {
 		return reject(err.Error())
+	}
+	if err = save("awaiting_ack", "Awaiting autopilot ACK", "agent", false); err != nil {
+		return nil, err
 	}
 	a.mavlinkMu.Lock()
 	current := a.mavlinkTarget
@@ -455,6 +475,10 @@ func (a *Agent) observeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 // sending a fresh generic command. Any matching ACK restarts the quiet interval.
 func (a *Agent) waitC2Quiet(ctx context.Context, p *pendingC2, expires int64) error {
 	started, last := time.Now(), time.Now()
+	a.mavlinkMu.Lock()
+	credited := a.protocolQuietForLocked(p.target, p.command, false, started)
+	a.mavlinkMu.Unlock()
+	started = started.Add(-credited)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -478,6 +502,19 @@ func (a *Agent) waitC2Quiet(ctx context.Context, p *pendingC2, expires int64) er
 				started = now
 			}
 			if now.Sub(started) >= 4*time.Second {
+				a.mavlinkMu.Lock()
+				q := a.protocolQuiet
+				quiet := a.protocolQuietForLocked(p.target, p.command, false, now)
+				recentACK := q.acks[p.command]
+				a.mavlinkMu.Unlock()
+				if !q.last.IsZero() && quiet < 4*time.Second {
+					started = now.Add(-quiet)
+					continue
+				}
+				if recentACK.After(started) {
+					started = recentACK
+					continue
+				}
 				return nil
 			}
 		}
