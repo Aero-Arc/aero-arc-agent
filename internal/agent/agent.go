@@ -196,11 +196,12 @@ type Agent struct {
 	mavlinkDone    chan struct{}
 	cancelWAL      context.CancelFunc
 
-	stateMu            sync.RWMutex
-	operationContextMu sync.Mutex
-	sessionID          string
-	operationContext   *wal.OperationContext
-	sendMu             sync.Mutex
+	stateMu                 sync.RWMutex
+	operationContextMu      sync.Mutex
+	sessionID               string
+	durableFlightCompletion bool
+	operationContext        *wal.OperationContext
+	sendMu                  sync.Mutex
 
 	c2Mu                  sync.Mutex
 	c2Pending             *pendingC2
@@ -519,6 +520,12 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 // observed telemetry is counted and dropped rather than allowing an unbounded
 // heap or preventing COMMAND_ACK and heartbeat state from being observed.
 func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Event) error {
+	completionQueue := make(chan completionObservation, 64)
+	completionCtx, stopCompletion := context.WithCancel(ctx)
+	completionDone := make(chan struct{})
+	go func() { defer close(completionDone); a.runCompletionObservations(completionCtx, completionQueue) }()
+	defer func() { stopCompletion(); <-completionDone }()
+
 	queueSize := 1000
 	if a.options != nil && a.options.EventQueueSize > 0 {
 		queueSize = a.options.EventQueueSize
@@ -559,6 +566,13 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 				// Control evidence must be observed before any telemetry work. WAL
 				// backpressure must never make a valid aircraft ACK time out.
 				a.observeMAVLinkFrame(frameEvt)
+				if observation, ok := a.completionObservation(frameEvt); ok {
+					select {
+					case completionQueue <- observation:
+					default:
+						slog.Warn("completion observation queue saturated; awaiting fresh evidence")
+					}
+				}
 				slog.LogAttrs(
 					ctx, slog.LevelDebug,
 					"mavlink_frame_received",
@@ -825,6 +839,7 @@ func (a *Agent) register(ctx context.Context) error {
 	a.telemetryMaxInflight.Store(maximum)
 	a.stateMu.Lock()
 	a.sessionID = response.GetSessionId()
+	a.durableFlightCompletion = response.GetDurableFlightCompletion()
 	a.stateMu.Unlock()
 
 	slog.LogAttrs(
@@ -899,6 +914,21 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 	ackCtx, cancelACKs := context.WithCancel(ctx)
 	var commandWG sync.WaitGroup
 	commandErrors := make(chan error, 1)
+	a.stateMu.RLock()
+	completionEnabled := a.durableFlightCompletion
+	a.stateMu.RUnlock()
+	if completionEnabled {
+		commandWG.Add(1)
+		go func() {
+			defer commandWG.Done()
+			if err := a.runCompletionDelivery(commandCtx, stream); err != nil {
+				select {
+				case commandErrors <- err:
+				default:
+				}
+			}
+		}()
+	}
 	ackQueue := make(chan *agentv1.TelemetryAck, telemetryACKQueueCapacity)
 	ackDone := make(chan error, 1)
 	var ackWG sync.WaitGroup
@@ -1045,6 +1075,8 @@ func (a *Agent) runTelemetryACKWorker(ctx context.Context, acknowledgments <-cha
 
 func (a *Agent) handleRelayMessage(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], message *agentv1.RelayStreamMessage) error {
 	switch payload := message.GetPayload().(type) {
+	case *agentv1.RelayStreamMessage_FlightCompletionReceipt:
+		return a.wal.AcknowledgeFlightCompletion(ctx, payload.FlightCompletionReceipt)
 	case *agentv1.RelayStreamMessage_TelemetryAck:
 		return a.handleTelemetryAck(ctx, payload.TelemetryAck)
 	case *agentv1.RelayStreamMessage_SetOperationContext:

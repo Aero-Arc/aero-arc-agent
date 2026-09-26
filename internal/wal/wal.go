@@ -224,7 +224,9 @@ func configureDB(db *sql.DB) error {
 func initDB(db *sql.DB) error {
 	// for seq we would need to emit 1000frames a second over 200million years to overflow
 	query := `
-	CREATE TABLE IF NOT EXISTS c2_commands (
+	CREATE TABLE IF NOT EXISTS flight_watches(flight_id TEXT PRIMARY KEY,start_command_id TEXT NOT NULL,payload BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS flight_completion_events(event_id TEXT PRIMARY KEY,digest TEXT NOT NULL,payload BLOB NOT NULL,delivered INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS c2_commands (
  command_id TEXT PRIMARY KEY, digest TEXT NOT NULL, payload BLOB NOT NULL, evidence BLOB NOT NULL, effect_started INTEGER NOT NULL DEFAULT 0
  );
  CREATE TABLE IF NOT EXISTS telemetry_frames (

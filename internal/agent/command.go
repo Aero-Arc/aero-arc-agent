@@ -362,6 +362,11 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	if ctx.Err() != nil || time.Now().UnixMilli() >= c.ExpiresAtUnixMs {
 		return reject("authorization expired or execution canceled before effect")
 	}
+	if c.Definition == "MISSION_START" {
+		if err = a.wal.BeginFlightWatch(ctx, c); err != nil {
+			return nil, err
+		}
+	}
 	if err = a.writeMAVLinkMessage(target.channel, request); err != nil {
 		return e, save("outcome_unknown", err.Error(), "mavlink_transport", true)
 	}

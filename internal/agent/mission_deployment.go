@@ -405,6 +405,9 @@ func validateMissionCommandAt(command *agentv1.DeployMissionCommand, now time.Ti
 		if !supportedMissionFrame(item.Frame) || !supportedMissionCommand(item.Command) {
 			return nil, "", fmt.Errorf("mission item %d has unsupported frame or command", i)
 		}
+		if item.Command == 20 && (i != len(command.Plan.Items)-1 || item.LatitudeE7 != 0 || item.LongitudeE7 != 0 || item.AltitudeM != 0) {
+			return nil, "", errors.New("RTL must be terminal with zero coordinates and altitude")
+		}
 		if item.Current {
 			return nil, "", fmt.Errorf("mission item %d current must be false; execution position is dynamic state, not canonical mission content", i)
 		}
@@ -485,7 +488,7 @@ func supportedMissionFrame(frame uint32) bool {
 
 func supportedMissionCommand(command uint32) bool {
 	switch command {
-	case 16, 21, 22:
+	case 16, 20, 21, 22:
 		return true
 	default:
 		return false
