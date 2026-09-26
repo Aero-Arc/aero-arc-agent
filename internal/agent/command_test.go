@@ -52,7 +52,11 @@ func TestCommandRestartNeverRepeatsAnUncertainEffect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	a := &Agent{wal: w}
 	e, err := a.executeDurableCommand(ctx, c, nil)
 	if err != nil {
@@ -78,7 +82,11 @@ func TestExpiredFirstCommandIsDurablyRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	c := testC2Command(t)
 	c.IssuedAtUnixMs = time.Now().Add(-time.Minute).UnixMilli()
 	c.ExpiresAtUnixMs = time.Now().Add(-time.Second).UnixMilli()
@@ -100,7 +108,11 @@ func TestCommandEffectPermitIsSingleUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	c := testC2Command(t)
 	payload, _ := proto.Marshal(c)
 	evidence, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: c.CommandDigest})

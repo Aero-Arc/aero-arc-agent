@@ -370,15 +370,11 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	a.mavlinkMu.Unlock()
 	execution, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	acked, observed := false, false
-	// MAVLink does not echo our identity. Require fresh matching vehicle evidence
-	// as well as an ACK before treating generic execution as applied.
+	// MAVLink does not echo our identity. A correlated ACK establishes application;
+	// fresh vehicle evidence is collected separately by observeDurableCommand.
 	for {
 		select {
 		case <-execution.Done():
-			if acked {
-				return e, nil
-			}
 			return e, save("outcome_unknown", "no correlated acceptance before timeout; no automatic effect retry", "agent", true)
 		case f := <-pending.frames:
 			switch v := f.Message().(type) {
@@ -386,8 +382,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 				if uint32(v.Command) != m.Command || (v.TargetSystem != 0 && v.TargetSystem != mavlinkSourceSystemID) || (v.TargetComponent != 0 && v.TargetComponent != mavlinkSourceComponentID) {
 					continue
 				}
-				if v.Result == common.MAV_RESULT_ACCEPTED && !acked {
-					acked = true
+				if v.Result == common.MAV_RESULT_ACCEPTED {
 					if err = save("applied", "autopilot accepted command; observation pending", "mavlink_command_ack", true); err != nil {
 						return nil, err
 					}
@@ -395,16 +390,6 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 				} else if v.Result != common.MAV_RESULT_IN_PROGRESS && v.Result != common.MAV_RESULT_ACCEPTED {
 					return e, save("rejected", fmt.Sprintf("autopilot rejected command: %s", v.Result.String()), "mavlink_command_ack", true)
 				}
-			case *common.MessageHeartbeat:
-				armed := v.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0
-				observed = observed || (m.Observation == "armed" && armed) || (m.Observation == "disarmed" && !armed) || (m.Observation == "custom_mode" && v.CustomMode == m.ExpectedCustomMode)
-			case *common.MessageMissionCurrent:
-				observed = observed || (m.Observation == "mission_running" && v.MissionState == common.MISSION_STATE_ACTIVE && v.MissionMode == 1)
-			case *common.MessageExtendedSysState:
-				observed = observed || (m.Observation == "landed" && v.LandedState == common.MAV_LANDED_STATE_ON_GROUND)
-			}
-			if acked && observed {
-				return e, save("observed", "fresh "+m.Observation+" matched command predicate", "mavlink_vehicle_state", true)
 			}
 		}
 	}
