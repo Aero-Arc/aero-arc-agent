@@ -2,11 +2,15 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"google.golang.org/protobuf/proto"
 )
+
+// ErrCommandSuperseded means a newer admitted command already began an effect.
+var ErrCommandSuperseded = errors.New("command superseded before first effect")
 
 // CommandRecord is an immutable command and its durable execution evidence.
 type CommandRecord struct {
@@ -117,12 +121,23 @@ func (w *WAL) CommandIsLatest(ctx context.Context, id string) (bool, error) {
 //
 // Parameters: ctx bounds the atomic update; id and digest select exact authority.
 //
-// Returns: True only for the first permit, false when consumed or absent, or a SQLite error.
+// Returns: True only for the first permit, false when consumed or absent,
+// ErrCommandSuperseded when newer authority has begun an effect, or a SQLite error.
 func (w *WAL) BeginCommandEffect(ctx context.Context, id, digest string) (bool, error) {
-	result, err := w.db.ExecContext(ctx, `UPDATE c2_commands SET effect_started=1 WHERE command_id=? AND digest=? AND effect_started=0`, id, digest)
+	result, err := w.db.ExecContext(ctx, `UPDATE c2_commands SET effect_started=1 WHERE command_id=? AND digest=? AND effect_started=0 AND NOT EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>c2_commands.rowid AND newer.effect_started=1)`, id, digest)
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
-	return n == 1, err
+	if err != nil || n == 1 {
+		return n == 1, err
+	}
+	var superseded bool
+	if err = w.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM c2_commands current WHERE command_id=? AND digest=? AND effect_started=0 AND EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>current.rowid AND newer.effect_started=1))`, id, digest).Scan(&superseded); err != nil {
+		return false, err
+	}
+	if superseded {
+		return false, ErrCommandSuperseded
+	}
+	return false, nil
 }

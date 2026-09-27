@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -309,5 +311,40 @@ func TestDurableArmRejectsTargetChangedDuringMissionReadback(t *testing.T) {
 	e, err := a.executeDurableCommand(context.Background(), c, nil)
 	if err != nil || !hasStage(e, "rejected") || writes.Load() != 0 {
 		t.Fatalf("retargeted ARM: %v err=%v writes=%d", e, err, writes.Load())
+	}
+}
+
+func TestSupersededAdmissionCannotAcquireEffectPermit(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	ctx := context.Background()
+	for _, id := range []string{"old", "new"} {
+		if err := a.wal.AdmitCommand(ctx, id, wal.CommandRecord{Digest: id, Payload: []byte{}, Evidence: []byte{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ok, err := a.wal.BeginCommandEffect(ctx, "new", "new"); err != nil || !ok {
+		t.Fatalf("new permit: %v %v", ok, err)
+	}
+	if ok, err := a.wal.BeginCommandEffect(ctx, "old", "old"); ok || !errors.Is(err, wal.ErrCommandSuperseded) {
+		t.Fatalf("superseded effect allowed: %v %v", ok, err)
+	}
+	record, err := a.wal.LoadCommand(ctx, "old")
+	if err != nil || record.EffectStarted {
+		t.Fatalf("stale effect fence consumed: %+v %v", record, err)
+	}
+}
+
+func TestMalformedMavlinkParametersFailBeforeJournalAdmission(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	c := testC2Command(t)
+	c.GetMavlink().Command = 21
+	c.GetMavlink().Parameters = []float32{0}
+	if _, err := a.executeDurableCommand(context.Background(), c, nil); err == nil {
+		t.Fatal("malformed envelope accepted")
+	}
+	if _, err := a.wal.LoadCommand(context.Background(), c.CommandId); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("malformed command journaled: %v", err)
 	}
 }
