@@ -331,6 +331,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 			cancelEffect()
 			return nil, err
 		}
+		prepared.validatedTarget = target
 		result := a.executePreparedAircraftCommand(effectCtx, prepared)
 		cancelEffect()
 		switch result.Status {
