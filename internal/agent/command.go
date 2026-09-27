@@ -149,7 +149,7 @@ func hasStage(e *pb.CommandEvidence, stage string) bool {
 	return false
 }
 
-func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand, emit func(*pb.CommandEvidence)) (*pb.CommandEvidence, error) {
+func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand, emit func(*pb.CommandEvidence)) (result *pb.CommandEvidence, resultErr error) {
 	digest, err := commanddigest.Digest(c)
 	if err != nil || digest != c.GetCommandDigest() || c.GetCommandId() == "" {
 		return nil, fmt.Errorf("invalid durable command identity")
@@ -183,6 +183,12 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		}
 		return err
 	}
+	defer func() {
+		if errors.Is(resultErr, wal.ErrCommandSuperseded) {
+			result = e
+			resultErr = save("rejected", "newer command already began an aircraft effect", "agent_journal", false)
+		}
+	}()
 	record, err := a.wal.LoadCommand(ctx, c.CommandId)
 	if err == nil {
 		effectOwned = record.EffectStarted
@@ -381,6 +387,12 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	}
 	if ctx.Err() != nil || time.Now().UnixMilli() >= c.ExpiresAtUnixMs {
 		return reject("authorization expired or execution canceled before effect")
+	}
+	a.mavlinkMu.Lock()
+	validTarget := sameValidatedTarget(a.mavlinkTarget, target)
+	a.mavlinkMu.Unlock()
+	if !validTarget {
+		return reject("autopilot target changed after effect fence")
 	}
 	if err = a.writeMAVLinkMessage(target.channel, request); err != nil {
 		return e, save("outcome_unknown", err.Error(), "mavlink_transport", true)
