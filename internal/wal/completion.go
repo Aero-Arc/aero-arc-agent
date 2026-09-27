@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/aero-arc/aero-arc-protos/flightcompletion"
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -16,6 +18,8 @@ import (
 // FlightWatch retains flight milestones across restarts; fresh ground samples
 // are deliberately process-local so a restart cannot combine stale observations.
 type FlightWatch struct {
+	// HandoffAt fences observations captured before the successful mission-start write.
+	HandoffAt  int64              `json:"handoff_at"`
 	Command    *pb.DurableCommand `json:"command"`
 	AirborneAt int64              `json:"airborne_at"`
 	TerminalAt int64              `json:"terminal_at"`
@@ -184,28 +188,94 @@ func (w *WAL) SaveFlightWatch(ctx context.Context, v FlightWatch, e *pb.FlightCo
 
 // PendingFlightCompletions returns bounded unacknowledged events for replay.
 //
-// Parameters: ctx bounds reads of outstanding immutable delivery obligations.
-// Returns: a bounded admission-ordered page, or a storage/protobuf decoding error;
-// reading does not acknowledge or alter any event.
+// Parameters: ctx bounds the read/quarantine transaction.
+// Returns: a bounded admission-ordered page of valid events, or a storage error.
+// Malformed protobufs, invalid evidence, and identity/digest mismatches are
+// durably quarantined with a reason and logged; their original bytes and pending
+// delivery status are preserved for operator repair. They do not block later
+// events or terminate telemetry streaming. Reading never acknowledges an event.
 func (w *WAL) PendingFlightCompletions(ctx context.Context) ([]*pb.FlightCompletionEvidence, error) {
-	rows, err := w.db.QueryContext(ctx, `SELECT payload FROM flight_completion_events WHERE delivered=0 ORDER BY rowid LIMIT 32`)
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT event_id,digest,payload FROM flight_completion_events e WHERE delivered=0 AND NOT EXISTS(SELECT 1 FROM flight_completion_quarantine q WHERE q.event_id=e.event_id) ORDER BY rowid LIMIT 32`)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+	type invalid struct{ id, reason string }
+	var corrupt []invalid
 	var result []*pb.FlightCompletionEvidence
 	for rows.Next() {
+		var id, digest string
 		var raw []byte
-		if err = rows.Scan(&raw); err != nil {
+		if err = rows.Scan(&id, &digest, &raw); err != nil {
 			return nil, err
 		}
 		e := new(pb.FlightCompletionEvidence)
-		if err = proto.Unmarshal(raw, e); err != nil {
-			return nil, err
+		validationErr := proto.Unmarshal(raw, e)
+		if validationErr == nil {
+			_, actual, encodeErr := flightcompletion.Encode(e)
+			validationErr = encodeErr
+			if validationErr == nil && (e.EventId != id || actual != digest) {
+				validationErr = errors.New("completion identity or digest mismatch")
+			}
+		}
+		if validationErr != nil {
+			corrupt = append(corrupt, invalid{id, validationErr.Error()})
+			continue
 		}
 		result = append(result, e)
 	}
-	return result, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, v := range corrupt {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO flight_completion_quarantine(event_id,reason,quarantined_at) VALUES(?,?,?) ON CONFLICT(event_id) DO NOTHING`, v.id, v.reason, time.Now().UnixNano()); err != nil {
+			return nil, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	for _, v := range corrupt {
+		slog.Error("flight completion quarantined; operator repair required", "event_id", v.id, "reason", v.reason)
+	}
+	return result, nil
+}
+
+// RecordFlightWatchHandoff persists the post-write boundary before start is applied.
+//
+// Parameters: ctx bounds storage; c is the exact mission-start authority; at is
+// the local capture-clock time immediately after successful MAVLink handoff.
+// Returns: nil for a persisted exact binding, an identical replay, or an absent
+// watch (missions without terminal recovery); errors for a changed binding/time,
+// invalid timestamp, or storage failure. A missing boundary never enables
+// completion observations, including watches written by older Agent versions.
+func (w *WAL) RecordFlightWatchHandoff(ctx context.Context, c *pb.DurableCommand, at int64) error {
+	if at <= 0 {
+		return errors.New("positive handoff time required")
+	}
+	v, err := w.LoadFlightWatch(ctx, c.Context.FlightId)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if v.Command.CommandId != c.CommandId {
+		return errors.New("flight watch handoff binding mismatch")
+	}
+	if v.HandoffAt != 0 && v.HandoffAt != at {
+		return errors.New("flight watch handoff is immutable")
+	}
+	v.HandoffAt = at
+	return w.SaveFlightWatch(ctx, v, nil)
 }
 
 // AcknowledgeFlightCompletion retires only a receipt matching persisted content.

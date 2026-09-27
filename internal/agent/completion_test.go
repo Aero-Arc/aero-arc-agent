@@ -44,6 +44,9 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			if err = w.BeginFlightWatch(ctx, c); err != nil {
 				t.Fatal(err)
 			}
+			if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
+				t.Fatal(err)
+			}
 			a := &Agent{wal: w}
 			samples := completionSamples{}
 			observe := func(o completionObservation) {
@@ -179,6 +182,7 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	watch.HandoffAt = time.Now().Add(-2 * time.Second).UnixNano()
 	watch.AirborneAt = time.Now().Add(-time.Second).UnixNano()
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
 		t.Fatal(err)
@@ -225,5 +229,52 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	saved, err := w.LoadFlightWatch(context.Background(), c.Context.FlightId)
 	if err != nil || saved.TerminalAt == 0 || saved.Outcome != "ended_early" {
 		t.Fatalf("accepted terminal milestone lost: %+v %v", saved, err)
+	}
+}
+
+func TestCompletionIgnoresQueuedPreHandoffObservations(t *testing.T) {
+	ctx := context.Background()
+	w, err := wal.New(ctx, filepath.Join(t.TempDir(), "watch.db"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	c := testC2Command(t)
+	c.GetMavlink().MissionPrecondition = &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Param4: 1, Autocontinue: true}}}
+	raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied"}}})
+	if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.BeginFlightWatch(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	handoff := time.Now().Add(time.Second).UnixNano()
+	if err = w.RecordFlightWatchHandoff(ctx, c, handoff); err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{wal: w}
+	samples := completionSamples{}
+	// Simulate queued observations captured after API issue but before the effect.
+	for _, o := range []completionObservation{{kind: "heartbeat", armed: true, mode: 6}, {kind: "landed", landed: 2}, {kind: "heartbeat", armed: true, mode: 6}, {kind: "landed", landed: 1}, {kind: "heartbeat", armed: false}} {
+		o.context = c.Context
+		o.at = handoff - 1
+		if err = a.observeCompletion(ctx, o, "epoch", &samples); err != nil {
+			t.Fatal(err)
+		}
+	}
+	watch, err := w.LoadFlightWatch(ctx, c.Context.FlightId)
+	if err != nil || watch.AirborneAt != 0 || watch.TerminalAt != 0 || watch.Done || samples.heartbeatAt != 0 {
+		t.Fatalf("pre-handoff evidence accepted: %+v %+v %v", watch, samples, err)
+	}
+	// Old watches without an actual handoff boundary also fail closed.
+	watch.HandoffAt = 0
+	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.observeCompletion(ctx, completionObservation{context: c.Context, at: handoff + 1, kind: "heartbeat", armed: true, mode: 6}, "epoch", &samples); err != nil {
+		t.Fatal(err)
+	}
+	if samples.heartbeatAt != 0 {
+		t.Fatal("missing handoff boundary accepted evidence")
 	}
 }

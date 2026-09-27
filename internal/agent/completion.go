@@ -121,7 +121,7 @@ func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, 
 	if !applied {
 		return nil
 	}
-	if c.Context.AircraftId != o.context.AircraftId || c.Context.IntentId != o.context.IntentId || c.Context.IntentVersion != o.context.IntentVersion || o.at < c.IssuedAtUnixMs*int64(time.Millisecond) {
+	if c.Context.AircraftId != o.context.AircraftId || c.Context.IntentId != o.context.IntentId || c.Context.IntentVersion != o.context.IntentVersion || watch.HandoffAt == 0 || o.at < watch.HandoffAt {
 		return nil
 	}
 	if samples.flight != o.context.FlightId {

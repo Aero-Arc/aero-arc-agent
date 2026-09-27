@@ -226,6 +226,7 @@ func initDB(db *sql.DB) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS flight_watches(flight_id TEXT PRIMARY KEY,start_command_id TEXT NOT NULL,payload BLOB NOT NULL);
  CREATE TABLE IF NOT EXISTS flight_completion_events(event_id TEXT PRIMARY KEY,digest TEXT NOT NULL,payload BLOB NOT NULL,delivered INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS flight_completion_quarantine(event_id TEXT PRIMARY KEY,reason TEXT NOT NULL,quarantined_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS c2_commands (
  command_id TEXT PRIMARY KEY, digest TEXT NOT NULL, payload BLOB NOT NULL, evidence BLOB NOT NULL, effect_started INTEGER NOT NULL DEFAULT 0
  );

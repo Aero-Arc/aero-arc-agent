@@ -405,9 +405,15 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	if err = a.writeMAVLinkMessage(target.channel, request); err != nil {
 		return e, save("outcome_unknown", err.Error(), "mavlink_transport", true)
 	}
+	handoffAt := time.Now()
 	a.mavlinkMu.Lock()
-	pending.after = time.Now()
+	pending.after = handoffAt
 	a.mavlinkMu.Unlock()
+	if c.Definition == "MISSION_START" {
+		if err = a.wal.RecordFlightWatchHandoff(ctx, c, handoffAt.UnixNano()); err != nil {
+			return e, save("outcome_unknown", "mission handoff evidence persistence failed: "+err.Error(), "agent", true)
+		}
+	}
 	execution, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	// MAVLink does not echo our identity. A correlated ACK establishes application;

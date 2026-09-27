@@ -23,3 +23,10 @@ AERO_AGENT_TEST_SITL_BINARY=/absolute/path/to/arducopter \
 
 RTL uses the autopilot's HOME and recovery parameters. Automatic API closure
 waits for actual landing/disarm, including when RTL settings leave it hovering.
+
+Completion observation capture times must follow the persisted post-MAVLink
+handoff boundary. Watches from older versions without that boundary fail closed
+and require operator reconciliation; command issue time is not a substitute.
+Malformed or identity/digest-mismatched completion rows are preserved in SQLite
+and excluded through `flight_completion_quarantine`, with a logged reason for
+operator repair. They never acknowledge delivery or block healthy later events.
