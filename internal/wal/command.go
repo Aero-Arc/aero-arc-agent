@@ -101,14 +101,14 @@ func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byt
 }
 
 // CommandIsLatest prevents late observations from being attributed across a newer
-// command admission on this single-aircraft Agent journal.
+// effect-bearing command on this single-aircraft Agent journal.
 //
 // Parameters: ctx bounds reads; id selects an admitted command.
 //
-// Returns: Whether no newer command has been admitted, or a SQLite error.
+// Returns: Whether no newer command has begun an effect, or a SQLite error.
 func (w *WAL) CommandIsLatest(ctx context.Context, id string) (bool, error) {
 	var latest bool
-	err := w.db.QueryRowContext(ctx, `SELECT rowid=(SELECT MAX(rowid) FROM c2_commands) FROM c2_commands WHERE command_id=?`, id).Scan(&latest)
+	err := w.db.QueryRowContext(ctx, `SELECT rowid=(SELECT MAX(rowid) FROM c2_commands WHERE effect_started=1) FROM c2_commands WHERE command_id=?`, id).Scan(&latest)
 	return latest, err
 }
 
