@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -193,5 +194,86 @@ func TestLandAppliedRemainsIndependentFromTouchdown(t *testing.T) {
 	}
 	if writes.Load() != 1 {
 		t.Fatalf("result recovery repeated aircraft effect %d times", writes.Load())
+	}
+}
+
+func TestDispatchJournalsIdentityBeforeAsyncExecution(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	c := testC2Command(t)
+	stream := &mockStream{}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	// Hold execution before its binding check, allowing an immediate duplicate.
+	a.operationContextMu.Lock()
+	if err := a.dispatchDurableCommand(context.Background(), stream, c, &wg, errs); err != nil {
+		a.operationContextMu.Unlock()
+		t.Fatal(err)
+	}
+	record, err := a.wal.LoadCommand(context.Background(), c.CommandId)
+	if err != nil || record.Digest != c.CommandDigest {
+		a.operationContextMu.Unlock()
+		wg.Wait()
+		t.Fatalf("dispatch returned before admission: %+v %v", record, err)
+	}
+	if err := a.dispatchDurableCommand(context.Background(), stream, c, &wg, errs); err != nil {
+		t.Error(err)
+	}
+	record, err = a.wal.LoadCommand(context.Background(), c.CommandId)
+	e := &pb.CommandEvidence{}
+	if err == nil {
+		err = proto.Unmarshal(record.Evidence, e)
+	}
+	if err != nil || hasStage(e, "rejected") {
+		t.Errorf("duplicate rejected active command: %v %v", e, err)
+	}
+	a.operationContextMu.Unlock()
+	wg.Wait()
+}
+
+func TestUncertainRecoveryObservesWithoutAppliedOrAnotherEffect(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c := testC2Command(t)
+	payload, _ := proto.Marshal(c)
+	evidence, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: c.CommandDigest})
+	if err := a.wal.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: c.CommandDigest, Payload: payload, Evidence: evidence}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.wal.BeginCommandEffect(ctx, c.CommandId, c.CommandDigest); err != nil {
+		t.Fatal(err)
+	}
+	// A subsequent effect-free rejection must not supersede this observation.
+	if err := a.wal.AdmitCommand(ctx, "rejected-other", wal.CommandRecord{Digest: "other", Payload: payload, Evidence: evidence}); err != nil {
+		t.Fatal(err)
+	}
+	var writes atomic.Int32
+	a.writeMAVLinkMessage = func(*gomavlib.Channel, message.Message) error { writes.Add(1); return nil }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.mavlinkMu.Lock()
+				p := a.c2Pending
+				a.mavlinkMu.Unlock()
+				if p != nil {
+					a.observeC2Frame(&gomavlib.EventFrame{Channel: p.target.channel, Frame: &frame.V2Frame{SystemID: p.target.systemID, ComponentID: p.target.componentID, Message: &common.MessageHeartbeat{BaseMode: common.MAV_MODE_FLAG_SAFETY_ARMED}}})
+				}
+			}
+		}
+	}()
+	e, err := a.executeDurableCommand(ctx, c, nil)
+	cancel()
+	<-done
+	if err != nil || !hasStage(e, "observed") || !hasStage(e, "outcome_unknown") || hasStage(e, "applied") || writes.Load() != 0 {
+		t.Fatalf("unsafe recovery: %v err=%v writes=%d", e, err, writes.Load())
 	}
 }

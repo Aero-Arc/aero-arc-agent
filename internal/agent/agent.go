@@ -203,6 +203,7 @@ type Agent struct {
 	operationContext        *wal.OperationContext
 	sendMu                  sync.Mutex
 
+	c2AdmissionMu         sync.Mutex
 	c2Mu                  sync.Mutex
 	c2Pending             *pendingC2
 	protocolQuiet         protocolQuiet

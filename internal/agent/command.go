@@ -49,7 +49,11 @@ func (a *Agent) observeC2Frame(frame *gomavlib.EventFrame) {
 }
 
 func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStreamingClient[pb.AgentStreamMessage, pb.RelayStreamMessage], c *pb.DurableCommand, wg *sync.WaitGroup, errs chan<- error) error {
-	// Bound concurrent submissions without blocking telemetry ingest.
+	// Serialize initial journal admission before exposing an active execution to
+	// duplicate deliveries. The execution itself remains asynchronous.
+	a.c2AdmissionMu.Lock()
+	defer a.c2AdmissionMu.Unlock()
+	// Bound concurrent submissions without waiting for aircraft execution.
 	if !a.c2Mu.TryLock() {
 		digest, err := commanddigest.Digest(c)
 		if err != nil || digest != c.GetCommandDigest() || c.GetAgentId() != identity.Resolve().FinalID {
@@ -88,6 +92,24 @@ func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStre
 		a.sendMu.Lock()
 		defer a.sendMu.Unlock()
 		return stream.Send(&pb.AgentStreamMessage{Payload: &pb.AgentStreamMessage_CommandEvidence{CommandEvidence: e}})
+	}
+	// Persist the winning identity before a busy duplicate can read the journal.
+	digest, err := commanddigest.Digest(c)
+	if err != nil || digest != c.GetCommandDigest() || c.GetAgentId() != identity.Resolve().FinalID {
+		a.c2Mu.Unlock()
+		return fmt.Errorf("invalid command identity")
+	}
+	payload, err := proto.Marshal(c)
+	if err == nil {
+		var evidence []byte
+		evidence, err = proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: digest})
+		if err == nil {
+			err = a.wal.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: digest, Payload: payload, Evidence: evidence})
+		}
+	}
+	if err != nil {
+		a.c2Mu.Unlock()
+		return err
 	}
 	wg.Add(1)
 	go func() {
@@ -184,10 +206,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 				return a.executeC2Mission(ctx, c, e, save)
 			}
 			// Recovery only listens for new observations. It never emits another effect.
-			if hasStage(e, "applied") {
-				return a.observeDurableCommand(ctx, c, e, save)
-			}
-			return e, nil
+			return a.observeDurableCommand(ctx, c, e, save)
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
