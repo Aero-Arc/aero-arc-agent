@@ -10,6 +10,7 @@ import (
 
 	"github.com/aero-arc/aero-arc-protos/commanddigest"
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/aero-arc/aero-arc-protos/missiondigest"
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/bluenviron/gomavlib/v3/pkg/frame"
@@ -275,5 +276,38 @@ func TestUncertainRecoveryObservesWithoutAppliedOrAnotherEffect(t *testing.T) {
 	<-done
 	if err != nil || !hasStage(e, "observed") || !hasStage(e, "outcome_unknown") || hasStage(e, "applied") || writes.Load() != 0 {
 		t.Fatalf("unsafe recovery: %v err=%v writes=%d", e, err, writes.Load())
+	}
+}
+
+func TestDurableArmRejectsTargetChangedDuringMissionReadback(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	c := testC2Command(t)
+	c.GetMavlink().MissionPrecondition = &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Autocontinue: true, Param4: 1}}}
+	c.GetMavlink().MissionPreconditionId = "mission"
+	c.GetMavlink().MissionPreconditionVersion = 1
+	var err error
+	c.CommandDigest, err = commanddigest.Digest(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.operationContext = &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}
+	a.mavlinkTarget.autopilot = common.MAV_AUTOPILOT_ARDUPILOTMEGA
+	a.mavlinkTarget.vehicleType = common.MAV_TYPE_QUADROTOR
+	a.mavlinkTarget.heartbeatAt = time.Now()
+	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, plan *pb.MissionPlan, _ bool, _ int64) (string, uint32, *uint32, error) {
+		a.mavlinkMu.Lock()
+		next := *a.mavlinkTarget
+		next.systemID++
+		a.mavlinkTarget = &next
+		a.mavlinkMu.Unlock()
+		digest, err := missiondigest.Digest(plan)
+		return digest, 1, nil, err
+	}
+	var writes atomic.Int32
+	a.writeMAVLinkCommand = func(*gomavlib.Channel, *common.MessageCommandLong) error { writes.Add(1); return nil }
+	e, err := a.executeDurableCommand(context.Background(), c, nil)
+	if err != nil || !hasStage(e, "rejected") || writes.Load() != 0 {
+		t.Fatalf("retargeted ARM: %v err=%v writes=%d", e, err, writes.Load())
 	}
 }

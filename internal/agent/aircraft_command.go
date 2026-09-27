@@ -63,10 +63,11 @@ type pendingMAVLinkCommand struct {
 }
 
 type preparedAircraftCommand struct {
-	command      *agentv1.AircraftCommand
-	result       *agentv1.AircraftCommandResult
-	param1       float32
-	desiredArmed bool
+	validatedTarget *mavlinkTarget
+	command         *agentv1.AircraftCommand
+	result          *agentv1.AircraftCommandResult
+	param1          float32
+	desiredArmed    bool
 }
 
 func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
@@ -454,6 +455,12 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 			result.Message = "autopilot MAVLink channel is unavailable"
 			return result
 		}
+		if expected := prepared.validatedTarget; expected != nil && !sameValidatedTarget(target, expected) {
+			a.mavlinkMu.Unlock()
+			result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
+			result.Message = "validated autopilot target changed before effect"
+			return result
+		}
 		if a.aircraftAckAmbiguous && target.armed == desiredArmed {
 			a.mavlinkMu.Unlock()
 			if !a.waitForAircraftACKQuiescenceOrTransition(admissionCtx, desiredArmed) {
@@ -519,6 +526,16 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
 		result.Message = "command canceled before MAVLink handoff: " + err.Error()
 		return result
+	}
+	if prepared.validatedTarget != nil {
+		a.mavlinkMu.Lock()
+		valid := sameValidatedTarget(a.mavlinkTarget, prepared.validatedTarget)
+		a.mavlinkMu.Unlock()
+		if !valid {
+			result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
+			result.Message = "validated autopilot target changed before handoff"
+			return result
+		}
 	}
 	if err := a.writeMAVLinkCommand(target.channel, mavlinkCommand); err != nil {
 		a.mavlinkMu.Lock()
@@ -626,4 +643,8 @@ func (a *Agent) aircraftCommandTimeout() time.Duration {
 		return a.options.AircraftCommandTimeout
 	}
 	return defaultAircraftCommandTimeout
+}
+
+func sameValidatedTarget(current, expected *mavlinkTarget) bool {
+	return current != nil && current.channel == expected.channel && current.systemID == expected.systemID && current.componentID == expected.componentID && current.autopilot == expected.autopilot && current.vehicleType == expected.vehicleType && time.Since(current.heartbeatAt) <= 3*time.Second
 }
