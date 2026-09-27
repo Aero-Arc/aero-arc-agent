@@ -189,7 +189,7 @@ type Agent struct {
 	dialFn         func(ctx context.Context) (*grpc.ClientConn, error)
 	registerFn     func(ctx context.Context) error
 	openStreamFn   func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
-	ackLoopFn      func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
+	ackLoopFn      func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], cancelStream context.CancelFunc) error
 	sleepWithBack  func(ctx context.Context, d time.Duration) bool
 	closeWALFn     func(ctx context.Context) error
 	closeMAVLinkFn func(ctx context.Context)
@@ -910,7 +910,7 @@ type relayStreamReceive struct {
 // commits. This prevents a burst of successful telemetry ACKs from placing
 // operation-context or aircraft control messages behind one SQLite FULL commit
 // per frame.
-func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], cancelStream context.CancelFunc) error {
 	commandCtx, cancelCommands := context.WithCancel(ctx)
 	ackCtx, cancelACKs := context.WithCancel(ctx)
 	var commandWG sync.WaitGroup
@@ -953,6 +953,8 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 		}
 	}()
 	defer func() {
+		// Stop the actual gRPC stream before waiting for workers blocked in Send.
+		cancelStream()
 		cancelCommands()
 		cancelACKs()
 		commandWG.Wait()
@@ -1516,7 +1518,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		// 5. Run the ack loop until it ends or context is cancelled.
 		go func() {
 			defer func() { streamStopped <- struct{}{} }()
-			errChan <- a.ackLoopFn(connCtx, stream)
+			errChan <- a.ackLoopFn(connCtx, stream, cancelConn)
 		}()
 
 		select {

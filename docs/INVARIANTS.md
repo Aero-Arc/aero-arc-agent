@@ -376,3 +376,7 @@ They exist to:
 - Make failure modes explicit
 
 They are as important as the code itself.
+
+Terminal RTL (MAV_CMD_NAV_RETURN_TO_LAUNCH, 20) has zero coordinates and
+parameters and may only be the final canonical item. Its return path comes from
+autopilot HOME/RTL settings, not an explicit waypoint at latitude/longitude zero.

@@ -4,11 +4,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"github.com/aero-arc/aero-arc-protos/flightcompletion"
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/protobuf/proto"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -101,5 +104,50 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			observe(completionObservation{kind: "heartbeat", at: int64(12 * time.Second)})
 			pending(0)
 		})
+	}
+}
+
+func TestAckFailureCancelsStreamBeforeWaitingForBlockedCompletionSend(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := testC2Command(t)
+	c.CommandId = "start"
+	c.Execution = &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Autocontinue: true, Param4: 1}}}}}
+	if err := a.wal.BeginFlightWatch(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	watch, err := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UnixNano()
+	event := &pb.FlightCompletionEvidence{EventId: "event", AgentId: c.AgentId, Context: c.Context, MissionId: "mission", MissionDigest: strings.Repeat("a", 64), StartCommandId: c.CommandId, Outcome: "mission_completed", AirborneAtUnixNs: at, TerminalAtUnixNs: at, LandedAtUnixNs: at, DisarmedAtUnixNs: at, ObservationEpoch: "epoch"}
+	if err = a.wal.SaveFlightWatch(ctx, watch, event); err != nil {
+		t.Fatal(err)
+	}
+	a.durableFlightCompletion = true
+	sending := make(chan struct{})
+	var once sync.Once
+	stream := &mockStream{sendFunc: func(*pb.AgentStreamMessage) error { once.Do(func() { close(sending) }); <-ctx.Done(); return ctx.Err() }, recvFunc: func() (*pb.RelayStreamMessage, error) {
+		select {
+		case <-sending:
+			return &pb.RelayStreamMessage{Payload: &pb.RelayStreamMessage_TelemetryAck{TelemetryAck: &pb.TelemetryAck{Seq: 0}}}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}}
+	done := make(chan error, 1)
+	go func() { done <- a.runAckLoop(ctx, stream, cancel) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidTelemetryAck) {
+			t.Fatalf("unexpected failure: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("ACK failure deadlocked behind blocked completion Send")
 	}
 }

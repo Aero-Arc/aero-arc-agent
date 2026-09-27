@@ -368,7 +368,7 @@ func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 		t.Fatalf("openStreamFn should not be called on dial failure")
 		return nil, nil
 	}
-	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], _ context.CancelFunc) error {
 		t.Fatalf("ackLoopFn should not be called on dial failure")
 		return nil
 	}
@@ -491,7 +491,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 		}, nil
 	}
 
-	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], _ context.CancelFunc) error {
 		// Just call Recv until error
 		for {
 			_, err := stream.Recv()
@@ -588,7 +588,7 @@ func TestRunWithReconnectRequeuesUnacknowledgedBatchPeersBeforeReconnect(t *test
 	a.openStreamFn = func(context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
 		return stream, nil
 	}
-	a.ackLoopFn = func(ackCtx context.Context, _ grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(ackCtx context.Context, _ grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], _ context.CancelFunc) error {
 		select {
 		case <-allSent:
 		case <-ackCtx.Done():
@@ -652,7 +652,7 @@ func TestRunWithReconnectRemainsSupervisedAfterWorkerTeardownTimeout(t *testing.
 		}}, nil
 	}
 	releaseACKWorker := make(chan struct{})
-	a.ackLoopFn = func(context.Context, grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(context.Context, grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], context.CancelFunc) error {
 		<-releaseACKWorker // Deliberately ignore stream cancellation past the teardown deadline.
 		return errors.New("released stale ACK worker")
 	}
@@ -913,7 +913,7 @@ func TestBatchedTelemetryACKsSustainFreshnessRespectWindowAndDispatchControl(t *
 	senderDone := make(chan error, 1)
 	ackDone := make(chan error, 1)
 	go func() { senderDone <- a.handleTelemetryFrames(ownerCtx, stream) }()
-	go func() { ackDone <- a.runAckLoop(ownerCtx, stream) }()
+	go func() { ackDone <- a.runAckLoop(ownerCtx, stream, func() {}) }()
 	select {
 	case latency := <-controlACK:
 		t.Logf("control dispatch latency behind 100 ACKs: %v", latency)
