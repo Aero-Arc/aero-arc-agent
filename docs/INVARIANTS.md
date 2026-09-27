@@ -269,8 +269,9 @@ All blocking operations must be cancellable or time-bounded.
   command timeout for a newer sample from that exact channel/system/component.
   Timeout or target movement still fails closed; absence never implies landed.
 - Schema v1 accepts at most 200 contiguous `MAV_FRAME_GLOBAL` (frame `0`)
-  mission items and only waypoint (`16`), land (`21`), and takeoff (`22`)
-  commands. The shared Protos `missiondigest` encoder, rather than protobuf
+  mission items and only waypoint (`16`), terminal RTL (`20`), land (`21`),
+  and takeoff (`22`) commands. RTL requires `mission_rtl_v1`, positive-zero
+  parameters and altitude, and zero coordinates. The shared Protos `missiondigest` encoder, rather than protobuf
   wire serialization, defines the cross-runtime canonical bytes and SHA-256.
 - Canonical mission items require `current=false`. The Agent normalizes
   readback `current` to false because ArduPilot derives that bit from the live
