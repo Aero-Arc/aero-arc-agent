@@ -52,6 +52,13 @@ func (v *FlightWatch) UnmarshalJSON(raw []byte) error {
 
 // BeginFlightWatch binds automatic completion to a verified mission-start command.
 // Existing flight authority is immutable, including after process restart.
+//
+// Parameters: ctx bounds the SQLite transaction; c is the mission-start authority
+// containing exact flight context and a verified mission precondition.
+// Returns: nil after creating/replaying the watch, or as a no-op when no mission
+// precondition or terminal RTL/LAND exists. Different start authority can replace
+// only a rejected, never-airborne watch; active/applied/unresolved predecessors,
+// malformed persisted state, encoding errors, and SQLite failures return errors.
 func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand) error {
 	m := c.GetMavlink()
 	if m == nil || m.MissionPrecondition == nil || len(m.MissionPrecondition.Items) == 0 {
@@ -115,6 +122,9 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand) error 
 }
 
 // LoadFlightWatch restores an exact flight's persisted completion milestones.
+//
+// Parameters: ctx bounds reads; flightID selects the immutable watch binding.
+// Returns: the decoded watch, sql.ErrNoRows if absent, or a storage/decoding error.
 func (w *WAL) LoadFlightWatch(ctx context.Context, flightID string) (FlightWatch, error) {
 	var raw []byte
 	var v FlightWatch
@@ -127,6 +137,11 @@ func (w *WAL) LoadFlightWatch(ctx context.Context, flightID string) (FlightWatch
 
 // SaveFlightWatch atomically persists milestones and, when present, the immutable
 // completion delivery obligation. Failed writes never mark a flight done.
+//
+// Parameters: ctx bounds the transaction; v carries the exact flight/start binding
+// and updated milestones; e is optional validated immutable completion evidence.
+// Returns: nil after both records commit, or a binding, digest conflict, evidence
+// validation, encoding, or storage error with the transaction rolled back.
 func (w *WAL) SaveFlightWatch(ctx context.Context, v FlightWatch, e *pb.FlightCompletionEvidence) error {
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -168,6 +183,10 @@ func (w *WAL) SaveFlightWatch(ctx context.Context, v FlightWatch, e *pb.FlightCo
 }
 
 // PendingFlightCompletions returns bounded unacknowledged events for replay.
+//
+// Parameters: ctx bounds reads of outstanding immutable delivery obligations.
+// Returns: a bounded admission-ordered page, or a storage/protobuf decoding error;
+// reading does not acknowledge or alter any event.
 func (w *WAL) PendingFlightCompletions(ctx context.Context) ([]*pb.FlightCompletionEvidence, error) {
 	rows, err := w.db.QueryContext(ctx, `SELECT payload FROM flight_completion_events WHERE delivered=0 ORDER BY rowid LIMIT 32`)
 	if err != nil {
@@ -190,6 +209,11 @@ func (w *WAL) PendingFlightCompletions(ctx context.Context) ([]*pb.FlightComplet
 }
 
 // AcknowledgeFlightCompletion retires only a receipt matching persisted content.
+//
+// Parameters: ctx bounds persistence; r binds the event ID and encoded digest
+// acknowledged by Relay only after its durable outbox commit.
+// Returns: nil after exact acknowledgement or duplicate receipt; nil, unknown,
+// mismatched receipts and storage errors leave the delivery obligation retained.
 func (w *WAL) AcknowledgeFlightCompletion(ctx context.Context, r *pb.FlightCompletionReceipt) error {
 	if r == nil {
 		return errors.New("completion receipt required")

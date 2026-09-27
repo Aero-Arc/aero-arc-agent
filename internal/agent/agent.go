@@ -522,10 +522,9 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 // heap or preventing COMMAND_ACK and heartbeat state from being observed.
 func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Event) error {
 	completionQueue := make(chan completionObservation, 64)
-	completionCtx, stopCompletion := context.WithCancel(ctx)
+	completionCtx, stopCompletion := context.WithCancel(context.Background())
 	completionDone := make(chan struct{})
 	go func() { defer close(completionDone); a.runCompletionObservations(completionCtx, completionQueue) }()
-	defer func() { stopCompletion(); <-completionDone }()
 
 	queueSize := 1000
 	if a.options != nil && a.options.EventQueueSize > 0 {
@@ -543,14 +542,17 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 	}()
 	defer func() {
 		close(telemetryQueue)
+		close(completionQueue)
 		drainTimeout := defaultTelemetryPersistenceDrainTimeout
 		if a.telemetryDrainTimeout > 0 {
 			drainTimeout = a.telemetryDrainTimeout
 		}
-		forceStop := time.AfterFunc(drainTimeout, cancelPersist)
+		forceStop := time.AfterFunc(drainTimeout, func() { cancelPersist(); stopCompletion() })
 		<-persistDone
+		<-completionDone
 		forceStop.Stop()
 		cancelPersist()
+		stopCompletion()
 	}()
 
 	for {
@@ -813,7 +815,7 @@ func (a *Agent) register(ctx context.Context) error {
 	agentID := identity.Resolve().FinalID
 	req := &agentv1.RegisterRequest{
 		AgentId:               agentID,
-		ExecutionCapabilities: []string{"mavlink_command_v1", "mission_upload_v1"},
+		ExecutionCapabilities: []string{"mavlink_command_v1", "mission_upload_v1", "mission_rtl_v1"},
 	}
 
 	slog.LogAttrs(

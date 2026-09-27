@@ -4,9 +4,13 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"github.com/aero-arc/aero-arc-protos/flightcompletion"
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/bluenviron/gomavlib/v3"
+	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/bluenviron/gomavlib/v3/pkg/frame"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/protobuf/proto"
 	"path/filepath"
@@ -149,5 +153,77 @@ func TestAckFailureCancelsStreamBeforeWaitingForBlockedCompletionSend(t *testing
 		cancel()
 		<-done
 		t.Fatal("ACK failure deadlocked behind blocked completion Send")
+	}
+}
+
+func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "completion.db")
+	w, err := wal.New(context.Background(), path, 1, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	c := testC2Command(t)
+	c.GetMavlink().MissionPrecondition = &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Param4: 1, Autocontinue: true}}}
+	c.GetMavlink().MissionPreconditionId = "mission"
+	raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied"}}})
+	if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.BeginFlightWatch(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	watch, err := w.LoadFlightWatch(ctx, c.Context.FlightId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watch.AirborneAt = time.Now().Add(-time.Second).UnixNano()
+	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	blocker, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback() }()
+	if _, err = blocker.Exec("UPDATE flight_watches SET payload=payload"); err != nil {
+		t.Fatal(err)
+	}
+	channel := &gomavlib.Channel{}
+	accepted := make(chan struct{})
+	a := &Agent{wal: w, options: &AgentOptions{}, operationContext: &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}, mavlinkTarget: &mavlinkTarget{channel: channel, systemID: 1, componentID: 1}, appendTelemetryFrame: func(context.Context, *pb.TelemetryFrame) error { close(accepted); return nil }}
+	events := make(chan gomavlib.Event)
+	done := make(chan error, 1)
+	go func() { done <- a.runMAVLinkEvents(ctx, events) }()
+	events <- &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{SystemID: 1, ComponentID: 1, Message: &common.MessageHeartbeat{Type: common.MAV_TYPE_QUADROTOR, Autopilot: common.MAV_AUTOPILOT_ARDUPILOTMEGA, BaseMode: common.MAV_MODE_FLAG_SAFETY_ARMED, CustomMode: 6}}}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("observation not accepted")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("stopped before draining blocked completion: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err = blocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("graceful completion drain stalled")
+	}
+	saved, err := w.LoadFlightWatch(context.Background(), c.Context.FlightId)
+	if err != nil || saved.TerminalAt == 0 || saved.Outcome != "ended_early" {
+		t.Fatalf("accepted terminal milestone lost: %+v %v", saved, err)
 	}
 }
