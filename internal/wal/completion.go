@@ -28,6 +28,11 @@ type FlightWatch struct {
 }
 
 // MarshalJSON preserves the protobuf execution oneof in the persisted watch.
+//
+// Parameters: the receiver supplies command authority, post-handoff boundary,
+// persisted milestones, and completion status; this method takes no arguments.
+// Returns: JSON bytes with protobuf-aware command encoding, or a protobuf/JSON
+// encoding error. It performs no storage writes and does not change the receiver.
 func (v FlightWatch) MarshalJSON() ([]byte, error) {
 	command, err := protojson.Marshal(v.Command)
 	if err != nil {
@@ -41,6 +46,13 @@ func (v FlightWatch) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON restores protobuf execution variants from a persisted watch.
+//
+// Parameters: raw contains persisted watch JSON, including the nested protobuf
+// command encoding. Missing handoff_at decodes as zero and cannot authorize
+// automatic completion from a legacy watch.
+// Returns: nil after decoding the watch and command oneof, or a JSON/protobuf
+// decoding error. The receiver may be partially populated on error and callers
+// must discard it; this method never changes the stored payload or repairs data.
 func (v *FlightWatch) UnmarshalJSON(raw []byte) error {
 	type plain FlightWatch
 	data := struct {
