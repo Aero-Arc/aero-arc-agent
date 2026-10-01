@@ -12,6 +12,9 @@ import (
 // ErrCommandSuperseded means a newer admitted command already began an effect.
 var ErrCommandSuperseded = errors.New("command superseded before first effect")
 
+// ErrCommandIdentityConflict identifies reuse of a command ID for different authority.
+var ErrCommandIdentityConflict = errors.New("command identity conflict")
+
 // CommandRecord is an immutable command and its durable execution evidence.
 type CommandRecord struct {
 	Digest            string
@@ -37,18 +40,31 @@ func (w *WAL) LoadCommand(ctx context.Context, id string) (CommandRecord, error)
 //
 // Returns: Nil for admission or exact replay; conflicting identity and storage errors fail closed.
 func (w *WAL) AdmitCommand(ctx context.Context, id string, r CommandRecord) error {
-	_, err := w.db.ExecContext(ctx, `INSERT INTO c2_commands(command_id,digest,payload,evidence) VALUES(?,?,?,?) ON CONFLICT(command_id) DO NOTHING`, id, r.Digest, r.Payload, r.Evidence)
+	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	existing, err := w.LoadCommand(ctx, id)
-	if err != nil {
+	defer func() { _ = tx.Rollback() }()
+	// Start with a conditional write to acquire SQLite's writer lock before
+	// reading the namespace; upgrading a deferred read can fail with SQLITE_BUSY.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO c2_commands(command_id,digest,payload,evidence) SELECT ?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM operation_context_commands WHERE command_id=?) ON CONFLICT(command_id) DO NOTHING`, id, r.Digest, r.Payload, r.Evidence, id); err != nil {
 		return err
 	}
-	if existing.Digest != r.Digest {
-		return fmt.Errorf("command identity conflict")
+	var conflict bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM operation_context_commands WHERE command_id=?)`, id).Scan(&conflict); err != nil {
+		return err
 	}
-	return nil
+	if conflict {
+		return ErrCommandIdentityConflict
+	}
+	var digest string
+	if err = tx.QueryRowContext(ctx, `SELECT digest FROM c2_commands WHERE command_id=?`, id).Scan(&digest); err != nil {
+		return err
+	}
+	if digest != r.Digest {
+		return ErrCommandIdentityConflict
+	}
+	return tx.Commit()
 }
 
 // SaveCommand atomically records evidence and the irreversible first-effect fence.
@@ -112,7 +128,7 @@ func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byt
 // Returns: Whether no newer command has begun an effect, or a SQLite error.
 func (w *WAL) CommandIsLatest(ctx context.Context, id string) (bool, error) {
 	var latest bool
-	err := w.db.QueryRowContext(ctx, `SELECT rowid=(SELECT MAX(rowid) FROM c2_commands WHERE effect_started=1) FROM c2_commands WHERE command_id=?`, id).Scan(&latest)
+	err := w.db.QueryRowContext(ctx, `SELECT rowid>COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) AND rowid=(SELECT MAX(rowid) FROM c2_commands WHERE effect_started=1) FROM c2_commands WHERE command_id=?`, id).Scan(&latest)
 	return latest, err
 }
 
@@ -124,7 +140,7 @@ func (w *WAL) CommandIsLatest(ctx context.Context, id string) (bool, error) {
 // Returns: True only for the first permit, false when consumed or absent,
 // ErrCommandSuperseded when newer authority has begun an effect, or a SQLite error.
 func (w *WAL) BeginCommandEffect(ctx context.Context, id, digest string) (bool, error) {
-	result, err := w.db.ExecContext(ctx, `UPDATE c2_commands SET effect_started=1 WHERE command_id=? AND digest=? AND effect_started=0 AND NOT EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>c2_commands.rowid AND newer.effect_started=1)`, id, digest)
+	result, err := w.db.ExecContext(ctx, `UPDATE c2_commands SET effect_started=1 WHERE command_id=? AND digest=? AND effect_started=0 AND rowid>COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) AND NOT EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>c2_commands.rowid AND newer.effect_started=1)`, id, digest)
 	if err != nil {
 		return false, err
 	}
@@ -133,11 +149,22 @@ func (w *WAL) BeginCommandEffect(ctx context.Context, id, digest string) (bool, 
 		return n == 1, err
 	}
 	var superseded bool
-	if err = w.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM c2_commands current WHERE command_id=? AND digest=? AND effect_started=0 AND EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>current.rowid AND newer.effect_started=1))`, id, digest).Scan(&superseded); err != nil {
+	if err = w.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM c2_commands current WHERE command_id=? AND digest=? AND effect_started=0 AND (current.rowid<=COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) OR EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>current.rowid AND newer.effect_started=1)))`, id, digest).Scan(&superseded); err != nil {
 		return false, err
 	}
 	if superseded {
 		return false, ErrCommandSuperseded
 	}
 	return false, nil
+}
+
+// RecordLegacyAircraftEffect fences durable observations before a legacy MAVLink write.
+// A failed or uncertain write conservatively retains the fence across restart.
+//
+// Parameters: ctx bounds persistence; callers serialize aircraft execution.
+// Returns: nil after all currently admitted durable commands are superseded,
+// or a storage error that must prevent the legacy write. Later admissions remain eligible.
+func (w *WAL) RecordLegacyAircraftEffect(ctx context.Context) error {
+	_, err := w.db.ExecContext(ctx, `INSERT INTO legacy_aircraft_effect(id,c2_rowid) SELECT 1,COALESCE(MAX(rowid),0) FROM c2_commands WHERE true ON CONFLICT(id) DO UPDATE SET c2_rowid=MAX(c2_rowid,excluded.c2_rowid)`)
+	return err
 }

@@ -227,6 +227,7 @@ func initDB(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS c2_commands (
  command_id TEXT PRIMARY KEY, digest TEXT NOT NULL, payload BLOB NOT NULL, evidence BLOB NOT NULL, effect_started INTEGER NOT NULL DEFAULT 0
  );
+ CREATE TABLE IF NOT EXISTS legacy_aircraft_effect (id INTEGER PRIMARY KEY CHECK(id=1), c2_rowid INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS telemetry_frames (
 		seq INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at INTEGER NOT NULL,
@@ -828,7 +829,7 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, finger
 	defer tx.Rollback()
 	var missionExists bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM mission_deployments WHERE command_id = ?)`, commandID).Scan(&missionExists); err != nil {
+		SELECT 1 FROM mission_deployments WHERE command_id = ? UNION ALL SELECT 1 FROM c2_commands WHERE command_id = ?)`, commandID, commandID).Scan(&missionExists); err != nil {
 		return false, fmt.Errorf("check operation command ID namespace: %w", err)
 	}
 	if missionExists {

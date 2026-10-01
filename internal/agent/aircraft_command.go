@@ -63,6 +63,7 @@ type pendingMAVLinkCommand struct {
 }
 
 type preparedAircraftCommand struct {
+	durableEffect   bool
 	validatedTarget *mavlinkTarget
 	command         *agentv1.AircraftCommand
 	result          *agentv1.AircraftCommandResult
@@ -534,6 +535,13 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		if !valid {
 			result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
 			result.Message = "validated autopilot target changed before handoff"
+			return result
+		}
+	}
+	if !prepared.durableEffect && a.wal != nil {
+		if err := a.wal.RecordLegacyAircraftEffect(commandCtx); err != nil {
+			result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
+			result.Message = "persist legacy effect fence: " + err.Error()
 			return result
 		}
 	}

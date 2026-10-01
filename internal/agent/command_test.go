@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -374,5 +375,34 @@ func TestMissionStartRejectsDisarmedAutopilotBeforeEffect(t *testing.T) {
 	record, err := a.wal.LoadCommand(context.Background(), c.CommandId)
 	if err != nil || record.EffectStarted {
 		t.Fatalf("precondition consumed effect permit: %+v %v", record, err)
+	}
+}
+
+func TestMalformedDurableCommandsDoNotEndTelemetry(t *testing.T) {
+	for _, busy := range []bool{false, true} {
+		for _, kind := range []string{"nil", "digest", "agent"} {
+			t.Run(fmt.Sprintf("%t/%s", busy, kind), func(t *testing.T) {
+				a := &Agent{}
+				if busy {
+					a.c2Mu.Lock()
+					defer a.c2Mu.Unlock()
+				}
+				c := testC2Command(t)
+				switch kind {
+				case "nil":
+					c = nil
+				case "digest":
+					c.CommandDigest = "wrong"
+				case "agent":
+					c.AgentId = "other"
+					c.CommandDigest, _ = commanddigest.Digest(c)
+				}
+				var wg sync.WaitGroup
+				if err := a.dispatchDurableCommand(context.Background(), nil, c, &wg, make(chan error, 1)); err != nil {
+					t.Fatalf("invalid command terminated telemetry: %v", err)
+				}
+				wg.Wait()
+			})
+		}
 	}
 }
