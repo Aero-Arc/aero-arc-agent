@@ -35,6 +35,7 @@ type AgentOptions struct {
 	AircraftCommandTimeout     time.Duration
 	MissionProtocolQuietPeriod time.Duration
 	Debug                      bool
+	DebugMAVLinkAddress        string
 }
 
 // GetAgentOptions builds Agent runtime options from CLI flags and the API-key

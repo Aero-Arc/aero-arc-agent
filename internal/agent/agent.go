@@ -291,11 +291,15 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 	}
 
 	if options.Debug {
+		address := options.DebugMAVLinkAddress
+		if address == "" {
+			address = "0.0.0.0:14550"
+		}
 		slog.LogAttrs(context.Background(), slog.LevelInfo, "debug mode enabled, using UDP mavlinkserver")
 		a.node = &gomavlib.Node{
 			Endpoints: []gomavlib.EndpointConf{
 				gomavlib.EndpointUDPServer{
-					Address: "0.0.0.0:14550",
+					Address: address,
 				},
 			},
 			OutVersion:     gomavlib.V2,

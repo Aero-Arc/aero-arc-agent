@@ -24,6 +24,7 @@ type CommandRecord struct {
 	Digest            string
 	Payload, Evidence []byte
 	EffectStarted     bool
+	Target            string
 }
 
 // LoadCommand reads command identity and evidence. Missing IDs return sql.ErrNoRows.
@@ -33,7 +34,7 @@ type CommandRecord struct {
 // Returns: The persisted record, sql.ErrNoRows, or a SQLite error.
 func (w *WAL) LoadCommand(ctx context.Context, id string) (CommandRecord, error) {
 	var r CommandRecord
-	err := w.db.QueryRowContext(ctx, `SELECT digest,payload,evidence,effect_started FROM c2_commands WHERE command_id=?`, id).Scan(&r.Digest, &r.Payload, &r.Evidence, &r.EffectStarted)
+	err := w.db.QueryRowContext(ctx, `SELECT digest,payload,evidence,effect_started,COALESCE((SELECT target FROM c2_command_targets WHERE command_id=c2_commands.command_id),'') FROM c2_commands WHERE command_id=?`, id).Scan(&r.Digest, &r.Payload, &r.Evidence, &r.EffectStarted, &r.Target)
 	return r, err
 }
 
@@ -200,4 +201,26 @@ func pairedMissionCommand(id string, commandRaw, missionRaw []byte) bool {
 		return false
 	}
 	return command.CommandId == id && mission.CommandId == id && command.GetMission() != nil && proto.Equal(command.GetMission(), &mission)
+}
+
+// BindCommandTarget persists the selected endpoint and autopilot before its effect.
+// Parameters: ctx bounds persistence; id selects admitted authority; target must be nonempty.
+// Returns nil for the first binding or its exact retry. Changed bindings and already
+// effected commands without a binding fail closed; historical effects are never relabeled.
+func (w *WAL) BindCommandTarget(ctx context.Context, id, target string) error {
+	if target == "" {
+		return errors.New("command target identity unavailable")
+	}
+	_, err := w.db.ExecContext(ctx, `INSERT INTO c2_command_targets(command_id,target) SELECT command_id,? FROM c2_commands WHERE command_id=? AND effect_started=0 ON CONFLICT(command_id) DO NOTHING`, target, id)
+	if err != nil {
+		return err
+	}
+	var saved string
+	if err = w.db.QueryRowContext(ctx, `SELECT target FROM c2_command_targets WHERE command_id=?`, id).Scan(&saved); err != nil {
+		return err
+	}
+	if saved != target {
+		return errors.New("command target changed")
+	}
+	return nil
 }

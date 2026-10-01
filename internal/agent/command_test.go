@@ -246,6 +246,9 @@ func TestUncertainRecoveryObservesWithoutAppliedOrAnotherEffect(t *testing.T) {
 	if err := a.wal.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: c.CommandDigest, Payload: payload, Evidence: evidence}); err != nil {
 		t.Fatal(err)
 	}
+	if err := a.wal.BindCommandTarget(ctx, c.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := a.wal.BeginCommandEffect(ctx, c.CommandId, c.CommandDigest); err != nil {
 		t.Fatal(err)
 	}
@@ -463,5 +466,32 @@ func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
 				t.Fatalf("effect-free attempt superseded prior command: %+v latest=%v writes=%d", record, latest, writes)
 			}
 		})
+	}
+}
+
+func TestCommandObservationCannotChangeEffectTarget(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	ctx := context.Background()
+	c := testC2Command(t)
+	payload, _ := proto.Marshal(c)
+	e := &pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: c.CommandDigest, Events: []*pb.CommandEvent{{Stage: "applied"}}}
+	raw, _ := proto.Marshal(e)
+	if err := a.wal.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: c.CommandDigest, Payload: payload, Evidence: raw}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.wal.BindCommandTarget(ctx, c.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.wal.BeginCommandEffect(ctx, c.CommandId, c.CommandDigest); err != nil {
+		t.Fatal(err)
+	}
+	// Recovery reloads the durable target; a different selected system must not
+	// install any observation waiter even if its vehicle state matches.
+	a.mavlinkTarget.systemID = 2
+	saves := 0
+	_, err := a.observeDurableCommand(ctx, c, e, func(string, string, string, bool) error { saves++; return nil })
+	if err != nil || saves != 0 || a.c2Pending != nil {
+		t.Fatalf("misattributed target: saves=%d err=%v", saves, err)
 	}
 }
