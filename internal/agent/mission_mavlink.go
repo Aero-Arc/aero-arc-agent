@@ -270,7 +270,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 func (a *Agent) refreshMissionUploadSafetyEvidence(ctx context.Context, expected *mavlinkTarget) (*mavlinkTarget, error) {
 	a.mavlinkMu.Lock()
 	current := a.mavlinkTarget
-	if current == nil || expected == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID {
+	if current == nil || expected == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID || current.autopilot != expected.autopilot || current.vehicleType != expected.vehicleType {
 		a.mavlinkMu.Unlock()
 		return nil, errors.New("selected autopilot target changed during HOME readback")
 	}
@@ -287,6 +287,9 @@ func (a *Agent) refreshMissionUploadSafetyEvidence(ctx context.Context, expected
 		}
 		target = *refreshed
 	}
+	if target.autopilot != expected.autopilot || target.vehicleType != expected.vehicleType {
+		return nil, errors.New("autopilot profile changed during safety refresh")
+	}
 	return &target, nil
 }
 
@@ -295,7 +298,7 @@ func (a *Agent) ensureMissionUploadSafe(expected *mavlinkTarget) error {
 	defer a.mavlinkMu.Unlock()
 	current := a.mavlinkTarget
 	now := time.Now()
-	if current == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID ||
+	if current == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID || current.autopilot != expected.autopilot || current.vehicleType != expected.vehicleType ||
 		current.heartbeatAt.IsZero() || now.Sub(current.heartbeatAt) > missionEvidenceTTL || current.armed ||
 		current.landedState != common.MAV_LANDED_STATE_ON_GROUND || current.landedStateAt.IsZero() || now.Sub(current.landedStateAt) > missionEvidenceTTL {
 		return errors.New("fresh MAVLink evidence no longer shows the selected aircraft disarmed and on ground")

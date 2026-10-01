@@ -1420,7 +1420,7 @@ func TestMissionRecoveryCannotChangeAutopilotTarget(t *testing.T) {
 }
 
 func TestMissionUploadRevalidatesAfterDurableFence(t *testing.T) {
-	for _, change := range []string{"armed", "target", "heartbeat", "landed", "deadline", "canceled"} {
+	for _, change := range []string{"armed", "target", "autopilot", "vehicle", "heartbeat", "landed", "deadline", "canceled"} {
 		t.Run(change, func(t *testing.T) {
 			command := validMissionCommand(t, "post-fence-"+change)
 			now := time.Now()
@@ -1438,6 +1438,10 @@ func TestMissionUploadRevalidatesAfterDurableFence(t *testing.T) {
 					a.mavlinkTarget.armed = true
 				case "target":
 					a.mavlinkTarget = &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 2}
+				case "autopilot":
+					a.mavlinkTarget.autopilot++
+				case "vehicle":
+					a.mavlinkTarget.vehicleType++
 				case "heartbeat":
 					a.mavlinkTarget.heartbeatAt = now.Add(-2 * missionEvidenceTTL)
 				case "landed":
