@@ -198,6 +198,11 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
+	// The independent blocker connection must wait for routine WAL bookkeeping
+	// before acquiring its deliberate test lock, just like production connections.
+	if _, err = db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		t.Fatal(err)
+	}
 	blocker, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)

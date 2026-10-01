@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -49,6 +50,13 @@ func (a *Agent) observeC2Frame(frame *gomavlib.EventFrame) {
 }
 
 func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStreamingClient[pb.AgentStreamMessage, pb.RelayStreamMessage], c *pb.DurableCommand, wg *sync.WaitGroup, errs chan<- error) error {
+	// Malformed or misrouted authority cannot produce trustworthy evidence.
+	// Discard only this message; it must not tear down unrelated telemetry.
+	checkedDigest, checkedErr := commanddigest.Digest(c)
+	if checkedErr != nil || checkedDigest != c.GetCommandDigest() || c.GetAgentId() != identity.Resolve().FinalID {
+		slog.WarnContext(ctx, "discarding invalid durable command")
+		return nil
+	}
 	// Serialize initial journal admission before exposing an active execution to
 	// duplicate deliveries. The execution itself remains asynchronous.
 	a.c2AdmissionMu.Lock()
@@ -71,6 +79,9 @@ func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStre
 				return marshalErr
 			}
 			if err = a.wal.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: digest, Payload: payload, Evidence: evidence}); err != nil {
+				if errors.Is(err, wal.ErrCommandIdentityConflict) {
+					return nil
+				}
 				return err
 			}
 			record, err = a.wal.LoadCommand(ctx, c.CommandId)
@@ -79,7 +90,7 @@ func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStre
 			return err
 		}
 		if record.Digest != c.GetCommandDigest() {
-			return fmt.Errorf("conflicting command identity")
+			return nil
 		}
 		e := &pb.CommandEvidence{}
 		if err = proto.Unmarshal(record.Evidence, e); err != nil {
@@ -109,6 +120,9 @@ func (a *Agent) dispatchDurableCommand(ctx context.Context, stream grpc.BidiStre
 	}
 	if err != nil {
 		a.c2Mu.Unlock()
+		if errors.Is(err, wal.ErrCommandIdentityConflict) {
+			return nil
+		}
 		return err
 	}
 	wg.Add(1)
@@ -342,6 +356,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 			return nil, err
 		}
 		prepared.validatedTarget = target
+		prepared.durableEffect = true
 		result := a.executePreparedAircraftCommand(effectCtx, prepared)
 		cancelEffect()
 		switch result.Status {
