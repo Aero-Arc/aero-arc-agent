@@ -309,11 +309,11 @@ func TestCompletionPollingRequiresAppliedNonRejectedStart(t *testing.T) {
 			if err := w.AdmitCommand(ctx, "start", wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 				t.Fatal(err)
 			}
-			if err := w.BeginFlightWatch(ctx, c, "target"); err != nil {
+			if err := w.BeginFlightWatch(ctx, c, "udp-server:0.0.0.0:14550/0/0/0/0"); err != nil {
 				t.Fatal(err)
 			}
 			writes := 0
-			a := &Agent{wal: w, operationContext: &wal.OperationContext{FlightID: "flight"}, mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, heartbeatAt: time.Now()}, writeMAVLinkCommand: func(_ *gomavlib.Channel, _ *common.MessageCommandLong) error { writes++; return nil }}
+			a := &Agent{wal: w, options: &AgentOptions{Debug: true}, operationContext: &wal.OperationContext{FlightID: "flight"}, mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, heartbeatAt: time.Now()}, writeMAVLinkCommand: func(_ *gomavlib.Channel, _ *common.MessageCommandLong) error { writes++; return nil }}
 			a.requestCompletionObservations(ctx)
 			want := 0
 			if len(stages) == 1 && stages[0] == "applied" {
@@ -322,6 +322,13 @@ func TestCompletionPollingRequiresAppliedNonRejectedStart(t *testing.T) {
 			if writes != want {
 				t.Fatalf("writes=%d want=%d", writes, want)
 			}
+			writes = 0
+			a.options.DebugMAVLinkAddress = "127.0.0.1:15550"
+			a.requestCompletionObservations(ctx)
+			if writes != 0 {
+				t.Fatal("polled an unrelated endpoint")
+			}
+
 		})
 	}
 }

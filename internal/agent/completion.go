@@ -239,7 +239,7 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 		target = *a.mavlinkTarget
 	}
 	a.mavlinkMu.Unlock()
-	if target.channel == nil || time.Since(target.heartbeatAt) > 3*time.Second {
+	if target.channel == nil || time.Since(target.heartbeatAt) > 3*time.Second || watch.Target == "" || a.completionTargetIdentity(&target) != watch.Target {
 		return
 	}
 	for _, id := range []uint32{245, 42} {
