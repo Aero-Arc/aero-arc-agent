@@ -51,7 +51,9 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			samples := completionSamples{}
 			observe := func(o completionObservation) {
 				t.Helper()
-				o.context = binding
+				if o.at < int64(2*time.Second) || o.target != "test-target" {
+					o.context = binding
+				}
 				o.at += at
 				if err := a.observeCompletion(ctx, o, "epoch", &samples); err != nil {
 					t.Fatal(err)
@@ -321,6 +323,16 @@ func TestCompletionPollingRequiresAppliedNonRejectedStart(t *testing.T) {
 			}
 			if writes != want {
 				t.Fatalf("writes=%d want=%d", writes, want)
+			}
+			writes = 0
+			a.operationContext = nil
+			observation, ok := a.completionObservation(&gomavlib.EventFrame{Channel: a.mavlinkTarget.channel, Frame: &frame.V2Frame{Message: &common.MessageHeartbeat{}}})
+			if !ok || observation.context != nil {
+				t.Fatal("cleared context discarded capture before durable watch lookup")
+			}
+			a.requestCompletionObservations(ctx)
+			if writes != want {
+				t.Fatalf("cleared context stopped polling: %d want %d", writes, want)
 			}
 			writes = 0
 			a.options.DebugMAVLinkAddress = "127.0.0.1:15550"

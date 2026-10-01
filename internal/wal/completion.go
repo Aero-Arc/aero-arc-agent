@@ -321,3 +321,51 @@ func (w *WAL) AcknowledgeFlightCompletion(ctx context.Context, r *pb.FlightCompl
 	}
 	return nil
 }
+
+// LoadUnresolvedFlightWatch restores completion authority after active context is cleared.
+//
+// Parameters: ctx bounds reads; target is the exact immutable autopilot endpoint
+// and identity. Only a non-rejected, applied start with an unfinished watch is eligible.
+// Returns: the unique matching watch, sql.ErrNoRows when none is eligible, or a
+// decoding/storage/ambiguity error. Multiple candidates never authorize attribution.
+func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (FlightWatch, error) {
+	rows, err := w.db.QueryContext(ctx, `SELECT w.payload,c.evidence FROM flight_watches w JOIN c2_commands c ON c.command_id=w.start_command_id WHERE json_extract(w.payload,'$.done')=0 AND json_extract(w.payload,'$.target')=?`, target)
+	if err != nil {
+		return FlightWatch{}, err
+	}
+	defer rows.Close()
+	var found *FlightWatch
+	for rows.Next() {
+		var raw, evidence []byte
+		if err = rows.Scan(&raw, &evidence); err != nil {
+			return FlightWatch{}, err
+		}
+		var watch FlightWatch
+		var events pb.CommandEvidence
+		if err = json.Unmarshal(raw, &watch); err != nil {
+			return FlightWatch{}, err
+		}
+		if err = proto.Unmarshal(evidence, &events); err != nil {
+			return FlightWatch{}, err
+		}
+		applied, rejected := false, false
+		for _, event := range events.Events {
+			applied = applied || event.Stage == "applied"
+			rejected = rejected || event.Stage == "rejected"
+		}
+		if !applied || rejected {
+			continue
+		}
+		if found != nil {
+			return FlightWatch{}, errors.New("multiple unresolved flight watches for autopilot")
+		}
+		found = &watch
+	}
+	if err = rows.Err(); err != nil {
+		return FlightWatch{}, err
+	}
+	if found == nil {
+		return FlightWatch{}, sql.ErrNoRows
+	}
+	return *found, nil
+}

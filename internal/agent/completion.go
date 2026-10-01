@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"github.com/makinje/aero-arc-agent/internal/wal"
 	"log/slog"
 	"time"
 
@@ -43,6 +44,10 @@ type completionSamples struct {
 func (a *Agent) completionObservation(frame *gomavlib.EventFrame) (completionObservation, bool) {
 	a.mavlinkMu.Lock()
 	target := a.mavlinkTarget
+	if target != nil {
+		snapshot := *target
+		target = &snapshot
+	}
 	matches := target != nil && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
 	a.mavlinkMu.Unlock()
 	if !matches {
@@ -50,11 +55,10 @@ func (a *Agent) completionObservation(frame *gomavlib.EventFrame) (completionObs
 	}
 	a.stateMu.RLock()
 	current := a.operationContext
-	if current == nil {
-		a.stateMu.RUnlock()
-		return completionObservation{}, false
+	o := completionObservation{target: a.completionTargetIdentity(target), channel: frame.Channel, at: time.Now().UnixNano()}
+	if current != nil {
+		o.context = &pb.OperationContext{AircraftId: current.AircraftID, FlightId: current.FlightID, IntentId: current.IntentID, IntentVersion: current.IntentVersion}
 	}
-	o := completionObservation{target: a.completionTargetIdentity(target), channel: frame.Channel, context: &pb.OperationContext{AircraftId: current.AircraftID, FlightId: current.FlightID, IntentId: current.IntentID, IntentVersion: current.IntentVersion}, at: time.Now().UnixNano()}
 	a.stateMu.RUnlock()
 	switch m := frame.Message().(type) {
 	case *common.MessageHeartbeat:
@@ -100,6 +104,18 @@ func (a *Agent) runCompletionObservations(ctx context.Context, queue <-chan comp
 }
 
 func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, epoch string, samples *completionSamples) error {
+	if o.context == nil {
+		// Resolve historical authority off the MAVLink capture path. Clearing
+		// active context must not discard an applied start's completion evidence.
+		watch, err := a.wal.LoadUnresolvedFlightWatch(ctx, o.target)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		o.context = watch.Command.Context
+	}
 	watch, err := a.wal.LoadFlightWatch(ctx, o.context.FlightId)
 	if err != nil {
 		return err
@@ -215,10 +231,19 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 		flightID = current.FlightID
 	}
 	a.stateMu.RUnlock()
-	if flightID == "" {
-		return
+	a.mavlinkMu.Lock()
+	var target mavlinkTarget
+	if a.mavlinkTarget != nil {
+		target = *a.mavlinkTarget
 	}
-	watch, err := a.wal.LoadFlightWatch(ctx, flightID)
+	a.mavlinkMu.Unlock()
+	var watch wal.FlightWatch
+	var err error
+	if flightID == "" {
+		watch, err = a.wal.LoadUnresolvedFlightWatch(ctx, a.completionTargetIdentity(&target))
+	} else {
+		watch, err = a.wal.LoadFlightWatch(ctx, flightID)
+	}
 	if err != nil || watch.Done {
 		return
 	}
@@ -230,12 +255,6 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 	if proto.Unmarshal(record.Evidence, &evidence) != nil || !hasStage(&evidence, "applied") || hasStage(&evidence, "rejected") {
 		return
 	}
-	a.mavlinkMu.Lock()
-	var target mavlinkTarget
-	if a.mavlinkTarget != nil {
-		target = *a.mavlinkTarget
-	}
-	a.mavlinkMu.Unlock()
 	if target.channel == nil || time.Since(target.heartbeatAt) > 3*time.Second || watch.Target == "" || a.completionTargetIdentity(&target) != watch.Target {
 		return
 	}

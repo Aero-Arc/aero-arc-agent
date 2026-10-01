@@ -18,6 +18,8 @@ github.com/aero-arc/aero-arc-protos v0.0.0-20261001042141-d75311583674 h1:ltlCIg
 github.com/aero-arc/aero-arc-protos v0.0.0-20261001042141-d75311583674/go.mod h1:fILW3Dz6auXllS5ABRFTt0FTnNC4Mtw3ukvGrJa7zLo=
 github.com/aero-arc/aero-arc-protos v0.0.0-20261001044742-2e849ef15fb4 h1:D29SP0kqJnffqXlLddimZE43HcvYr5eTcTpr47Lc2oc=
 github.com/aero-arc/aero-arc-protos v0.0.0-20261001044742-2e849ef15fb4/go.mod h1:fILW3Dz6auXllS5ABRFTt0FTnNC4Mtw3ukvGrJa7zLo=
+github.com/aero-arc/aero-arc-protos v0.0.0-20261001061041-cdd5e45a6497 h1:UBTxJ1PrEPCWbbL68e2yKSPa2mAJzhwvxOgdqz9z/CI=
+github.com/aero-arc/aero-arc-protos v0.0.0-20261001061041-cdd5e45a6497/go.mod h1:fILW3Dz6auXllS5ABRFTt0FTnNC4Mtw3ukvGrJa7zLo=
 github.com/bluenviron/gomavlib/v3 v3.3.0 h1:ul1yiDslfvsqCjLs+by1eSdU8Oud5qwemoO5ZBpX/fs=
 github.com/bluenviron/gomavlib/v3 v3.3.0/go.mod h1:pPrXt2HspzeIKNlvSDCrPzwPSLPDXORfhWJ8vT8zEKk=
 github.com/creack/goselect v0.1.2 h1:2DNy14+JPjRBgPzAd1thbQp4BSIihxcBf0IXhQXDRa0=
