@@ -74,31 +74,72 @@ func (v *FlightWatch) UnmarshalJSON(raw []byte) error {
 // containing exact flight context and a verified mission precondition; target
 // is the verified transport/system/component/profile binding, immutable on replay.
 // Returns: nil after creating/replaying the watch, or as a no-op when no mission
-// precondition or terminal RTL/LAND exists. Different start authority can replace
+// precondition or terminal RTL/LAND exists and no unresolved target watch owns
+// the aircraft. Target ownership is checked even for starts without a new watch.
+// Different start authority can replace
 // only a rejected, never-airborne watch; active/applied/unresolved predecessors,
 // malformed persisted state, encoding errors, and SQLite failures return errors.
 func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand, target string) error {
-	m := c.GetMavlink()
-	if m == nil || m.MissionPrecondition == nil || len(m.MissionPrecondition.Items) == 0 {
-		return nil
-	}
-	items := m.MissionPrecondition.Items
-	last := items[len(items)-1].Command
-	if last != 20 && last != 21 {
-		return nil
-	}
 	if target == "" {
 		return errors.New("flight watch requires an autopilot target binding")
-	}
-	raw, err := json.Marshal(FlightWatch{Command: c, Target: target})
-	if err != nil {
-		return err
 	}
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Acquire the SQLite writer lock before inspecting other target owners.
+	if _, err = tx.ExecContext(ctx, `UPDATE flight_watches SET payload=payload WHERE flight_id=?`, c.Context.FlightId); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT w.payload,COALESCE(c.evidence,X'') FROM flight_watches w LEFT JOIN c2_commands c ON c.command_id=w.start_command_id WHERE w.start_command_id<>? AND json_extract(w.payload,'$.done')=0 AND json_extract(w.payload,'$.target')=?`, c.CommandId, target)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var payload, evidence []byte
+		if err = rows.Scan(&payload, &evidence); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		var previous FlightWatch
+		var events pb.CommandEvidence
+		if err = json.Unmarshal(payload, &previous); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err = proto.Unmarshal(evidence, &events); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		rejected, applied := false, false
+		for _, event := range events.Events {
+			rejected = rejected || event.Stage == "rejected"
+			applied = applied || event.Stage == "applied"
+		}
+		if !rejected || applied || previous.AirborneAt != 0 || previous.TerminalAt != 0 {
+			_ = rows.Close()
+			return errors.New("autopilot has an unresolved prior flight watch")
+		}
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	m := c.GetMavlink()
+	if m == nil || m.MissionPrecondition == nil || len(m.MissionPrecondition.Items) == 0 {
+		return tx.Commit()
+	}
+	items := m.MissionPrecondition.Items
+	last := items[len(items)-1].Command
+	if last != 20 && last != 21 {
+		return tx.Commit()
+	}
+	raw, err := json.Marshal(FlightWatch{Command: c, Target: target})
+	if err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO flight_watches(flight_id,start_command_id,payload) VALUES(?,?,?) ON CONFLICT(flight_id) DO NOTHING`, c.Context.FlightId, c.CommandId, raw); err != nil {
 		return err
 	}

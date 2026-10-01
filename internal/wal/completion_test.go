@@ -5,6 +5,8 @@ package wal
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/aero-arc/aero-arc-protos/flightcompletion"
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -94,5 +96,34 @@ func TestPendingCompletionQuarantinesCorruptionAndContinues(t *testing.T) {
 	}
 	if err = w.db.QueryRowContext(ctx, `SELECT payload,delivered FROM flight_completion_events WHERE event_id='bad-0'`).Scan(&original, &delivered); err != nil || delivered != 0 || !bytes.Equal(original, corrupt) {
 		t.Fatalf("quarantine discarded/acknowledged evidence: %v", err)
+	}
+}
+
+func TestUnfinishedTargetWatchBlocksOtherFlightsIncludingNoWatchStarts(t *testing.T) {
+	ctx := context.Background()
+	w, err := New(ctx, filepath.Join(t.TempDir(), "watch.db"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	first := &pb.DurableCommand{CommandId: "first", Context: &pb.OperationContext{FlightId: "first-flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21}}}}}}
+	raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: "first", Events: []*pb.CommandEvent{{Stage: "applied"}}})
+	if err = w.AdmitCommand(ctx, "first", CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.BeginFlightWatch(ctx, first, "target"); err != nil {
+		t.Fatal(err)
+	}
+	for _, terminal := range []uint32{16, 20, 21} {
+		next := proto.Clone(first).(*pb.DurableCommand)
+		next.CommandId = "next"
+		next.Context.FlightId = "next-flight"
+		next.GetMavlink().MissionPrecondition.Items[0].Command = terminal
+		if err = w.BeginFlightWatch(ctx, next, "target"); err == nil {
+			t.Fatalf("new flight with terminal %d bypassed unresolved target owner", terminal)
+		}
+	}
+	if _, err = w.LoadFlightWatch(ctx, "next-flight"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("blocked admission persisted watch: %v", err)
 	}
 }
