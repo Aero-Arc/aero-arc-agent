@@ -223,6 +223,14 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 	if err != nil || watch.Done {
 		return
 	}
+	record, err := a.wal.LoadCommand(ctx, watch.Command.CommandId)
+	if err != nil {
+		return
+	}
+	var evidence pb.CommandEvidence
+	if proto.Unmarshal(record.Evidence, &evidence) != nil || !hasStage(&evidence, "applied") || hasStage(&evidence, "rejected") {
+		return
+	}
 	a.mavlinkMu.Lock()
 	var target mavlinkTarget
 	if a.mavlinkTarget != nil {

@@ -290,3 +290,38 @@ func TestCompletionIgnoresQueuedPreHandoffObservations(t *testing.T) {
 		t.Fatal("missing handoff boundary accepted evidence")
 	}
 }
+
+func TestCompletionPollingRequiresAppliedNonRejectedStart(t *testing.T) {
+	for _, stages := range [][]string{{"acknowledged"}, {"rejected"}, {"applied"}, {"applied", "rejected"}} {
+		t.Run(strings.Join(stages, "-"), func(t *testing.T) {
+			ctx := context.Background()
+			w, err := wal.New(ctx, filepath.Join(t.TempDir(), "wal.db"), 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close()
+			c := &pb.DurableCommand{CommandId: "start", Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21}}}}}}
+			e := &pb.CommandEvidence{CommandId: "start"}
+			for _, stage := range stages {
+				e.Events = append(e.Events, &pb.CommandEvent{Stage: stage})
+			}
+			raw, _ := proto.Marshal(e)
+			if err := w.AdmitCommand(ctx, "start", wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.BeginFlightWatch(ctx, c, "target"); err != nil {
+				t.Fatal(err)
+			}
+			writes := 0
+			a := &Agent{wal: w, operationContext: &wal.OperationContext{FlightID: "flight"}, mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, heartbeatAt: time.Now()}, writeMAVLinkCommand: func(_ *gomavlib.Channel, _ *common.MessageCommandLong) error { writes++; return nil }}
+			a.requestCompletionObservations(ctx)
+			want := 0
+			if len(stages) == 1 && stages[0] == "applied" {
+				want = 2
+			}
+			if writes != want {
+				t.Fatalf("writes=%d want=%d", writes, want)
+			}
+		})
+	}
+}
