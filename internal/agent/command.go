@@ -28,6 +28,13 @@ type pendingC2 struct {
 	frames              chan *gomavlib.EventFrame
 	completionCommandID string
 	acceptedAt          time.Time
+	terminalACK         chan c2TerminalACK
+	terminalSeen        bool
+}
+
+type c2TerminalACK struct {
+	result common.MAV_RESULT
+	at     time.Time
 }
 
 func (a *Agent) observeC2Frame(frame *gomavlib.EventFrame) {
@@ -54,9 +61,16 @@ func (a *Agent) observeC2FrameAt(frame *gomavlib.EventFrame, arrivedAt time.Time
 	if heartbeat, ok := frame.Message().(*common.MessageHeartbeat); ok && (heartbeat.Autopilot != p.target.autopilot || heartbeat.Type != p.target.vehicleType) {
 		return
 	}
-	if ack, ok := frame.Message().(*common.MessageCommandAck); ok && p.completionCommandID != "" && p.acceptedAt.IsZero() && uint32(ack.Command) == p.command && ack.Result == common.MAV_RESULT_ACCEPTED && (ack.TargetSystem == 0 || ack.TargetSystem == mavlinkSourceSystemID) && (ack.TargetComponent == 0 || ack.TargetComponent == mavlinkSourceComponentID) {
-		p.acceptedAt = arrivedAt
-		a.acceptCompletionStart(p.completionCommandID, arrivedAt.UnixNano()+1)
+	if p.terminalACK != nil {
+		if ack, ok := frame.Message().(*common.MessageCommandAck); ok && !p.terminalSeen && uint32(ack.Command) == p.command && ack.Result != common.MAV_RESULT_IN_PROGRESS && (ack.TargetSystem == 0 || ack.TargetSystem == mavlinkSourceSystemID) && (ack.TargetComponent == 0 || ack.TargetComponent == mavlinkSourceComponentID) {
+			p.terminalSeen = true
+			if ack.Result == common.MAV_RESULT_ACCEPTED {
+				p.acceptedAt = arrivedAt
+				a.acceptCompletionStart(p.completionCommandID, arrivedAt.UnixNano()+1)
+			}
+			p.terminalACK <- c2TerminalACK{result: ack.Result, at: arrivedAt}
+		}
+		return
 	}
 	select {
 	case p.frames <- frame:
@@ -188,6 +202,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	}
 	e := &pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: digest}
 	effectOwned := false
+	var startACKAt int64
 	save := func(stage, msg, source string, effect bool) error {
 		previousEvents := len(e.Events)
 		if stage != "" && !hasStage(e, stage) {
@@ -207,7 +222,11 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		if err != nil {
 			return err
 		}
-		err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
+		if stage == "applied" && startACKAt > 0 {
+			err = a.wal.SaveMissionStartAcceptance(ctx, c, b, startACKAt)
+		} else {
+			err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
+		}
 		if errors.Is(err, wal.ErrCommandSuperseded) {
 			e.Events = e.Events[:previousEvents]
 			return err
@@ -494,6 +513,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	}
 	a.mavlinkMu.Lock()
 	pending.after = handoffAt
+	pending.terminalACK = make(chan c2TerminalACK, 1)
 	if completionWatch != nil {
 		pending.completionCommandID = c.CommandId
 	}
@@ -511,32 +531,17 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		select {
 		case <-execution.Done():
 			return e, save("outcome_unknown", "no correlated acceptance before timeout; no automatic effect retry", "agent", true)
-		case f := <-pending.frames:
-			switch v := f.Message().(type) {
-			case *common.MessageCommandAck:
-				if uint32(v.Command) != m.Command || (v.TargetSystem != 0 && v.TargetSystem != mavlinkSourceSystemID) || (v.TargetComponent != 0 && v.TargetComponent != mavlinkSourceComponentID) {
-					continue
+		case ack := <-pending.terminalACK:
+			if ack.result == common.MAV_RESULT_ACCEPTED {
+				if completionWatch != nil {
+					startACKAt = ack.at.UnixNano()
 				}
-				if v.Result == common.MAV_RESULT_ACCEPTED {
-					if completionWatch != nil {
-						a.mavlinkMu.Lock()
-						acceptedAt := pending.acceptedAt
-						a.mavlinkMu.Unlock()
-						if acceptedAt.IsZero() {
-							return e, save("outcome_unknown", "start ACK arrival boundary unavailable", "agent", true)
-						}
-						if err = a.wal.RecordFlightWatchACK(ctx, c, acceptedAt.UnixNano()); err != nil {
-							return nil, err
-						}
-					}
-					if err = save("applied", "autopilot accepted command; observation pending", "mavlink_command_ack", true); err != nil {
-						return nil, err
-					}
-					return a.observeDurableCommand(ctx, c, e, save)
-				} else if v.Result != common.MAV_RESULT_IN_PROGRESS && v.Result != common.MAV_RESULT_ACCEPTED {
-					return e, save("rejected", fmt.Sprintf("autopilot rejected command: %s", v.Result.String()), "mavlink_command_ack", true)
+				if err = save("applied", "autopilot accepted command; observation pending", "mavlink_command_ack", true); err != nil {
+					return nil, err
 				}
+				return a.observeDurableCommand(ctx, c, e, save)
 			}
+			return e, save("rejected", fmt.Sprintf("autopilot rejected command: %s", ack.result.String()), "mavlink_command_ack", true)
 		}
 	}
 }

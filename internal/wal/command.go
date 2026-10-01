@@ -91,6 +91,30 @@ func (w *WAL) AdmitCommand(ctx context.Context, id string, r CommandRecord) erro
 // command overtaken by newer authority. Conflicting evidence, identity mismatch,
 // and storage errors roll back.
 func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byte, effect bool) error {
+	return w.saveCommand(ctx, id, digest, evidence, effect, nil, 0)
+}
+
+// SaveMissionStartAcceptance atomically commits captured ACK and applied authority.
+// Parameters: ctx bounds storage; c is the exact start command; evidence contains
+// its applied event; at is the correlated ACK's original MAVLink arrival time.
+// Returns: nil only after both changes commit; invalid authority, conflicting
+// boundaries, immutable event conflicts and storage errors roll back both.
+func (w *WAL) SaveMissionStartAcceptance(ctx context.Context, c *pb.DurableCommand, evidence []byte, at int64) error {
+	var e pb.CommandEvidence
+	if err := proto.Unmarshal(evidence, &e); err != nil {
+		return err
+	}
+	applied := false
+	for _, event := range e.Events {
+		applied = applied || event.Stage == "applied"
+	}
+	if c.GetDefinition() != "MISSION_START" || !applied {
+		return errors.New("applied mission-start authority required")
+	}
+	return w.saveCommand(ctx, c.CommandId, c.CommandDigest, evidence, true, c, at)
+}
+
+func (w *WAL) saveCommand(ctx context.Context, id, digest string, evidence []byte, effect bool, start *pb.DurableCommand, at int64) error {
 	incoming := &pb.CommandEvidence{}
 	if err := proto.Unmarshal(evidence, incoming); err != nil {
 		return err
@@ -154,6 +178,11 @@ func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byt
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE c2_commands SET evidence=? WHERE command_id=? AND digest=?`, encoded, id, digest); err != nil {
 		return err
+	}
+	if start != nil {
+		if err = recordFlightWatchACK(ctx, tx, start, at); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

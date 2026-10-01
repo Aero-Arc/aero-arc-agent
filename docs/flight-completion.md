@@ -23,8 +23,10 @@ The MAVLink reader captures the correlated accepted ACK's arrival time and opens
 the completion accumulator immediately, before the command goroutine consumes
 the ACK. The boundary excludes samples at or before that nanosecond. Pre-ACK samples, including buffered ACTIVE and
 COMPLETE messages from an earlier mission, cannot seed completion milestones.
-The worker requires that exact captured boundary and applied command authority
-to be durable before committing milestones. Restart restores the captured ACK
+Terminal ACKs have a dedicated one-result slot separate from lossy observation
+frames. The captured start boundary and applied command authority commit in one
+SQLite transaction; a failed write retains neither half. The worker requires
+that transaction before committing milestones. Restart restores the captured ACK
 boundary and discards older milestones preceding it. Missing captured ACKs fail
 closed; command processing time is not a substitute. This remains MAVLink correlation, not an autopilot-issued mission
 execution identity.

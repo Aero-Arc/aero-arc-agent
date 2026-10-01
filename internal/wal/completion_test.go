@@ -321,6 +321,68 @@ func TestFlightWatchRestoresCapturedACKBoundaryWithAppliedAuthority(t *testing.T
 	}
 }
 
+func TestMissionStartAcceptanceCommitsACKAndAuthorityAtomically(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "atomic-acceptance.db")
+	w, err := New(ctx, path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &pb.DurableCommand{CommandId: "start", CommandDigest: "digest", Definition: "MISSION_START", Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 20}}}}}}
+	empty, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: c.CommandDigest})
+	if err = w.AdmitCommand(ctx, c.CommandId, CommandRecord{Digest: c.CommandDigest, Payload: []byte{}, Evidence: empty}); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.BeginFlightWatch(ctx, c, "target"); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.RecordFlightWatchHandoff(ctx, c, 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.BeginCommandEffect(ctx, c.CommandId, c.CommandDigest); err != nil {
+		t.Fatal(err)
+	}
+	applied, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: c.CommandDigest, Events: []*pb.CommandEvent{{EventId: "start/applied", Stage: "applied", OccurredAtUnixMs: 1}}})
+	if _, err = w.db.Exec(`CREATE TRIGGER fail_watch_update BEFORE UPDATE ON flight_watches BEGIN SELECT RAISE(ABORT, 'injected watch write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.SaveMissionStartAcceptance(ctx, c, applied, 20); err == nil {
+		t.Fatal("injected failure accepted")
+	}
+	record, err := w.LoadCommand(ctx, c.CommandId)
+	if err != nil || !bytes.Equal(record.Evidence, empty) {
+		t.Fatalf("applied committed without ACK: %+v %v", record, err)
+	}
+	watch, err := w.LoadFlightWatch(ctx, "flight")
+	if err != nil || watch.StartACKAt != 0 {
+		t.Fatalf("partial ACK persisted: %+v %v", watch, err)
+	}
+	if _, err = w.db.Exec(`DROP TRIGGER fail_watch_update`); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.SaveMissionStartAcceptance(ctx, c, applied, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w, err = New(ctx, path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	watch, err = w.LoadUnresolvedFlightWatch(ctx, "target")
+	if err != nil || watch.AppliedAfter != 21 {
+		t.Fatalf("accepted authority lost on restart: %+v %v", watch, err)
+	}
+	if err = w.SaveMissionStartAcceptance(ctx, c, applied, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.SaveMissionStartAcceptance(ctx, c, applied, 21); err == nil {
+		t.Fatal("ACK boundary changed on replay")
+	}
+}
+
 func TestFlightWatchUnknownCorruptLegacyAuthorityFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	w, err := New(ctx, filepath.Join(t.TempDir(), "unknown.db"), 0, 0)

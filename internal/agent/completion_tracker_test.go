@@ -79,6 +79,12 @@ func TestCompletionRejectsPreviousMissionUntilStartACK(t *testing.T) {
 	a := &Agent{mavlinkTarget: target}
 	pending := &pendingC2{target: target, command: uint32(common.MAV_CMD_MISSION_START), after: time.Unix(0, 10), completionCommandID: "new-start", frames: make(chan *gomavlib.EventFrame, 64)}
 	a.c2Pending = pending
+	pending.terminalACK = make(chan c2TerminalACK, 1)
+	// High-rate telemetry already filled the ordinary lossy queue while storage
+	// blocked the command consumer. A terminal ACK needs independent capacity.
+	for i := 0; i < cap(pending.frames); i++ {
+		pending.frames <- &gomavlib.EventFrame{}
+	}
 	watch := wal.FlightWatch{Target: "target", HandoffAt: 10, Command: &pb.DurableCommand{CommandId: "new-start", Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 21}}}}}}}
 	a.trackFlightCompletion(watch)
 	observe := func(o completionObservation) { o.target = "target"; a.accumulateCompletion(o) }
@@ -110,8 +116,12 @@ func TestCompletionRejectsPreviousMissionUntilStartACK(t *testing.T) {
 	if tracker.watch.MissionActiveAt != 24 || tracker.watch.TerminalAt != 25 {
 		t.Fatalf("post-ACK mission milestones missing: %+v", tracker.watch)
 	}
-	if len(pending.frames) != 1 || tracker.watch.StartACKAt != 20 || tracker.watch.AppliedAfter != 21 {
+	if len(pending.terminalACK) != 1 || tracker.watch.StartACKAt != 20 || tracker.watch.AppliedAfter != 21 {
 		t.Fatalf("ACK arrival lost before command consumer ran: %+v", tracker.watch)
+	}
+	ack := <-pending.terminalACK
+	if ack.result != common.MAV_RESULT_ACCEPTED || ack.at.UnixNano() != 20 {
+		t.Fatalf("captured ACK changed: %+v", ack)
 	}
 }
 

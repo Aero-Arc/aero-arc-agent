@@ -280,15 +280,36 @@ func (w *WAL) SaveFlightWatch(ctx context.Context, v FlightWatch, e *pb.FlightCo
 // local MAVLink arrival time. Returns nil for an exact immutable binding, or an
 // error for a changed boundary, pre-handoff ACK, missing watch, or storage failure.
 func (w *WAL) RecordFlightWatchACK(ctx context.Context, c *pb.DurableCommand, at int64) error {
-	v, err := w.LoadFlightWatch(ctx, c.Context.FlightId)
+	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err = recordFlightWatchACK(ctx, tx, c, at); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func recordFlightWatchACK(ctx context.Context, tx *sql.Tx, c *pb.DurableCommand, at int64) error {
+	var raw []byte
+	if err := tx.QueryRowContext(ctx, `SELECT payload FROM flight_watches WHERE flight_id=? AND start_command_id=?`, c.Context.FlightId, c.CommandId).Scan(&raw); err != nil {
+		return err
+	}
+	var v FlightWatch
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return err
 	}
 	if v.Command.CommandId != c.CommandId || v.HandoffAt == 0 || at < v.HandoffAt || (v.StartACKAt != 0 && v.StartACKAt != at) {
 		return errors.New("flight watch ACK boundary mismatch")
 	}
 	v.StartACKAt = at
-	return w.SaveFlightWatch(ctx, v, nil)
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE flight_watches SET payload=? WHERE flight_id=? AND start_command_id=?`, raw, c.Context.FlightId, c.CommandId)
+	return err
 }
 
 // PendingFlightCompletions returns bounded unacknowledged events for replay.
