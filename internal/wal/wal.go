@@ -251,6 +251,7 @@ func initDB(db *sql.DB) error {
 		command_kind TEXT NOT NULL DEFAULT '',
 		payload_fingerprint TEXT NOT NULL DEFAULT ''
 	);
+	CREATE TABLE IF NOT EXISTS mission_deployment_targets(command_id TEXT PRIMARY KEY,target TEXT NOT NULL);
 	CREATE TABLE IF NOT EXISTS mission_deployments (
 		command_id TEXT PRIMARY KEY,
 		payload_fingerprint TEXT NOT NULL,

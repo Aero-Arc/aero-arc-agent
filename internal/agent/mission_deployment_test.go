@@ -380,9 +380,12 @@ func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	command := validMissionCommand(t, "uncertain-1")
 	digest := command.Binding.MissionDigest
 	readbackFlags := []bool{}
-	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(_ context.Context, target *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
 		readbackFlags = append(readbackFlags, readbackOnly)
 		if len(readbackFlags) == 1 {
+			if err := target.beforeMissionEffect(target); err != nil {
+				return "", 0, nil, err
+			}
 			return "", 0, nil, errMissionOutcomeUnknown
 		}
 		return digest, 0, nil, nil
@@ -410,6 +413,9 @@ func TestMissionDeploymentUnknownRetryReplacesDefinitiveMismatchBeforeExpiry(t *
 	}
 	if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
 		t.Fatalf("reserve uncertain command = %v, %v", created, err)
+	}
+	if err := a.wal.BindMissionDeploymentTarget(context.Background(), command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+		t.Fatal(err)
 	}
 	if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
 		t.Fatal(err)
@@ -518,6 +524,9 @@ func TestExpiredUncertainDeploymentIsReadbackOnly(t *testing.T) {
 			}
 			if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
 				t.Fatalf("reserve uncertain command = %v, %v", created, err)
+			}
+			if err := a.wal.BindMissionDeploymentTarget(context.Background(), command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+				t.Fatal(err)
 			}
 			if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
 				t.Fatal(err)
@@ -1071,7 +1080,7 @@ func TestMAVLinkMissionUploadBootstrapsArduPilotHomeFromEmptyMission(t *testing.
 		t.Run(name, func(t *testing.T) {
 			a, closeWAL := testMissionAgent(t)
 			defer closeWAL()
-			a.options = &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}
+			a.options = &AgentOptions{Debug: true, AircraftCommandTimeout: 20 * time.Millisecond}
 			command := validMissionCommand(t, "empty-home-"+strings.ReplaceAll(name, " ", "-"))
 			if recovery {
 				payload, fingerprint, err := missionCommandIdentity(command)
@@ -1080,6 +1089,9 @@ func TestMAVLinkMissionUploadBootstrapsArduPilotHomeFromEmptyMission(t *testing.
 				}
 				if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
 					t.Fatalf("reserve uncertain command = %v, %v", created, err)
+				}
+				if err := a.wal.BindMissionDeploymentTarget(context.Background(), command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+					t.Fatal(err)
 				}
 				if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
 					t.Fatal(err)
@@ -1371,5 +1383,38 @@ func TestMissionReadbackDropsResponsesDuringRequestHandoff(t *testing.T) {
 	a.observeMissionProtocolMessage(response)
 	if len(events) != 1 {
 		t.Fatal("post-handoff response was not admitted")
+	}
+}
+
+func TestMissionRecoveryCannotChangeAutopilotTarget(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		a, closeWAL := testMissionAgent(t)
+		defer closeWAL()
+		ctx := context.Background()
+		command := validMissionCommand(t, "target-bound")
+		raw, fingerprint, err := missionCommandIdentity(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err = a.wal.ReserveMissionDeployment(ctx, command.CommandId, fingerprint, raw); err != nil {
+			t.Fatal(err)
+		}
+		if !missing {
+			if err = a.wal.BindMissionDeploymentTarget(ctx, command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err = a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint); err != nil {
+			t.Fatal(err)
+		}
+		a.mavlinkTarget.systemID = 2
+		a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
+			t.Fatal("mission recovery reached unrelated target")
+			return "", 0, nil, nil
+		}
+		result := a.executeMissionDeployment(ctx, command)
+		if result.Status != agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN || !strings.Contains(result.Message, "target") {
+			t.Fatalf("missing=%v result=%+v", missing, result)
+		}
 	}
 }

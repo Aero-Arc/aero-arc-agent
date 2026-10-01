@@ -238,3 +238,26 @@ func (w *WAL) BindCommandTarget(ctx context.Context, id, target string) error {
 	}
 	return nil
 }
+
+// BindMissionDeploymentTarget persists the exact autopilot before any mission effect.
+// Parameters: ctx bounds storage; id selects reserved deployment authority; target
+// identifies the configured endpoint and selected MAVLink system/component/profile.
+// Returns: nil for initial prepared binding or exact replay; missing historic
+// bindings, changed targets, absent records, and storage errors fail closed.
+func (w *WAL) BindMissionDeploymentTarget(ctx context.Context, id, target string) error {
+	if target == "" {
+		return errors.New("mission target identity unavailable")
+	}
+	_, err := w.db.ExecContext(ctx, `INSERT INTO mission_deployment_targets(command_id,target) SELECT command_id,? FROM mission_deployments WHERE command_id=? AND state='prepared' ON CONFLICT(command_id) DO NOTHING`, target, id)
+	if err != nil {
+		return err
+	}
+	var saved string
+	if err = w.db.QueryRowContext(ctx, `SELECT target FROM mission_deployment_targets WHERE command_id=?`, id).Scan(&saved); err != nil {
+		return err
+	}
+	if saved != target {
+		return errors.New("mission target changed")
+	}
+	return nil
+}
