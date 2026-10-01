@@ -186,12 +186,19 @@ func reduceCompletion(watch *wal.FlightWatch, o completionObservation, epoch str
 	if watch.AirborneAt == 0 {
 		return false, nil, nil
 	}
+	// A pre-existing RTL/LAND heartbeat may arrive after transport handoff but
+	// before MISSION_START takes effect. Establish airborne AUTO execution first.
+	// Persist this milestone so a restart during later recovery retains it.
+	if watch.MissionActiveAt == 0 && samples.armed && samples.mode == 3 && samples.landed == uint32(common.MAV_LANDED_STATE_IN_AIR) && fresh(samples.heartbeatAt) && fresh(samples.landedAt) {
+		watch.MissionActiveAt = o.at
+		changed = true
+	}
 	if watch.TerminalAt == 0 {
 		if o.kind == "mission" && samples.mode == 3 && samples.armed && fresh(samples.heartbeatAt) && (o.sequence == uint32(len(c.GetMavlink().MissionPrecondition.Items)) || o.missionState == uint32(common.MISSION_STATE_COMPLETE)) {
 			watch.TerminalAt = o.at
 			watch.Outcome = "mission_completed"
 			changed = true
-		} else if o.kind == "heartbeat" && o.armed && (o.mode == 6 || o.mode == 9) {
+		} else if watch.MissionActiveAt > 0 && o.kind == "heartbeat" && o.armed && (o.mode == 6 || o.mode == 9) {
 			watch.TerminalAt = o.at
 			watch.Outcome = "ended_early"
 			changed = true

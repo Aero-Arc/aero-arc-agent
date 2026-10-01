@@ -12,6 +12,12 @@ Startup revalidates older watch indexes for a complete terminal RTL/LAND mission
 structure. Invalid payloads remain preserved and quarantined, and cannot reach
 the completion reducer.
 
+Early RTL/LAND classification requires observed airborne AUTO execution after
+the start handoff. This milestone persists across restart. A recovery mode that
+was already present before the autopilot processes MISSION_START cannot by
+itself mark the new flight ended early; an older watch lacking this milestone
+must observe AUTO before that fallback can be used.
+
 Completion tracking is bound to the immutable, applied MISSION_START command and
 its verified terminal RTL/LAND mission. It requires observed airborne state,
 terminal mission progress (or early RTL/LAND), and landed/disarmed samples within

@@ -20,12 +20,13 @@ import (
 type FlightWatch struct {
 	Target string `json:"target"`
 	// HandoffAt fences observations captured before the successful mission-start write.
-	HandoffAt  int64              `json:"handoff_at"`
-	Command    *pb.DurableCommand `json:"command"`
-	AirborneAt int64              `json:"airborne_at"`
-	TerminalAt int64              `json:"terminal_at"`
-	Outcome    string             `json:"outcome"`
-	Done       bool               `json:"done"`
+	HandoffAt       int64              `json:"handoff_at"`
+	Command         *pb.DurableCommand `json:"command"`
+	AirborneAt      int64              `json:"airborne_at"`
+	MissionActiveAt int64              `json:"mission_active_at"`
+	TerminalAt      int64              `json:"terminal_at"`
+	Outcome         string             `json:"outcome"`
+	Done            bool               `json:"done"`
 }
 
 // MarshalJSON preserves the protobuf execution oneof in the persisted watch.

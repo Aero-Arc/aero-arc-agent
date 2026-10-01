@@ -193,6 +193,7 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	}
 	watch.HandoffAt = time.Now().Add(-2 * time.Second).UnixNano()
 	watch.AirborneAt = time.Now().Add(-time.Second).UnixNano()
+	watch.MissionActiveAt = watch.AirborneAt
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
 		t.Fatal(err)
 	}

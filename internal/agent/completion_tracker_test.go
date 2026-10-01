@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,6 +15,44 @@ import (
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestCompletionDoesNotAttributePreExistingRecoveryToNewStart(t *testing.T) {
+	for _, mode := range []uint32{6, 9} {
+		watch := wal.FlightWatch{Target: "target", HandoffAt: 1, Command: &pb.DurableCommand{Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 21}}}}}}}
+		samples := completionSamples{}
+		observe := func(o completionObservation) {
+			t.Helper()
+			o.target = "target"
+			if _, _, err := reduceCompletion(&watch, o, "epoch", &samples); err != nil {
+				t.Fatal(err)
+			}
+		}
+		observe(completionObservation{kind: "heartbeat", armed: true, mode: mode, at: 2})
+		observe(completionObservation{kind: "landed", landed: 2, at: 3})
+		observe(completionObservation{kind: "heartbeat", armed: true, mode: mode, at: 4})
+		if watch.TerminalAt != 0 || watch.MissionActiveAt != 0 {
+			t.Fatalf("pre-existing recovery classified as ending: %+v", watch)
+		}
+		observe(completionObservation{kind: "heartbeat", armed: true, mode: 3, at: 5})
+		if watch.MissionActiveAt != 5 {
+			t.Fatalf("AUTO execution not retained: %+v", watch)
+		}
+		// Milestones survive restart independently of process-local fresh samples.
+		raw, err := json.Marshal(watch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		watch = wal.FlightWatch{}
+		if err = json.Unmarshal(raw, &watch); err != nil {
+			t.Fatal(err)
+		}
+		samples = completionSamples{}
+		observe(completionObservation{kind: "heartbeat", armed: true, mode: mode, at: 6})
+		if watch.TerminalAt != 6 || watch.Outcome != "ended_early" {
+			t.Fatalf("post-execution recovery not retained: %+v", watch)
+		}
+	}
+}
 
 func TestCompletionPreservesPreHandoffArrival(t *testing.T) {
 	a := &Agent{mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}}
