@@ -54,7 +54,7 @@ func TestRunAckLoopBoundsMissionDeploymentBurstWhileBusy(t *testing.T) {
 		},
 	}
 	done := make(chan error, 1)
-	go func() { done <- a.runAckLoop(context.Background(), stream) }()
+	go func() { done <- a.runAckLoop(context.Background(), stream, func() {}) }()
 	select {
 	case err := <-done:
 		if !errors.Is(err, io.EOF) {

@@ -240,7 +240,7 @@ func TestRunAckLoopRejectsConcurrentAircraftCommandWithoutDelayingReceive(t *tes
 		},
 	}
 	loopDone := make(chan error, 1)
-	go func() { loopDone <- agent.runAckLoop(context.Background(), stream) }()
+	go func() { loopDone <- agent.runAckLoop(context.Background(), stream, func() {}) }()
 
 	select {
 	case result := <-results:

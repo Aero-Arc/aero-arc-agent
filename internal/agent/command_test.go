@@ -348,3 +348,31 @@ func TestMalformedMavlinkParametersFailBeforeJournalAdmission(t *testing.T) {
 		t.Fatalf("malformed command journaled: %v", err)
 	}
 }
+
+func TestMissionStartRejectsDisarmedAutopilotBeforeEffect(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	c := testC2Command(t)
+	c.Definition = "MISSION_START"
+	c.GetMavlink().Command = 300
+	c.GetMavlink().Parameters[0] = 0
+	c.GetMavlink().Observation = "mission_running"
+	var err error
+	c.CommandDigest, err = commanddigest.Digest(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.operationContext = &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}
+	a.mavlinkTarget.armed = false
+	a.mavlinkTarget.heartbeatAt = time.Now()
+	var writes atomic.Int32
+	a.writeMAVLinkMessage = func(*gomavlib.Channel, message.Message) error { writes.Add(1); return nil }
+	e, err := a.executeDurableCommand(context.Background(), c, nil)
+	if err != nil || !hasStage(e, "rejected") || writes.Load() != 0 {
+		t.Fatalf("disarmed mission start: %v %v writes=%d", e, err, writes.Load())
+	}
+	record, err := a.wal.LoadCommand(context.Background(), c.CommandId)
+	if err != nil || record.EffectStarted {
+		t.Fatalf("precondition consumed effect permit: %+v %v", record, err)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -368,7 +369,7 @@ func TestRunWithReconnect_DialFailureHonorsContextAndBackoff(t *testing.T) {
 		t.Fatalf("openStreamFn should not be called on dial failure")
 		return nil, nil
 	}
-	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], _ context.CancelFunc) error {
 		t.Fatalf("ackLoopFn should not be called on dial failure")
 		return nil
 	}
@@ -491,7 +492,7 @@ func TestRunWithReconnect_StreamFailureTriggersReconnect(t *testing.T) {
 		}, nil
 	}
 
-	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], _ context.CancelFunc) error {
 		// Just call Recv until error
 		for {
 			_, err := stream.Recv()
@@ -588,7 +589,7 @@ func TestRunWithReconnectRequeuesUnacknowledgedBatchPeersBeforeReconnect(t *test
 	a.openStreamFn = func(context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error) {
 		return stream, nil
 	}
-	a.ackLoopFn = func(ackCtx context.Context, _ grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(ackCtx context.Context, _ grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], _ context.CancelFunc) error {
 		select {
 		case <-allSent:
 		case <-ackCtx.Done():
@@ -652,7 +653,7 @@ func TestRunWithReconnectRemainsSupervisedAfterWorkerTeardownTimeout(t *testing.
 		}}, nil
 	}
 	releaseACKWorker := make(chan struct{})
-	a.ackLoopFn = func(context.Context, grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+	a.ackLoopFn = func(context.Context, grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], context.CancelFunc) error {
 		<-releaseACKWorker // Deliberately ignore stream cancellation past the teardown deadline.
 		return errors.New("released stale ACK worker")
 	}
@@ -913,7 +914,7 @@ func TestBatchedTelemetryACKsSustainFreshnessRespectWindowAndDispatchControl(t *
 	senderDone := make(chan error, 1)
 	ackDone := make(chan error, 1)
 	go func() { senderDone <- a.handleTelemetryFrames(ownerCtx, stream) }()
-	go func() { ackDone <- a.runAckLoop(ownerCtx, stream) }()
+	go func() { ackDone <- a.runAckLoop(ownerCtx, stream, cancel) }()
 	select {
 	case latency := <-controlACK:
 		t.Logf("control dispatch latency behind 100 ACKs: %v", latency)
@@ -1683,5 +1684,47 @@ func TestStart_ImmediateCancel(t *testing.T) {
 	}
 	if !errors.Is(err, shutdownErr) {
 		t.Errorf("Start did not surface shutdown error: %v", err)
+	}
+}
+
+func TestAckFailureCancelsBlockedDurableProgressSend(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sending := make(chan struct{})
+	command := testC2Command(t)
+	var once sync.Once
+	received := false
+	stream := &mockStream{
+		sendFunc: func(*agentv1.AgentStreamMessage) error {
+			once.Do(func() { close(sending) })
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		recvFunc: func() (*agentv1.RelayStreamMessage, error) {
+			if !received {
+				received = true
+				return &agentv1.RelayStreamMessage{Payload: &agentv1.RelayStreamMessage_DurableCommand{DurableCommand: command}}, nil
+			}
+			select {
+			case <-sending:
+				return &agentv1.RelayStreamMessage{Payload: &agentv1.RelayStreamMessage_TelemetryAck{TelemetryAck: &agentv1.TelemetryAck{Seq: 0}}}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.runAckLoop(ctx, stream, cancel) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidTelemetryAck) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("blocked progress send deadlocked stream teardown")
 	}
 }
