@@ -414,14 +414,17 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	}
 	a.mavlinkMu.Lock()
 	current := a.mavlinkTarget
-	same := current != nil && current.channel == target.channel && current.systemID == target.systemID && current.componentID == target.componentID && time.Since(current.heartbeatAt) <= 3*time.Second
+	same := sameValidatedTarget(current, target) && (c.Definition != "MISSION_START" || current.armed)
 	pending.after = time.Time{}
 	a.mavlinkMu.Unlock()
 	if !same {
 		return reject("autopilot target changed before effect")
 	}
-	if time.Now().UnixMilli() >= c.ExpiresAtUnixMs {
+	if ctx.Err() != nil || time.Now().UnixMilli() >= c.ExpiresAtUnixMs {
 		return reject("authorization expired before effect")
+	}
+	if a.writeMAVLinkMessage == nil {
+		return reject("MAVLink writer unavailable before effect fence")
 	}
 	// Discard evidence from the pre-send epoch; callbacks during handoff are
 	// ignored until the new post-send observation boundary is installed.
