@@ -1423,6 +1423,12 @@ func TestMissionReadbackDropsResponsesDuringRequestHandoff(t *testing.T) {
 	if len(events) != 0 {
 		t.Fatal("stale response entered the new readback epoch during handoff")
 	}
+	// A frame can have arrived before handoff yet acquire mavlinkMu only
+	// after the writer clears the gate. Its original arrival must still lose.
+	a.observeMissionProtocolMessageAt(response, now)
+	if len(events) != 0 {
+		t.Fatal("delayed pre-handoff observer entered the new epoch")
+	}
 	a.observeMissionProtocolMessage(response)
 	if len(events) != 1 {
 		t.Fatal("post-handoff response was not admitted")

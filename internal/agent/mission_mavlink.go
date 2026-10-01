@@ -15,12 +15,17 @@ import (
 
 type missionTransactionTarget struct {
 	readbackHandoff bool
+	readbackAfter   time.Time
 	channel         *gomavlib.Channel
 	systemID        uint8
 	componentID     uint8
 }
 
 func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
+	a.observeMissionProtocolMessageAt(frame, time.Now())
+}
+
+func (a *Agent) observeMissionProtocolMessageAt(frame *gomavlib.EventFrame, arrivedAt time.Time) {
 	if frame == nil {
 		return
 	}
@@ -40,7 +45,7 @@ func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
 	}
 	target := a.pendingMissionTarget
 	events := a.pendingMissionEvents
-	matched := target != nil && !target.readbackHandoff && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
+	matched := target != nil && !target.readbackHandoff && !arrivedAt.Before(target.readbackAfter) && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
 	if !matched || events == nil {
 		return
 	}
@@ -617,6 +622,9 @@ func (a *Agent) startMissionReadback(ctx context.Context, target *mavlinkTarget,
 	})
 	a.mavlinkMu.Lock()
 	if pending != nil && a.pendingMissionTarget == pending {
+		// Arrival is stamped before the observer takes mavlinkMu. An observer
+		// already waiting on that mutex cannot enter this new response epoch.
+		pending.readbackAfter = time.Now()
 		pending.readbackHandoff = false
 	}
 	a.protocolQuiet.mission = time.Now()

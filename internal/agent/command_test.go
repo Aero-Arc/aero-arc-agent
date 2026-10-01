@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -576,5 +577,33 @@ func TestDurableArmUnavailableWriterDoesNotConsumeEffect(t *testing.T) {
 	record, err := a.wal.LoadCommand(context.Background(), c.CommandId)
 	if err != nil || record.EffectStarted {
 		t.Fatalf("missing writer consumed effect: %+v %v", record, err)
+	}
+}
+
+func TestGenericUnavailableWriterDoesNotConsumeEffect(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	c := testC2Command(t)
+	c.Definition = "LAND"
+	c.GetMavlink().Command = 21
+	c.GetMavlink().Parameters = make([]float32, 7)
+	c.GetMavlink().Observation = "landed"
+	c.CommandDigest, _ = commanddigest.Digest(c)
+	a.operationContext = &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}
+	a.mavlinkTarget.autopilot = common.MAV_AUTOPILOT_ARDUPILOTMEGA
+	a.mavlinkTarget.vehicleType = common.MAV_TYPE_QUADROTOR
+	a.writeMAVLinkMessage = nil
+	now := time.Now()
+	a.protocolQuiet = protocolQuiet{channel: a.mavlinkTarget.channel, system: 1, component: 1, since: now.Add(-time.Minute), last: now}
+	e, err := a.executeDurableCommand(context.Background(), c, nil)
+	if err != nil || !hasStage(e, "rejected") {
+		t.Fatalf("no-writer result=%v err=%v", e, err)
+	}
+	if !strings.Contains(e.Events[len(e.Events)-1].Message, "writer unavailable before effect") {
+		t.Fatalf("rejected for wrong reason: %v", e)
+	}
+	r, err := a.wal.LoadCommand(context.Background(), c.CommandId)
+	if err != nil || r.EffectStarted {
+		t.Fatalf("missing writer consumed effect: %+v %v", r, err)
 	}
 }
