@@ -288,6 +288,11 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 	}
 	if !effectStarted {
 		if err := a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint); err != nil {
+			if errors.Is(err, wal.ErrCommandSuperseded) {
+				result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
+				result.Message = err.Error()
+				return a.persistMissionResult(ctx, fingerprint, result, false)
+			}
 			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
 			result.Message = err.Error()
 			return result

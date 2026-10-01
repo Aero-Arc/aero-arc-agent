@@ -411,7 +411,7 @@ func TestMalformedDurableCommandsDoNotEndTelemetry(t *testing.T) {
 }
 
 func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
-	for _, scenario := range []string{"busy", "no-target", "no-transport", "write"} {
+	for _, scenario := range []string{"busy", "no-target", "no-transport", "write", "superseded"} {
 		t.Run(scenario, func(t *testing.T) {
 			a, closeWAL := testMissionAgent(t)
 			defer closeWAL()
@@ -446,6 +446,16 @@ func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
 					return mission.Binding.MissionDigest, 1, nil, nil
 				}
 			}
+			if scenario == "superseded" {
+				raw, _ := proto.Marshal(c)
+				evidence, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: c.CommandDigest})
+				if err := a.wal.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: c.CommandDigest, Payload: raw, Evidence: evidence}); err != nil {
+					t.Fatal(err)
+				}
+				if err := a.wal.RecordLegacyAircraftEffect(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
 			e, err := a.executeDurableCommand(ctx, c, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -457,6 +467,16 @@ func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
 			latest, err := a.wal.CommandIsLatest(ctx, "older")
 			if err != nil {
 				t.Fatal(err)
+			}
+			if scenario == "superseded" {
+				if writes != 0 || record.EffectStarted || !hasStage(e, "rejected") || hasStage(e, "outcome_unknown") {
+					t.Fatalf("superseded mission not definitively rejected: %+v", e)
+				}
+				replay, err := a.executeDurableCommand(ctx, c, nil)
+				if err != nil || !hasStage(replay, "rejected") || writes != 0 {
+					t.Fatalf("superseded replay: %+v %v", replay, err)
+				}
+				return
 			}
 			if scenario == "write" {
 				if writes != 1 || !record.EffectStarted || latest || !hasStage(e, "observed") {
