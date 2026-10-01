@@ -333,7 +333,7 @@ func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (Fli
 	if err != nil {
 		return FlightWatch{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var found *FlightWatch
 	for rows.Next() {
 		var raw, evidence []byte
