@@ -21,7 +21,7 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer w.Close()
+			defer func() { _ = w.Close() }()
 			at := time.Now().UnixNano()
 			c := &pb.DurableCommand{CommandId: "start", AgentId: "agent", Context: &pb.OperationContext{AircraftId: "aircraft", FlightId: "flight", IntentId: "intent", IntentVersion: 1}, IssuedAtUnixMs: at / int64(time.Millisecond), Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPreconditionId: "mission", MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Autocontinue: true, Param4: 1}}}}}}
 			raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: "start", Events: []*pb.CommandEvent{{Stage: "applied"}}})
@@ -47,12 +47,12 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() { _ = db.Close() }()
 			tx, err := db.BeginTx(ctx, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer tx.Rollback()
+			defer func() { _ = tx.Rollback() }()
 			if _, err = tx.Exec(`UPDATE flight_watches SET payload=payload`); err != nil {
 				t.Fatal(err)
 			}
@@ -114,7 +114,7 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer reopened.Close()
+			defer func() { _ = reopened.Close() }()
 			replayed, err := reopened.PendingFlightCompletions(ctx)
 			if err != nil || len(replayed) != 1 || !proto.Equal(events[0], replayed[0]) {
 				t.Fatalf("restart changed completion evidence: %v %v", replayed, err)

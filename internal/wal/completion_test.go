@@ -57,7 +57,7 @@ func TestIncompleteMissionWatchesAreQuarantinedOnUpgrade(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer w.Close()
+				defer func() { _ = w.Close() }()
 				var reason string
 				var preserved []byte
 				if err = w.db.QueryRow(`SELECT i.quarantine_reason,w.payload FROM flight_watch_index i JOIN flight_watches w USING(flight_id) WHERE flight_id='flight'`).Scan(&reason, &preserved); err != nil || reason == "" || !bytes.Equal(raw, preserved) {
