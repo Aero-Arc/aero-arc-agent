@@ -47,6 +47,8 @@ type mavlinkArmedStateEvidence struct {
 }
 
 type pendingMAVLinkCommand struct {
+	target             *mavlinkTarget
+	after              time.Time
 	channel            *gomavlib.Channel
 	systemID           uint8
 	componentID        uint8
@@ -74,15 +76,16 @@ type preparedAircraftCommand struct {
 }
 
 func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
+	arrivedAt := time.Now()
 	if frame == nil {
 		return
 	}
-	a.observeC2Frame(frame)
-	a.observeMissionProtocolMessage(frame)
+	a.observeC2FrameAt(frame, arrivedAt)
+	a.observeMissionProtocolMessageAt(frame, arrivedAt)
 	switch message := frame.Message().(type) {
 	case *common.MessageHeartbeat:
 		if frame.ComponentID() == uint8(common.MAV_COMP_ID_AUTOPILOT1) && message.Type != common.MAV_TYPE_GCS {
-			a.observeMAVLinkHeartbeat(frame.Channel, frame.SystemID(), frame.ComponentID(), message.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0, uint32(message.Type), uint32(message.Autopilot))
+			a.observeMAVLinkHeartbeatAt(arrivedAt, frame.Channel, frame.SystemID(), frame.ComponentID(), message.BaseMode&common.MAV_MODE_FLAG_SAFETY_ARMED != 0, uint32(message.Type), uint32(message.Autopilot))
 		} else {
 			a.observeMAVLinkEventProgress(frame.Channel)
 		}
@@ -90,7 +93,7 @@ func (a *Agent) observeMAVLinkFrame(frame *gomavlib.EventFrame) {
 		// ACK classification and its fence reset share one critical section.
 		// Generic progress must not expose a quiet epoch before this same event
 		// is consumed as potentially stale command evidence.
-		a.observeMAVLinkCommandAck(frame.Channel, frame.SystemID(), frame.ComponentID(), message)
+		a.observeMAVLinkCommandAckAt(arrivedAt, frame.Channel, frame.SystemID(), frame.ComponentID(), message)
 	case *common.MessageExtendedSysState:
 		a.observeMAVLinkLandedState(frame.Channel, frame.SystemID(), frame.ComponentID(), message.LandedState)
 	default:
@@ -143,9 +146,16 @@ func (a *Agent) rearmAircraftACKFenceLocked() {
 }
 
 func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, componentID uint8, armed bool, profile ...uint32) {
+	a.observeMAVLinkHeartbeatAt(time.Now(), channel, systemID, componentID, armed, profile...)
+}
+
+func (a *Agent) observeMAVLinkHeartbeatAt(arrivedAt time.Time, channel *gomavlib.Channel, systemID, componentID uint8, armed bool, profile ...uint32) {
 	a.mavlinkMu.Lock()
 	previous := a.mavlinkTarget
 	targetChanged := previous == nil || previous.channel != channel || previous.systemID != systemID || previous.componentID != componentID
+	if previous != nil && len(profile) == 2 && (previous.vehicleType != common.MAV_TYPE(profile[0]) || previous.autopilot != common.MAV_AUTOPILOT(profile[1])) {
+		targetChanged = true
+	}
 	if targetChanged {
 		a.protocolQuiet = protocolQuiet{}
 		// A different transport target starts a new ACK-correlation domain. Even
@@ -158,7 +168,7 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 	}
 	a.mavlinkHeartbeatSeq++
 	sequence := a.mavlinkHeartbeatSeq
-	now := time.Now()
+	now := arrivedAt
 	updated := &mavlinkTarget{
 		channel: channel, systemID: systemID, componentID: componentID,
 		heartbeatSequence: sequence, armed: armed, heartbeatAt: now,
@@ -176,13 +186,16 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 		updated.autopilot = previous.autopilot
 	}
 	a.mavlinkTarget = updated
+	if mission := a.pendingMissionTarget; mission != nil && mission.channel == channel && mission.systemID == systemID && mission.componentID == componentID && (mission.autopilot != updated.autopilot || mission.vehicleType != updated.vehicleType) {
+		mission.profileChanged = true
+	}
 	pending := a.pendingMAVLinkCommand
 	var stateChanges chan mavlinkArmedStateEvidence
 	var stateEvidence mavlinkArmedStateEvidence
-	if pending != nil && pending.channel == channel && pending.systemID == systemID && pending.componentID == componentID {
+	if pending != nil && pending.channel == channel && pending.systemID == systemID && pending.componentID == componentID && (pending.target == nil || sameTargetIdentity(updated, pending.target)) {
 		if !pending.enqueueComplete {
 			pending.armedAtEnqueue = armed
-		} else if sequence > pending.heartbeatAtEnqueue {
+		} else if sequence > pending.heartbeatAtEnqueue && !arrivedAt.Before(pending.after) {
 			if armed != pending.desiredArmed {
 				pending.oppositeStateObserved = true
 			}
@@ -213,6 +226,10 @@ func (a *Agent) observeMAVLinkHeartbeat(channel *gomavlib.Channel, systemID, com
 }
 
 func (a *Agent) observeMAVLinkCommandAck(channel *gomavlib.Channel, systemID, componentID uint8, ack *common.MessageCommandAck) {
+	a.observeMAVLinkCommandAckAt(time.Now(), channel, systemID, componentID, ack)
+}
+
+func (a *Agent) observeMAVLinkCommandAckAt(arrivedAt time.Time, channel *gomavlib.Channel, systemID, componentID uint8, ack *common.MessageCommandAck) {
 	if ack == nil {
 		return
 	}
@@ -220,9 +237,10 @@ func (a *Agent) observeMAVLinkCommandAck(channel *gomavlib.Channel, systemID, co
 	pending := a.pendingMAVLinkCommand
 	matchesPending := pending != nil && pending.channel == channel && pending.command == ack.Command &&
 		pending.systemID == systemID && pending.componentID == componentID &&
+		(pending.target == nil || sameTargetIdentity(a.mavlinkTarget, pending.target)) &&
 		(ack.TargetSystem == 0 || ack.TargetSystem == mavlinkSourceSystemID) &&
 		(ack.TargetComponent == 0 || ack.TargetComponent == mavlinkSourceComponentID)
-	if matchesPending && !pending.enqueueComplete {
+	if matchesPending && (!pending.enqueueComplete || arrivedAt.Before(pending.after)) {
 		// A COMMAND_ACK observed before WriteMessageTo returns predates the
 		// command's gomavlib handoff boundary. It cannot be correlated to this
 		// attempt. Discard it and require state verification for any later ACK;
@@ -476,6 +494,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 			continue
 		}
 		pending = &pendingMAVLinkCommand{
+			target:  target,
 			channel: target.channel, systemID: target.systemID, componentID: target.componentID,
 			command:            common.MAV_CMD_COMPONENT_ARM_DISARM,
 			desiredArmed:       desiredArmed,
@@ -588,6 +607,7 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		// gomavlib WriteMessageTo returning confirms handoff to the node, not
 		// physical channel I/O. COMMAND_ACK remains the transmission evidence.
 		pending.enqueueComplete = true
+		pending.after = time.Now()
 	}
 	stateVerificationRequired := pending.stateVerificationRequired
 	a.mavlinkMu.Unlock()
@@ -679,5 +699,9 @@ func (a *Agent) aircraftCommandTimeout() time.Duration {
 }
 
 func sameValidatedTarget(current, expected *mavlinkTarget) bool {
-	return current != nil && current.channel == expected.channel && current.systemID == expected.systemID && current.componentID == expected.componentID && current.autopilot == expected.autopilot && current.vehicleType == expected.vehicleType && time.Since(current.heartbeatAt) <= 3*time.Second
+	return sameTargetIdentity(current, expected) && time.Since(current.heartbeatAt) <= 3*time.Second
+}
+
+func sameTargetIdentity(current, expected *mavlinkTarget) bool {
+	return current != nil && expected != nil && current.channel == expected.channel && current.systemID == expected.systemID && current.componentID == expected.componentID && current.autopilot == expected.autopilot && current.vehicleType == expected.vehicleType
 }

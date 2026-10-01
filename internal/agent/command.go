@@ -29,6 +29,10 @@ type pendingC2 struct {
 }
 
 func (a *Agent) observeC2Frame(frame *gomavlib.EventFrame) {
+	a.observeC2FrameAt(frame, time.Now())
+}
+
+func (a *Agent) observeC2FrameAt(frame *gomavlib.EventFrame, arrivedAt time.Time) {
 	if frame == nil {
 		return
 	}
@@ -37,10 +41,15 @@ func (a *Agent) observeC2Frame(frame *gomavlib.EventFrame) {
 	a.trackProtocolQuietLocked(frame, time.Now())
 	p := a.c2Pending
 	current := a.mavlinkTarget
-	if current == nil || p == nil || current.channel != p.target.channel || current.systemID != p.target.systemID || current.componentID != p.target.componentID {
+	if p == nil || !sameTargetIdentity(current, p.target) {
 		return
 	}
-	if p.after.IsZero() || frame.Channel != p.target.channel || frame.SystemID() != p.target.systemID || frame.ComponentID() != p.target.componentID {
+	if p.after.IsZero() || arrivedAt.Before(p.after) || frame.Channel != p.target.channel || frame.SystemID() != p.target.systemID || frame.ComponentID() != p.target.componentID {
+		return
+	}
+	// Heartbeat routing precedes the selected-target update. Validate the
+	// profile carried by this frame as well as the previously selected profile.
+	if heartbeat, ok := frame.Message().(*common.MessageHeartbeat); ok && (heartbeat.Autopilot != p.target.autopilot || heartbeat.Type != p.target.vehicleType) {
 		return
 	}
 	select {
