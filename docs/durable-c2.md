@@ -13,6 +13,13 @@ response loss or restart. An interrupted effect becomes outcome unknown; recover
 replays facts or observes fresh vehicle messages. It never extends authorization.
 Mission upload retains the existing journal/readback recovery rules.
 
+An older WAL may lack ownership metadata for an in-flight legacy mission.
+That mission can reconcile through matching onboard readback, but cannot issue
+a replacement upload: the old journal cannot prove that no later legacy effect
+occurred. It remains outcome unknown rather than becoming a terminal superseded
+rejection. Startup never invents ownership for these records; reconcile them
+before migrating an operational installation.
+
 Agent admission, autopilot acceptance, and observed state are independent facts.
 Evidence returns over the existing authenticated telemetry stream and is replayed
 on later exchanges. Telemetry WAL ACK semantics are unchanged. The API persists
