@@ -18,6 +18,7 @@ var agentCmd = cli.Command{
 	Action: RunAgent,
 
 	Flags: []cli.Flag{
+		&cli.StringFlag{Name: "debug-mavlink-address", Value: "0.0.0.0:14550", Usage: "UDP listener for isolated simulator testing; used only with --debug"},
 		&cli.StringFlag{
 			Name:  "serial-path",
 			Value: "/dev/ttyUSB0",
