@@ -411,7 +411,7 @@ func TestMalformedDurableCommandsDoNotEndTelemetry(t *testing.T) {
 }
 
 func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
-	for _, scenario := range []string{"busy", "no-target", "no-transport", "write", "superseded", "prepared-superseded"} {
+	for _, scenario := range []string{"busy", "no-target", "no-transport", "write", "superseded", "prepared-superseded", "home-error", "armed-after-home"} {
 		t.Run(scenario, func(t *testing.T) {
 			a, closeWAL := testMissionAgent(t)
 			defer closeWAL()
@@ -437,13 +437,36 @@ func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
 			}
 			writes := 0
 			if scenario != "no-transport" {
-				a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *pb.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
+				a.deployMAVLinkMission = func(_ context.Context, target *mavlinkTarget, _ *pb.MissionPlan, _ bool, _ int64) (string, uint32, *uint32, error) {
+					if target.beforeMissionEffect != nil {
+						if err := target.beforeMissionEffect(target); err != nil {
+							return "", 0, nil, err
+						}
+					}
 					writes++
 					record, err := a.wal.LoadCommand(ctx, c.CommandId)
 					if err != nil || !record.EffectStarted {
 						t.Fatalf("write without paired fence: %+v %v", record, err)
 					}
 					return mission.Binding.MissionDigest, 1, nil, nil
+				}
+			}
+			if scenario == "home-error" || scenario == "armed-after-home" {
+				a.deployMAVLinkMission = a.executeMAVLinkMissionDeployment
+				a.writeMAVLinkMessage = func(_ *gomavlib.Channel, msg message.Message) error {
+					switch msg.(type) {
+					case *common.MessageMissionRequestList:
+						if scenario == "home-error" {
+							return errors.New("HOME unavailable")
+						}
+						a.mavlinkMu.Lock()
+						a.mavlinkTarget.armed = true
+						a.mavlinkMu.Unlock()
+						a.pendingMissionEvents <- &common.MessageMissionCount{Count: 0, MissionType: common.MAV_MISSION_TYPE_MISSION}
+					case *common.MessageMissionCount, *common.MessageMissionItemInt:
+						writes++
+					}
+					return nil
 				}
 			}
 			if scenario == "superseded" {

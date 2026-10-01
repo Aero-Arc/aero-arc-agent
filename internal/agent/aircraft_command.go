@@ -21,6 +21,7 @@ const (
 )
 
 type mavlinkTarget struct {
+	beforeMissionEffect func(*mavlinkTarget) error
 	vehicleType         common.MAV_TYPE
 	autopilot           common.MAV_AUTOPILOT
 	channel             *gomavlib.Channel

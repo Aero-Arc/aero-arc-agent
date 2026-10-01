@@ -112,6 +112,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	if plan == nil || len(plan.Items) == 0 {
 		return "", 0, nil, errors.New("replacement mission requires at least one canonical item")
 	}
+	beforeEffect := target.beforeMissionEffect
 	home, err := a.readbackMAVLinkHome(ctx, target, events, plan.Items[0])
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("pre-upload HOME readback: %w", err)
@@ -126,6 +127,11 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	}
 	if expiresAtUnixMs <= 0 || time.Now().UnixMilli() > expiresAtUnixMs {
 		return "", 0, nil, errors.New("mission effect deadline expired before MISSION_COUNT handoff")
+	}
+	if beforeEffect != nil {
+		if err := beforeEffect(target); err != nil {
+			return "", 0, nil, err
+		}
 	}
 	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionCount{
 		TargetSystem: target.systemID, TargetComponent: target.componentID,
