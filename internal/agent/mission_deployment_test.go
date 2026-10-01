@@ -374,6 +374,49 @@ func TestAcquireFreshLandedStateRejectsWrongTargetAndTimeout(t *testing.T) {
 	}
 }
 
+func TestMissionDeploymentMissingOwnershipDoesNotBecomeTerminalRejection(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	ctx := context.Background()
+	command := validMissionCommand(t, "legacy-ownership")
+	raw, fingerprint, err := missionCommandIdentity(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = a.wal.ReserveMissionDeployment(ctx, command.CommandId, fingerprint, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.wal.BindMissionDeploymentTarget(ctx, command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	matched := false
+	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
+		if readbackOnly {
+			if matched {
+				return command.Binding.MissionDigest, 0, nil, nil
+			}
+			return "different", 0, nil, nil
+		}
+		return "", 0, nil, wal.ErrMissionEffectOwnershipUnknown
+	}
+	result := a.executeMissionDeployment(ctx, command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN {
+		t.Fatalf("missing ownership result = %+v", result)
+	}
+	record, err := a.wal.LoadMissionDeployment(ctx, command.CommandId)
+	if err != nil || record.State != "outcome_unknown" {
+		t.Fatalf("durable uncertainty lost: %+v %v", record, err)
+	}
+	matched = true
+	result = a.executeMissionDeployment(ctx, command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED {
+		t.Fatalf("later readback reconciliation = %+v", result)
+	}
+}
+
 func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	a, closeWAL := testMissionAgent(t)
 	defer closeWAL()

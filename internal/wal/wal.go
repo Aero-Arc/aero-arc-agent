@@ -43,6 +43,11 @@ var ErrOperationCommandConflict = errors.New("operation command ID reused with a
 // with a different immutable command payload.
 var ErrMissionDeploymentConflict = errors.New("mission deployment command ID reused with a different payload")
 
+// ErrMissionEffectOwnershipUnknown prevents replacement writes when an older
+// WAL cannot establish which legacy command owns the latest aircraft effect.
+// Readback reconciliation remains permitted; missing history is not supersession.
+var ErrMissionEffectOwnershipUnknown = errors.New("legacy mission effect ownership is unknown; replacement upload requires reconciliation")
+
 var (
 	// ErrTelemetryFrameNotFound reports an ACK for no durable WAL sequence.
 	ErrTelemetryFrameNotFound = errors.New("telemetry ACK sequence does not exist")
@@ -1045,6 +1050,16 @@ func (w *WAL) MarkMissionDeploymentEffectStarted(ctx context.Context, commandID,
 			return ErrCommandSuperseded
 		}
 	} else if previous != "prepared" {
+		var recorded bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM mission_effect_ownership WHERE command_id=?)`, commandID).Scan(&recorded); err != nil {
+			return err
+		}
+		if !recorded {
+			// Old WALs did not record the identity of legacy effects. Backfilling
+			// the current fence would wrongly authorize an older command after
+			// a newer legacy write. Preserve uncertainty instead of inventing it.
+			return ErrMissionEffectOwnershipUnknown
+		}
 		var latest bool
 		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM mission_effect_ownership o JOIN legacy_effect_revision r ON r.id=1 AND r.revision=o.legacy_revision WHERE o.command_id=? AND NOT EXISTS(SELECT 1 FROM c2_commands WHERE effect_started=1 AND rowid>o.c2_rowid))`, commandID).Scan(&latest); err != nil {
 			return err

@@ -306,6 +306,10 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 	result.UploadedItemCount = count
 	result.MavlinkMissionAckType = ack
 	switch {
+	case errors.Is(err, wal.ErrMissionEffectOwnershipUnknown):
+		result.Status = agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN
+		result.Message = err.Error()
+		return a.persistMissionResult(ctx, fingerprint, result, true)
 	case errors.Is(err, wal.ErrCommandSuperseded):
 		result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
 		result.Message = err.Error()
