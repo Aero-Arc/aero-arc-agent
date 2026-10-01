@@ -207,6 +207,14 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 				err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
 			}
 		}
+		if err == nil && stage == "applied" && c.Definition == "MISSION_START" {
+			watch, loadErr := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
+			if loadErr == nil {
+				a.trackFlightCompletion(watch)
+			} else if !errors.Is(loadErr, sql.ErrNoRows) {
+				return loadErr
+			}
+		}
 		if err == nil && stage != "" && emit != nil {
 			emit(proto.Clone(e).(*pb.CommandEvidence))
 		}
@@ -458,6 +466,12 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	if c.Definition == "MISSION_START" {
 		if err = a.wal.RecordFlightWatchHandoff(ctx, c, handoffAt.UnixNano()); err != nil {
 			return e, save("outcome_unknown", "mission handoff evidence persistence failed: "+err.Error(), "agent", true)
+		}
+		watch, loadErr := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
+		if loadErr == nil {
+			a.trackFlightCompletion(watch)
+		} else if !errors.Is(loadErr, sql.ErrNoRows) {
+			return e, save("outcome_unknown", "mission completion tracking unavailable: "+loadErr.Error(), "agent", true)
 		}
 	}
 	execution, cancel := context.WithTimeout(ctx, 20*time.Second)

@@ -1,5 +1,17 @@
 # Flight completion evidence
 
+The MAVLink reader reduces observations into a constant-size accumulator per
+unfinished target. It retains airborne, terminal, and fresh landed/disarmed
+milestones while SQLite is busy; only persistence wakeups coalesce. A worker
+validates durable applied start authority before committing these facts and
+retries failed writes. Shutdown drains within its existing deadline. As with
+other uncommitted observations, a process crash before persistence can lose
+in-memory evidence; the accumulator does not claim crash durability before commit.
+
+Startup revalidates older watch indexes for a complete terminal RTL/LAND mission
+structure. Invalid payloads remain preserved and quarantined, and cannot reach
+the completion reducer.
+
 Completion tracking is bound to the immutable, applied MISSION_START command and
 its verified terminal RTL/LAND mission. It requires observed airborne state,
 terminal mission progress (or early RTL/LAND), and landed/disarmed samples within

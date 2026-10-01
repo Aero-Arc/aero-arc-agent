@@ -17,6 +17,60 @@ import (
 	"testing"
 )
 
+func TestIncompleteMissionWatchesAreQuarantinedOnUpgrade(t *testing.T) {
+	for _, indexed := range []bool{false, true} {
+		for _, shape := range []string{"execution", "plan", "items", "terminal"} {
+			t.Run(fmt.Sprintf("%s-indexed-%v", shape, indexed), func(t *testing.T) {
+				ctx := context.Background()
+				path := filepath.Join(t.TempDir(), "watch.db")
+				w, err := New(ctx, path, 0, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c := &pb.DurableCommand{CommandId: "start", Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 20}}}}}}
+				switch shape {
+				case "execution":
+					c.Execution = nil
+				case "plan":
+					c.GetMavlink().MissionPrecondition = nil
+				case "items":
+					c.GetMavlink().MissionPrecondition.Items = nil
+				case "terminal":
+					c.GetMavlink().MissionPrecondition.Items[0].Command = 16
+				}
+				raw, err := json.Marshal(FlightWatch{Target: "target", HandoffAt: 1, Command: c})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = w.db.Exec(`INSERT INTO flight_watches(flight_id,start_command_id,payload) VALUES('flight','start',?)`, raw); err != nil {
+					t.Fatal(err)
+				}
+				if indexed {
+					if _, err = w.db.Exec(`INSERT INTO flight_watch_index(flight_id,target,done) VALUES('flight','target',0)`); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err = w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				w, err = New(ctx, path, 0, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer w.Close()
+				var reason string
+				var preserved []byte
+				if err = w.db.QueryRow(`SELECT i.quarantine_reason,w.payload FROM flight_watch_index i JOIN flight_watches w USING(flight_id) WHERE flight_id='flight'`).Scan(&reason, &preserved); err != nil || reason == "" || !bytes.Equal(raw, preserved) {
+					t.Fatalf("quarantine failed: %q %v", reason, err)
+				}
+				if _, err = w.LoadUnresolvedFlightWatch(ctx, "target"); err == nil {
+					t.Fatal("quarantined watch admitted")
+				}
+			})
+		}
+	}
+}
+
 func TestFlightWatchReplacementRequiresRejectedUnflownStart(t *testing.T) {
 	ctx := context.Background()
 	w, err := New(ctx, filepath.Join(t.TempDir(), "watch.db"), 0, 0)
@@ -136,7 +190,7 @@ func TestFlightWatchIndexMigratesHistoryAndIsolatesCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := &pb.DurableCommand{CommandId: "healthy", Context: &pb.OperationContext{FlightId: "healthy-flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 20}}}}}}
+	command := &pb.DurableCommand{CommandId: "healthy", Context: &pb.OperationContext{FlightId: "healthy-flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 20}}}}}}
 	evidence, _ := proto.Marshal(&pb.CommandEvidence{Events: []*pb.CommandEvent{{Stage: "applied"}}})
 	if err = w.AdmitCommand(ctx, command.CommandId, CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: evidence}); err != nil {
 		t.Fatal(err)

@@ -421,6 +421,9 @@ func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (Fli
 		if watch.Target != target || watch.Done || watch.Command.GetCommandId() == "" || watch.Command.GetContext().GetFlightId() == "" {
 			return FlightWatch{}, errors.New("flight watch disagrees with indexed authority")
 		}
+		if err = validateFlightWatchStructure(watch); err != nil {
+			return FlightWatch{}, err
+		}
 		if err = proto.Unmarshal(evidence, &events); err != nil {
 			return FlightWatch{}, err
 		}
@@ -444,4 +447,26 @@ func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (Fli
 		return FlightWatch{}, sql.ErrNoRows
 	}
 	return *found, nil
+}
+
+// UnresolvedFlightWatchTargets lists indexed unfinished target identities for
+// restoring process-local completion tracking before MAVLink ingest begins.
+// Parameters: ctx bounds the query. Returns distinct targets or a storage error.
+// Callers must still load each target through LoadUnresolvedFlightWatch, which
+// validates command authority and rejects ambiguous or quarantined ownership.
+func (w *WAL) UnresolvedFlightWatchTargets(ctx context.Context) ([]string, error) {
+	rows, err := w.db.QueryContext(ctx, `SELECT DISTINCT target FROM flight_watch_index WHERE done=0 AND target<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var targets []string
+	for rows.Next() {
+		var target string
+		if err := rows.Scan(&target); err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	return targets, rows.Err()
 }

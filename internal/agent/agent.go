@@ -202,6 +202,9 @@ type Agent struct {
 	durableFlightCompletion bool
 	operationContext        *wal.OperationContext
 	sendMu                  sync.Mutex
+	completionMu            sync.Mutex
+	completionTrackers      map[string]*completionTracker
+	completionWake          chan struct{}
 
 	c2AdmissionMu         sync.Mutex
 	c2Mu                  sync.Mutex
@@ -525,10 +528,13 @@ func (a *Agent) runMAVLink(ctx context.Context) error {
 // observed telemetry is counted and dropped rather than allowing an unbounded
 // heap or preventing COMMAND_ACK and heartbeat state from being observed.
 func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Event) error {
-	completionQueue := make(chan completionObservation, 64)
+	if err := a.restoreCompletionTrackers(ctx); err != nil {
+		return fmt.Errorf("restore completion tracking: %w", err)
+	}
+	completionClosed := make(chan struct{})
 	completionCtx, stopCompletion := context.WithCancel(context.Background())
 	completionDone := make(chan struct{})
-	go func() { defer close(completionDone); a.runCompletionObservations(completionCtx, completionQueue) }()
+	go func() { defer close(completionDone); a.runCompletionObservations(completionCtx, completionClosed) }()
 
 	queueSize := 1000
 	if a.options != nil && a.options.EventQueueSize > 0 {
@@ -546,7 +552,7 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 	}()
 	defer func() {
 		close(telemetryQueue)
-		close(completionQueue)
+		close(completionClosed)
 		drainTimeout := defaultTelemetryPersistenceDrainTimeout
 		if a.telemetryDrainTimeout > 0 {
 			drainTimeout = a.telemetryDrainTimeout
@@ -574,11 +580,7 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 				// backpressure must never make a valid aircraft ACK time out.
 				a.observeMAVLinkFrame(frameEvt)
 				if observation, ok := a.completionObservation(frameEvt); ok {
-					select {
-					case completionQueue <- observation:
-					default:
-						slog.Warn("completion observation queue saturated; awaiting fresh evidence")
-					}
+					a.accumulateCompletion(observation)
 				}
 				slog.LogAttrs(
 					ctx, slog.LevelDebug,

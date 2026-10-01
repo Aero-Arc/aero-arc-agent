@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log/slog"
 	"time"
 
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -12,6 +11,7 @@ import (
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/google/uuid"
+	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -77,9 +77,10 @@ func (a *Agent) completionObservation(frame *gomavlib.EventFrame) (completionObs
 	return o, true
 }
 
-func (a *Agent) runCompletionObservations(ctx context.Context, queue <-chan completionObservation) {
-	epoch := uuid.NewString()
-	samples := completionSamples{}
+func (a *Agent) runCompletionObservations(ctx context.Context, closed <-chan struct{}) {
+	a.completionMu.Lock()
+	wake := a.completionWake
+	a.completionMu.Unlock()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -87,16 +88,21 @@ func (a *Agent) runCompletionObservations(ctx context.Context, queue <-chan comp
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			a.flushCompletionTrackers(ctx)
 			a.requestCompletionObservations(ctx)
-		case o, ok := <-queue:
-			if !ok {
-				return
-			}
-			if a.wal == nil {
-				continue
-			}
-			if err := a.observeCompletion(ctx, o, epoch, &samples); err != nil && ctx.Err() == nil && !errors.Is(err, sql.ErrNoRows) {
-				slog.Error("flight completion evidence persistence failed", "error", err)
+		case <-wake:
+			a.flushCompletionTrackers(ctx)
+		case <-closed:
+			for {
+				a.flushCompletionTrackers(ctx)
+				if !a.completionWritesPending() {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
 			}
 		}
 	}
@@ -137,6 +143,24 @@ func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, 
 	if c.Context.AircraftId != o.context.AircraftId || c.Context.IntentId != o.context.IntentId || c.Context.IntentVersion != o.context.IntentVersion || watch.HandoffAt == 0 || o.at < watch.HandoffAt {
 		return nil
 	}
+	changed, completion, err := reduceCompletion(&watch, o, epoch, samples)
+	if err != nil {
+		return err
+	}
+	if changed {
+		return a.wal.SaveFlightWatch(ctx, watch, completion)
+	}
+	return nil
+}
+
+// reduceCompletion performs no I/O: bounded state retains milestones even when
+// the persistence worker is blocked. Samples retain their original capture times.
+func reduceCompletion(watch *wal.FlightWatch, o completionObservation, epoch string, samples *completionSamples) (bool, *pb.FlightCompletionEvidence, error) {
+	if watch.Done || watch.Target != o.target || watch.HandoffAt == 0 || o.at < watch.HandoffAt {
+		return false, nil, nil
+	}
+	c := watch.Command
+	o.context = c.Context
 	if samples.flight != o.context.FlightId || samples.target != o.target || samples.channel != o.channel {
 		*samples = completionSamples{flight: o.context.FlightId, target: o.target, channel: o.channel}
 	}
@@ -156,7 +180,7 @@ func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, 
 		changed = true
 	}
 	if watch.AirborneAt == 0 {
-		return nil
+		return false, nil, nil
 	}
 	if watch.TerminalAt == 0 {
 		if o.kind == "mission" && samples.mode == 3 && samples.armed && fresh(samples.heartbeatAt) && (o.sequence == uint32(len(c.GetMavlink().MissionPrecondition.Items)) || o.missionState == uint32(common.MISSION_STATE_COMPLETE)) {
@@ -172,16 +196,13 @@ func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, 
 	if watch.TerminalAt > 0 && !samples.armed && samples.landed == uint32(common.MAV_LANDED_STATE_ON_GROUND) && fresh(samples.heartbeatAt) && fresh(samples.landedAt) && samples.heartbeatAt >= watch.TerminalAt && samples.landedAt >= watch.TerminalAt {
 		digest, err := missiondigest.Digest(c.GetMavlink().MissionPrecondition)
 		if err != nil {
-			return err
+			return false, nil, err
 		}
 		evidence := &pb.FlightCompletionEvidence{EventId: uuid.NewSHA1(uuid.NameSpaceOID, []byte(c.CommandId+"/flight-completion")).String(), AgentId: c.AgentId, Context: c.Context, MissionId: c.GetMavlink().MissionPreconditionId, MissionDigest: digest, StartCommandId: c.CommandId, Outcome: watch.Outcome, AirborneAtUnixNs: watch.AirborneAt, TerminalAtUnixNs: watch.TerminalAt, LandedAtUnixNs: samples.landedAt, DisarmedAtUnixNs: samples.heartbeatAt, ObservationEpoch: epoch}
 		watch.Done = true
-		return a.wal.SaveFlightWatch(ctx, watch, evidence)
+		return true, evidence, nil
 	}
-	if changed {
-		return a.wal.SaveFlightWatch(ctx, watch, nil)
-	}
-	return nil
+	return changed, nil, nil
 }
 
 func (a *Agent) runCompletionDelivery(ctx context.Context, stream grpc.BidiStreamingClient[pb.AgentStreamMessage, pb.RelayStreamMessage]) error {
