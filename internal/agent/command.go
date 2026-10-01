@@ -405,7 +405,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		<-pending.frames
 	}
 	if c.Definition == "MISSION_START" {
-		if err = a.wal.BeginFlightWatch(ctx, c, completionTargetIdentity(target)); err != nil {
+		if err = a.wal.BeginFlightWatch(ctx, c, a.completionTargetIdentity(target)); err != nil {
 			return reject("flight watch preparation failed before effect: " + err.Error())
 		}
 	}

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"time"
 
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -55,7 +57,7 @@ func (a *Agent) completionObservation(frame *gomavlib.EventFrame) (completionObs
 		a.stateMu.RUnlock()
 		return completionObservation{}, false
 	}
-	o := completionObservation{target: completionTargetIdentity(target), channel: frame.Channel, context: &pb.OperationContext{AircraftId: current.AircraftID, FlightId: current.FlightID, IntentId: current.IntentID, IntentVersion: current.IntentVersion}, at: time.Now().UnixNano()}
+	o := completionObservation{target: a.completionTargetIdentity(target), channel: frame.Channel, context: &pb.OperationContext{AircraftId: current.AircraftID, FlightId: current.FlightID, IntentId: current.IntentID, IntentVersion: current.IntentVersion}, at: time.Now().UnixNano()}
 	a.stateMu.RUnlock()
 	switch m := frame.Message().(type) {
 	case *common.MessageHeartbeat:
@@ -253,9 +255,29 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 // The endpoint and MAVLink identity/profile survive process restart. A changed
 // endpoint or autopilot identity requires explicit recovery, never automatic
 // rebinding of a flight watch. MAVLink IDs are not cryptographic hardware IDs.
-func completionTargetIdentity(target *mavlinkTarget) string {
+func (a *Agent) completionTargetIdentity(target *mavlinkTarget) string {
 	if target == nil || target.channel == nil {
 		return ""
 	}
-	return fmt.Sprintf("%s/%d/%d/%d/%d", target.channel.String(), target.systemID, target.componentID, target.vehicleType, target.autopilot)
+	if a.options == nil {
+		return ""
+	}
+	endpoint := ""
+	if a.options.Debug {
+		address := strings.TrimSpace(a.options.DebugMAVLinkAddress)
+		if address == "" {
+			address = "0.0.0.0:14550"
+		}
+		endpoint = "udp-server:" + address
+	} else {
+		if a.options.SerialPath == "" {
+			return ""
+		}
+		path, err := filepath.Abs(a.options.SerialPath)
+		if err != nil {
+			return ""
+		}
+		endpoint = "serial:" + path
+	}
+	return fmt.Sprintf("%s/%d/%d/%d/%d", endpoint, target.systemID, target.componentID, target.vehicleType, target.autopilot)
 }

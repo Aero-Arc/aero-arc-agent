@@ -187,7 +187,7 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	watch.Target = "/1/1/2/3"
+	watch.Target = "udp-server:0.0.0.0:14550/1/1/2/3"
 	watch.HandoffAt = time.Now().Add(-2 * time.Second).UnixNano()
 	watch.AirborneAt = time.Now().Add(-time.Second).UnixNano()
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
@@ -213,7 +213,7 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	}
 	channel := &gomavlib.Channel{}
 	accepted := make(chan struct{})
-	a := &Agent{wal: w, options: &AgentOptions{}, operationContext: &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}, mavlinkTarget: &mavlinkTarget{channel: channel, systemID: 1, componentID: 1}, appendTelemetryFrame: func(context.Context, *pb.TelemetryFrame) error { close(accepted); return nil }}
+	a := &Agent{wal: w, options: &AgentOptions{Debug: true}, operationContext: &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}, mavlinkTarget: &mavlinkTarget{channel: channel, systemID: 1, componentID: 1}, appendTelemetryFrame: func(context.Context, *pb.TelemetryFrame) error { close(accepted); return nil }}
 	events := make(chan gomavlib.Event)
 	done := make(chan error, 1)
 	go func() { done <- a.runMAVLinkEvents(ctx, events) }()
@@ -323,5 +323,25 @@ func TestCompletionPollingRequiresAppliedNonRejectedStart(t *testing.T) {
 				t.Fatalf("writes=%d want=%d", writes, want)
 			}
 		})
+	}
+}
+
+func TestCompletionTargetUsesConfiguredEndpoint(t *testing.T) {
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	a := &Agent{options: &AgentOptions{SerialPath: "/dev/serial/by-id/aircraft-a"}}
+	first := a.completionTargetIdentity(target)
+	a.options.SerialPath = "/dev/serial/by-id/aircraft-b"
+	if first == "" || first == a.completionTargetIdentity(target) {
+		t.Fatal("distinct serial devices share completion identity")
+	}
+	a.options = &AgentOptions{Debug: true, DebugMAVLinkAddress: "127.0.0.1:14550"}
+	first = a.completionTargetIdentity(target)
+	target.channel = &gomavlib.Channel{}
+	if first != a.completionTargetIdentity(target) {
+		t.Fatal("runtime channel replacement changed configured UDP identity")
+	}
+	a.options.DebugMAVLinkAddress = "127.0.0.1:14560"
+	if first == a.completionTargetIdentity(target) {
+		t.Fatal("changed configured UDP endpoint retained identity")
 	}
 }
