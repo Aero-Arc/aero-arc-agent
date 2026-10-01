@@ -15,10 +15,13 @@ import (
 
 type missionTransactionTarget struct {
 	readbackHandoff bool
+	profileChanged  bool
 	readbackAfter   time.Time
 	channel         *gomavlib.Channel
 	systemID        uint8
 	componentID     uint8
+	autopilot       common.MAV_AUTOPILOT
+	vehicleType     common.MAV_TYPE
 }
 
 func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
@@ -45,7 +48,10 @@ func (a *Agent) observeMissionProtocolMessageAt(frame *gomavlib.EventFrame, arri
 	}
 	target := a.pendingMissionTarget
 	events := a.pendingMissionEvents
-	matched := target != nil && !target.readbackHandoff && !arrivedAt.Before(target.readbackAfter) && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
+	matched := target != nil && !target.profileChanged && !target.readbackHandoff && !arrivedAt.Before(target.readbackAfter) && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
+	if current := a.mavlinkTarget; current != nil && target != nil && current.channel == target.channel && current.systemID == target.systemID && current.componentID == target.componentID && (current.autopilot != target.autopilot || current.vehicleType != target.vehicleType) {
+		matched = false
+	}
 	if !matched || events == nil {
 		return
 	}
@@ -92,6 +98,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	a.pendingMissionEvents = events
 	a.pendingMissionTarget = &missionTransactionTarget{
 		channel: target.channel, systemID: target.systemID, componentID: target.componentID,
+		autopilot: target.autopilot, vehicleType: target.vehicleType,
 	}
 	a.mavlinkMu.Unlock()
 	defer func() {

@@ -273,7 +273,7 @@ func TestUncertainRecoveryObservesWithoutAppliedOrAnotherEffect(t *testing.T) {
 				p := a.c2Pending
 				a.mavlinkMu.Unlock()
 				if p != nil {
-					a.observeC2Frame(&gomavlib.EventFrame{Channel: p.target.channel, Frame: &frame.V2Frame{SystemID: p.target.systemID, ComponentID: p.target.componentID, Message: &common.MessageHeartbeat{BaseMode: common.MAV_MODE_FLAG_SAFETY_ARMED}}})
+					a.observeC2Frame(&gomavlib.EventFrame{Channel: p.target.channel, Frame: &frame.V2Frame{SystemID: p.target.systemID, ComponentID: p.target.componentID, Message: &common.MessageHeartbeat{BaseMode: common.MAV_MODE_FLAG_SAFETY_ARMED, Type: p.target.vehicleType, Autopilot: p.target.autopilot}}})
 				}
 			}
 		}
