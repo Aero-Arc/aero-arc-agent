@@ -915,20 +915,28 @@ func (w *WAL) ReserveMissionDeployment(ctx context.Context, commandID, fingerpri
 		return MissionDeploymentRecord{}, false, fmt.Errorf("begin mission deployment reservation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var operationExists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM operation_context_commands WHERE command_id = ?)`, commandID).Scan(&operationExists); err != nil {
-		return MissionDeploymentRecord{}, false, fmt.Errorf("check mission command ID namespace: %w", err)
-	}
-	if operationExists {
-		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
-	}
 	now := time.Now().UnixNano()
+	// Acquire the writer lock before checking both command namespaces.
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO mission_deployments
 		(command_id, payload_fingerprint, command_payload, state, created_at, updated_at)
 		VALUES(?, ?, ?, 'prepared', ?, ?)`, commandID, fingerprint, payload, now, now)
 	if err != nil {
 		return MissionDeploymentRecord{}, false, fmt.Errorf("reserve mission deployment: %w", err)
+	}
+	var operationExists bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM operation_context_commands WHERE command_id=?)`, commandID).Scan(&operationExists); err != nil {
+		return MissionDeploymentRecord{}, false, err
+	}
+	if operationExists {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
+	var commandPayload []byte
+	err = tx.QueryRowContext(ctx, `SELECT payload FROM c2_commands WHERE command_id=?`, commandID).Scan(&commandPayload)
+	if err == nil && !pairedMissionCommand(commandID, commandPayload, payload) {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return MissionDeploymentRecord{}, false, err
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {

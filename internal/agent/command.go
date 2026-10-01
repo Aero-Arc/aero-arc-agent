@@ -174,6 +174,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	e := &pb.CommandEvidence{CommandId: c.CommandId, CommandDigest: digest}
 	effectOwned := false
 	save := func(stage, msg, source string, effect bool) error {
+		previousEvents := len(e.Events)
 		if stage != "" && !hasStage(e, stage) {
 			e.Events = append(e.Events, commandEvent(c, stage, msg, source))
 		}
@@ -192,6 +193,16 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 			return err
 		}
 		err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
+		if errors.Is(err, wal.ErrObservationSuperseded) {
+			e.Events = e.Events[:previousEvents]
+			if !hasStage(e, "observation_superseded") {
+				e.Events = append(e.Events, commandEvent(c, "observation_superseded", "newer aircraft effect prevents attributing this observation", "agent_journal"))
+			}
+			b, err = proto.Marshal(e)
+			if err == nil {
+				err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
+			}
+		}
 		if err == nil && stage != "" && emit != nil {
 			emit(proto.Clone(e).(*pb.CommandEvidence))
 		}

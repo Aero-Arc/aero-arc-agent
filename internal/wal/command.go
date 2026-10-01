@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -11,6 +12,9 @@ import (
 
 // ErrCommandSuperseded means a newer admitted command already began an effect.
 var ErrCommandSuperseded = errors.New("command superseded before first effect")
+
+// ErrObservationSuperseded means newer durable or legacy effects prevent attribution.
+var ErrObservationSuperseded = errors.New("command observation superseded")
 
 // ErrCommandIdentityConflict identifies reuse of a command ID for different authority.
 var ErrCommandIdentityConflict = errors.New("command identity conflict")
@@ -57,6 +61,14 @@ func (w *WAL) AdmitCommand(ctx context.Context, id string, r CommandRecord) erro
 	if conflict {
 		return ErrCommandIdentityConflict
 	}
+	var missionPayload []byte
+	err = tx.QueryRowContext(ctx, `SELECT command_payload FROM mission_deployments WHERE command_id=?`, id).Scan(&missionPayload)
+	if err == nil && !pairedMissionCommand(id, r.Payload, missionPayload) {
+		return ErrCommandIdentityConflict
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	var digest string
 	if err = tx.QueryRowContext(ctx, `SELECT digest FROM c2_commands WHERE command_id=?`, id).Scan(&digest); err != nil {
 		return err
@@ -72,7 +84,9 @@ func (w *WAL) AdmitCommand(ctx context.Context, id string, r CommandRecord) erro
 //
 // Parameters: ctx bounds the transaction; id and digest bind evidence; evidence contains immutable protobuf events; effect preserves the irreversible fence.
 //
-// Returns: Nil after atomic merge; conflicting evidence, identity mismatch, and storage errors roll back.
+// Returns: nil after atomic merge; ErrObservationSuperseded if a new observed
+// event crosses a newer durable or legacy effect. Existing observations replay
+// unchanged. Conflicting evidence, identity mismatch, and storage errors roll back.
 func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byte, effect bool) error {
 	incoming := &pb.CommandEvidence{}
 	if err := proto.Unmarshal(evidence, incoming); err != nil {
@@ -107,6 +121,15 @@ func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byt
 			}
 		}
 		if !found {
+			if event.Stage == "observed" {
+				var latest bool
+				if err = tx.QueryRowContext(ctx, `SELECT rowid>COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) AND rowid=(SELECT MAX(rowid) FROM c2_commands WHERE effect_started=1) FROM c2_commands WHERE command_id=?`, id).Scan(&latest); err != nil {
+					return err
+				}
+				if !latest {
+					return ErrObservationSuperseded
+				}
+			}
 			merged.Events = append(merged.Events, event)
 		}
 	}
@@ -167,4 +190,14 @@ func (w *WAL) BeginCommandEffect(ctx context.Context, id, digest string) (bool, 
 func (w *WAL) RecordLegacyAircraftEffect(ctx context.Context) error {
 	_, err := w.db.ExecContext(ctx, `INSERT INTO legacy_aircraft_effect(id,c2_rowid) SELECT 1,COALESCE(MAX(rowid),0) FROM c2_commands WHERE true ON CONFLICT(id) DO UPDATE SET c2_rowid=MAX(c2_rowid,excluded.c2_rowid)`)
 	return err
+}
+
+// Only an exact embedded deployment may share an ID with its durable envelope.
+func pairedMissionCommand(id string, commandRaw, missionRaw []byte) bool {
+	var command pb.DurableCommand
+	var mission pb.DeployMissionCommand
+	if proto.Unmarshal(commandRaw, &command) != nil || proto.Unmarshal(missionRaw, &mission) != nil {
+		return false
+	}
+	return command.CommandId == id && mission.CommandId == id && command.GetMission() != nil && proto.Equal(command.GetMission(), &mission)
 }
