@@ -193,6 +193,10 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 			return err
 		}
 		err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
+		if errors.Is(err, wal.ErrCommandSuperseded) {
+			e.Events = e.Events[:previousEvents]
+			return err
+		}
 		if errors.Is(err, wal.ErrObservationSuperseded) {
 			e.Events = e.Events[:previousEvents]
 			if !hasStage(e, "observation_superseded") {
