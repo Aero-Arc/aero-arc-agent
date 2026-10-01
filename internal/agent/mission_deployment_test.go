@@ -1418,3 +1418,59 @@ func TestMissionRecoveryCannotChangeAutopilotTarget(t *testing.T) {
 		}
 	}
 }
+
+func TestMissionUploadRevalidatesAfterDurableFence(t *testing.T) {
+	for _, change := range []string{"armed", "target", "heartbeat", "landed", "deadline", "canceled"} {
+		t.Run(change, func(t *testing.T) {
+			command := validMissionCommand(t, "post-fence-"+change)
+			now := time.Now()
+			target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
+				landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
+			a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			fenced := false
+			target.beforeMissionEffect = func(_ *mavlinkTarget) error {
+				fenced = true
+				a.mavlinkMu.Lock()
+				switch change {
+				case "armed":
+					a.mavlinkTarget.armed = true
+				case "target":
+					a.mavlinkTarget = &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 2}
+				case "heartbeat":
+					a.mavlinkTarget.heartbeatAt = now.Add(-2 * missionEvidenceTTL)
+				case "landed":
+					a.mavlinkTarget.landedState = common.MAV_LANDED_STATE_IN_AIR
+				case "canceled":
+					cancel()
+				}
+				a.mavlinkMu.Unlock()
+				if change == "deadline" {
+					time.Sleep(time.Until(time.UnixMilli(command.ExpiresAtUnixMs)) + 2*time.Millisecond)
+				}
+				return nil
+			}
+			home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
+			writes := 0
+			a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+				switch value := outbound.(type) {
+				case *common.MessageMissionRequestList:
+					a.pendingMissionEvents <- &common.MessageMissionCount{Count: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+				case *common.MessageMissionRequestInt:
+					a.pendingMissionEvents <- missionItemINT(target, home, value.Seq)
+				case *common.MessageMissionCount:
+					writes++
+				}
+				return nil
+			}
+			if change == "deadline" {
+				command.ExpiresAtUnixMs = time.Now().Add(200 * time.Millisecond).UnixMilli()
+			}
+			_, _, _, err := a.executeMAVLinkMissionDeployment(ctx, target, command.Plan, false, command.ExpiresAtUnixMs)
+			if err == nil || !fenced || writes != 0 {
+				t.Fatalf("error=%v fenced=%v mission writes=%d", err, fenced, writes)
+			}
+		})
+	}
+}

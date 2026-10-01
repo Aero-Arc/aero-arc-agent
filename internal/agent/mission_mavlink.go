@@ -133,6 +133,17 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 			return "", 0, nil, err
 		}
 	}
+	// The durable fence can wait on SQLite. Revalidate evidence and the effect
+	// deadline after it returns, immediately before the transport handoff.
+	if err := a.ensureMissionUploadSafe(target); err != nil {
+		return "", 0, nil, err
+	}
+	if expiresAtUnixMs <= 0 || time.Now().UnixMilli() > expiresAtUnixMs {
+		return "", 0, nil, errors.New("mission effect deadline expired after durable fence")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, nil, err
+	}
 	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionCount{
 		TargetSystem: target.systemID, TargetComponent: target.componentID,
 		Count: uint16(len(plan.Items) + 1), MissionType: common.MAV_MISSION_TYPE_MISSION,
