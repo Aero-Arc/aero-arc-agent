@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"github.com/makinje/aero-arc-agent/internal/wal"
 	"log/slog"
 	"time"
 
@@ -104,22 +103,16 @@ func (a *Agent) runCompletionObservations(ctx context.Context, queue <-chan comp
 }
 
 func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, epoch string, samples *completionSamples) error {
-	if o.context == nil {
-		// Resolve historical authority off the MAVLink capture path. Clearing
-		// active context must not discard an applied start's completion evidence.
-		watch, err := a.wal.LoadUnresolvedFlightWatch(ctx, o.target)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		o.context = watch.Command.Context
+	// Active planning context can be cleared or replaced independently of this
+	// aircraft's unfinished flight. Only persisted start authority owns completion.
+	watch, err := a.wal.LoadUnresolvedFlightWatch(ctx, o.target)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
 	}
-	watch, err := a.wal.LoadFlightWatch(ctx, o.context.FlightId)
 	if err != nil {
 		return err
 	}
+	o.context = watch.Command.Context
 	if watch.Done || watch.Target == "" || watch.Target != o.target {
 		return nil
 	}
@@ -224,26 +217,13 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 	if a.wal == nil || a.writeMAVLinkCommand == nil {
 		return
 	}
-	a.stateMu.RLock()
-	current := a.operationContext
-	flightID := ""
-	if current != nil {
-		flightID = current.FlightID
-	}
-	a.stateMu.RUnlock()
 	a.mavlinkMu.Lock()
 	var target mavlinkTarget
 	if a.mavlinkTarget != nil {
 		target = *a.mavlinkTarget
 	}
 	a.mavlinkMu.Unlock()
-	var watch wal.FlightWatch
-	var err error
-	if flightID == "" {
-		watch, err = a.wal.LoadUnresolvedFlightWatch(ctx, a.completionTargetIdentity(&target))
-	} else {
-		watch, err = a.wal.LoadFlightWatch(ctx, flightID)
-	}
+	watch, err := a.wal.LoadUnresolvedFlightWatch(ctx, a.completionTargetIdentity(&target))
 	if err != nil || watch.Done {
 		return
 	}

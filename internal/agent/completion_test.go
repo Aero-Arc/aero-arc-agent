@@ -53,6 +53,8 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 				t.Helper()
 				if o.at < int64(2*time.Second) || o.target != "test-target" {
 					o.context = binding
+				} else if early {
+					o.context = &pb.OperationContext{FlightId: "next-flight", IntentId: "next-intent", IntentVersion: 2, AircraftId: binding.AircraftId}
 				}
 				o.at += at
 				if err := a.observeCompletion(ctx, o, "epoch", &samples); err != nil {
@@ -333,6 +335,12 @@ func TestCompletionPollingRequiresAppliedNonRejectedStart(t *testing.T) {
 			a.requestCompletionObservations(ctx)
 			if writes != want {
 				t.Fatalf("cleared context stopped polling: %d want %d", writes, want)
+			}
+			writes = 0
+			a.operationContext = &wal.OperationContext{FlightID: "next-flight", IntentVersion: 2}
+			a.requestCompletionObservations(ctx)
+			if writes != want {
+				t.Fatalf("replacement context stopped polling: %d want %d", writes, want)
 			}
 			writes = 0
 			a.options.DebugMAVLinkAddress = "127.0.0.1:15550"
