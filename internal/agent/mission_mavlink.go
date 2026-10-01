@@ -14,12 +14,21 @@ import (
 )
 
 type missionTransactionTarget struct {
-	channel     *gomavlib.Channel
-	systemID    uint8
-	componentID uint8
+	readbackHandoff bool
+	profileChanged  bool
+	readbackAfter   time.Time
+	channel         *gomavlib.Channel
+	systemID        uint8
+	componentID     uint8
+	autopilot       common.MAV_AUTOPILOT
+	vehicleType     common.MAV_TYPE
 }
 
 func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
+	a.observeMissionProtocolMessageAt(frame, time.Now())
+}
+
+func (a *Agent) observeMissionProtocolMessageAt(frame *gomavlib.EventFrame, arrivedAt time.Time) {
 	if frame == nil {
 		return
 	}
@@ -33,10 +42,16 @@ func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
 		return
 	}
 	a.mavlinkMu.Lock()
+	defer a.mavlinkMu.Unlock()
+	if current := a.mavlinkTarget; current != nil && current.channel == frame.Channel && current.systemID == frame.SystemID() && current.componentID == frame.ComponentID() {
+		a.protocolQuiet.mission = time.Now()
+	}
 	target := a.pendingMissionTarget
 	events := a.pendingMissionEvents
-	matched := target != nil && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
-	a.mavlinkMu.Unlock()
+	matched := target != nil && !target.profileChanged && !target.readbackHandoff && !arrivedAt.Before(target.readbackAfter) && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
+	if current := a.mavlinkTarget; current != nil && target != nil && current.channel == target.channel && current.systemID == target.systemID && current.componentID == target.componentID && (current.autopilot != target.autopilot || current.vehicleType != target.vehicleType) {
+		matched = false
+	}
 	if !matched || events == nil {
 		return
 	}
@@ -83,11 +98,13 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	a.pendingMissionEvents = events
 	a.pendingMissionTarget = &missionTransactionTarget{
 		channel: target.channel, systemID: target.systemID, componentID: target.componentID,
+		autopilot: target.autopilot, vehicleType: target.vehicleType,
 	}
 	a.mavlinkMu.Unlock()
 	defer func() {
 		a.mavlinkMu.Lock()
 		if a.pendingMissionEvents == events {
+			a.protocolQuiet.mission = time.Now()
 			a.pendingMissionEvents = nil
 			a.pendingMissionTarget = nil
 		}
@@ -107,6 +124,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	if plan == nil || len(plan.Items) == 0 {
 		return "", 0, nil, errors.New("replacement mission requires at least one canonical item")
 	}
+	beforeEffect := target.beforeMissionEffect
 	home, err := a.readbackMAVLinkHome(ctx, target, events, plan.Items[0])
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("pre-upload HOME readback: %w", err)
@@ -121,6 +139,22 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 	}
 	if expiresAtUnixMs <= 0 || time.Now().UnixMilli() > expiresAtUnixMs {
 		return "", 0, nil, errors.New("mission effect deadline expired before MISSION_COUNT handoff")
+	}
+	if beforeEffect != nil {
+		if err := beforeEffect(target); err != nil {
+			return "", 0, nil, err
+		}
+	}
+	// The durable fence can wait on SQLite. Revalidate evidence and the effect
+	// deadline after it returns, immediately before the transport handoff.
+	if err := a.ensureMissionUploadSafe(target); err != nil {
+		return "", 0, nil, err
+	}
+	if expiresAtUnixMs <= 0 || time.Now().UnixMilli() > expiresAtUnixMs {
+		return "", 0, nil, errors.New("mission effect deadline expired after durable fence")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, nil, err
 	}
 	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionCount{
 		TargetSystem: target.systemID, TargetComponent: target.componentID,
@@ -248,7 +282,7 @@ func (a *Agent) executeMAVLinkMissionDeployment(ctx context.Context, target *mav
 func (a *Agent) refreshMissionUploadSafetyEvidence(ctx context.Context, expected *mavlinkTarget) (*mavlinkTarget, error) {
 	a.mavlinkMu.Lock()
 	current := a.mavlinkTarget
-	if current == nil || expected == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID {
+	if current == nil || expected == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID || current.autopilot != expected.autopilot || current.vehicleType != expected.vehicleType {
 		a.mavlinkMu.Unlock()
 		return nil, errors.New("selected autopilot target changed during HOME readback")
 	}
@@ -265,6 +299,9 @@ func (a *Agent) refreshMissionUploadSafetyEvidence(ctx context.Context, expected
 		}
 		target = *refreshed
 	}
+	if target.autopilot != expected.autopilot || target.vehicleType != expected.vehicleType {
+		return nil, errors.New("autopilot profile changed during safety refresh")
+	}
 	return &target, nil
 }
 
@@ -273,7 +310,7 @@ func (a *Agent) ensureMissionUploadSafe(expected *mavlinkTarget) error {
 	defer a.mavlinkMu.Unlock()
 	current := a.mavlinkTarget
 	now := time.Now()
-	if current == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID ||
+	if current == nil || current.channel != expected.channel || current.systemID != expected.systemID || current.componentID != expected.componentID || current.autopilot != expected.autopilot || current.vehicleType != expected.vehicleType ||
 		current.heartbeatAt.IsZero() || now.Sub(current.heartbeatAt) > missionEvidenceTTL || current.armed ||
 		current.landedState != common.MAV_LANDED_STATE_ON_GROUND || current.landedStateAt.IsZero() || now.Sub(current.landedStateAt) > missionEvidenceTTL {
 		return errors.New("fresh MAVLink evidence no longer shows the selected aircraft disarmed and on ground")
@@ -301,14 +338,14 @@ func (a *Agent) readbackMAVLinkMission(ctx context.Context, target *mavlinkTarge
 	return digestMissionPlan(&agentv1.MissionPlan{SchemaVersion: missionSchemaVersion, Items: canonical})
 }
 
-func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, emptyMissionPlaceholder *agentv1.MissionItem) (*agentv1.MissionItem, error) {
-	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, emptyMissionPlaceholder *agentv1.MissionItem) (_ *agentv1.MissionItem, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			a.resetMissionQuiet()
+		}
+	}()
+	if err := a.startMissionReadback(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish HOME readback epoch: %w", err)
-	}
-	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
-		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
-	}); err != nil {
-		return nil, err
 	}
 	responseTimeout := a.aircraftCommandTimeout()
 	timeout := time.NewTimer(responseTimeout)
@@ -400,17 +437,25 @@ func consumeReadyMissionEvent(events <-chan message.Message) bool {
 	}
 }
 
-// beginMissionReadbackEpoch terminates any earlier download and requires one
-// full response-timeout interval with no mission-protocol traffic before a new
+// beginMissionReadbackEpoch reuses a continuously observed idle interval or
+// terminates an earlier download and waits for protocol silence before a new
 // MISSION_REQUEST_LIST is sent. MAVLink mission messages have no transaction
 // identifier, so a delayed count from a timed-out request is otherwise
 // indistinguishable from the response to the next request and could decide a
 // durable recovery result.
 func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) error {
+	// Reuse an already-established idle epoch. On startup, target changes,
+	// traffic gaps or failed transfers the conservative cancellation path remains.
+	a.mavlinkMu.Lock()
+	idle := a.protocolQuietForLocked(target, 0, true, time.Now()) >= a.missionReadbackQuietPeriod()
+	a.mavlinkMu.Unlock()
+	if idle && !consumeReadyMissionEvent(events) {
+		return nil
+	}
 	if err := a.cancelMissionReadback(target); err != nil {
 		return fmt.Errorf("cancel prior mission readback: %w", err)
 	}
-	quietPeriod := a.aircraftCommandTimeout()
+	quietPeriod := a.missionReadbackQuietPeriod()
 	quiet := time.NewTimer(quietPeriod)
 	defer quiet.Stop()
 	overall := time.NewTimer(2 * quietPeriod)
@@ -438,14 +483,14 @@ func (a *Agent) readbackMAVLinkWireMission(ctx context.Context, target *mavlinkT
 	return a.readbackMAVLinkWireMissionWithin(ctx, target, events, responseTimeout, missionTransferOverallTimeout(responseTimeout, maxWireMissionItems+2))
 }
 
-func (a *Agent) readbackMAVLinkWireMissionWithin(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, responseTimeout, overallTimeout time.Duration) ([]*agentv1.MissionItem, error) {
-	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+func (a *Agent) readbackMAVLinkWireMissionWithin(ctx context.Context, target *mavlinkTarget, events <-chan message.Message, responseTimeout, overallTimeout time.Duration) (_ []*agentv1.MissionItem, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			a.resetMissionQuiet()
+		}
+	}()
+	if err := a.startMissionReadback(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish full mission readback epoch: %w", err)
-	}
-	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
-		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
-	}); err != nil {
-		return nil, err
 	}
 	timeout := time.NewTimer(responseTimeout)
 	defer timeout.Stop()
@@ -553,4 +598,43 @@ func boolByte(value bool) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// missionReadbackQuietPeriod separates stale-response fencing from the per-message
+// response timeout when explicitly configured. The default preserves the
+// previous guard duration, including installations with longer response timeouts.
+func (a *Agent) missionReadbackQuietPeriod() time.Duration {
+	if a.options != nil && a.options.MissionProtocolQuietPeriod > 0 {
+		return a.options.MissionProtocolQuietPeriod
+	}
+	return a.aircraftCommandTimeout()
+}
+
+// startMissionReadback closes receive admission while handing off the request.
+// Traffic arriving after the idle check cannot enter the next response epoch.
+func (a *Agent) startMissionReadback(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) error {
+	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+		return err
+	}
+	a.mavlinkMu.Lock()
+	pending := a.pendingMissionTarget
+	if pending != nil {
+		pending.readbackHandoff = true
+	}
+	for consumeReadyMissionEvent(events) {
+	}
+	a.mavlinkMu.Unlock()
+	err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
+		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
+	})
+	a.mavlinkMu.Lock()
+	if pending != nil && a.pendingMissionTarget == pending {
+		// Arrival is stamped before the observer takes mavlinkMu. An observer
+		// already waiting on that mutex cannot enter this new response epoch.
+		pending.readbackAfter = time.Now()
+		pending.readbackHandoff = false
+	}
+	a.protocolQuiet.mission = time.Now()
+	a.mavlinkMu.Unlock()
+	return err
 }

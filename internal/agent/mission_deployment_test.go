@@ -54,7 +54,7 @@ func TestRunAckLoopBoundsMissionDeploymentBurstWhileBusy(t *testing.T) {
 		},
 	}
 	done := make(chan error, 1)
-	go func() { done <- a.runAckLoop(context.Background(), stream) }()
+	go func() { done <- a.runAckLoop(context.Background(), stream, func() {}) }()
 	select {
 	case err := <-done:
 		if !errors.Is(err, io.EOF) {
@@ -374,15 +374,61 @@ func TestAcquireFreshLandedStateRejectsWrongTargetAndTimeout(t *testing.T) {
 	}
 }
 
+func TestMissionDeploymentMissingOwnershipDoesNotBecomeTerminalRejection(t *testing.T) {
+	a, closeWAL := testMissionAgent(t)
+	defer closeWAL()
+	ctx := context.Background()
+	command := validMissionCommand(t, "legacy-ownership")
+	raw, fingerprint, err := missionCommandIdentity(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = a.wal.ReserveMissionDeployment(ctx, command.CommandId, fingerprint, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.wal.BindMissionDeploymentTarget(ctx, command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	matched := false
+	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
+		if readbackOnly {
+			if matched {
+				return command.Binding.MissionDigest, 0, nil, nil
+			}
+			return "different", 0, nil, nil
+		}
+		return "", 0, nil, wal.ErrMissionEffectOwnershipUnknown
+	}
+	result := a.executeMissionDeployment(ctx, command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN {
+		t.Fatalf("missing ownership result = %+v", result)
+	}
+	record, err := a.wal.LoadMissionDeployment(ctx, command.CommandId)
+	if err != nil || record.State != "outcome_unknown" {
+		t.Fatalf("durable uncertainty lost: %+v %v", record, err)
+	}
+	matched = true
+	result = a.executeMissionDeployment(ctx, command)
+	if result.Status != agentv1.MissionDeploymentResult_STATUS_ALREADY_APPLIED {
+		t.Fatalf("later readback reconciliation = %+v", result)
+	}
+}
+
 func TestMissionDeploymentUnknownRetryReconcilesBeforeAnyUpload(t *testing.T) {
 	a, closeWAL := testMissionAgent(t)
 	defer closeWAL()
 	command := validMissionCommand(t, "uncertain-1")
 	digest := command.Binding.MissionDigest
 	readbackFlags := []bool{}
-	a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
+	a.deployMAVLinkMission = func(_ context.Context, target *mavlinkTarget, _ *agentv1.MissionPlan, readbackOnly bool, _ int64) (string, uint32, *uint32, error) {
 		readbackFlags = append(readbackFlags, readbackOnly)
 		if len(readbackFlags) == 1 {
+			if err := target.beforeMissionEffect(target); err != nil {
+				return "", 0, nil, err
+			}
 			return "", 0, nil, errMissionOutcomeUnknown
 		}
 		return digest, 0, nil, nil
@@ -410,6 +456,9 @@ func TestMissionDeploymentUnknownRetryReplacesDefinitiveMismatchBeforeExpiry(t *
 	}
 	if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
 		t.Fatalf("reserve uncertain command = %v, %v", created, err)
+	}
+	if err := a.wal.BindMissionDeploymentTarget(context.Background(), command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+		t.Fatal(err)
 	}
 	if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
 		t.Fatal(err)
@@ -518,6 +567,9 @@ func TestExpiredUncertainDeploymentIsReadbackOnly(t *testing.T) {
 			}
 			if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
 				t.Fatalf("reserve uncertain command = %v, %v", created, err)
+			}
+			if err := a.wal.BindMissionDeploymentTarget(context.Background(), command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+				t.Fatal(err)
 			}
 			if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
 				t.Fatal(err)
@@ -1071,7 +1123,7 @@ func TestMAVLinkMissionUploadBootstrapsArduPilotHomeFromEmptyMission(t *testing.
 		t.Run(name, func(t *testing.T) {
 			a, closeWAL := testMissionAgent(t)
 			defer closeWAL()
-			a.options = &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}
+			a.options = &AgentOptions{Debug: true, AircraftCommandTimeout: 20 * time.Millisecond}
 			command := validMissionCommand(t, "empty-home-"+strings.ReplaceAll(name, " ", "-"))
 			if recovery {
 				payload, fingerprint, err := missionCommandIdentity(command)
@@ -1080,6 +1132,9 @@ func TestMAVLinkMissionUploadBootstrapsArduPilotHomeFromEmptyMission(t *testing.
 				}
 				if _, created, err := a.wal.ReserveMissionDeployment(context.Background(), command.CommandId, fingerprint, payload); err != nil || !created {
 					t.Fatalf("reserve uncertain command = %v, %v", created, err)
+				}
+				if err := a.wal.BindMissionDeploymentTarget(context.Background(), command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+					t.Fatal(err)
 				}
 				if err := a.wal.MarkMissionDeploymentEffectStarted(context.Background(), command.CommandId, fingerprint); err != nil {
 					t.Fatal(err)
@@ -1306,7 +1361,8 @@ func testMissionAgent(t *testing.T) (*Agent, func()) {
 	}
 	now := time.Now()
 	a := &Agent{
-		wal: w,
+		wal:     w,
+		options: &AgentOptions{Debug: true},
 		operationContext: &wal.OperationContext{
 			AircraftID: "aircraft-1", FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 1,
 		},
@@ -1341,4 +1397,133 @@ func setMissionDigest(t *testing.T, command *agentv1.DeployMissionCommand) {
 		t.Fatal(err)
 	}
 	command.Binding.MissionDigest = digest
+}
+
+func TestMissionReadbackDropsResponsesDuringRequestHandoff(t *testing.T) {
+	channel := &gomavlib.Channel{}
+	target := &mavlinkTarget{channel: channel, systemID: 1, componentID: 1}
+	events := make(chan message.Message, 4)
+	now := time.Now()
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Millisecond}, mavlinkTarget: target,
+		pendingMissionTarget: &missionTransactionTarget{channel: channel, systemID: 1, componentID: 1},
+		pendingMissionEvents: events,
+		protocolQuiet:        protocolQuiet{channel: channel, system: 1, component: 1, since: now.Add(-time.Second), last: now, mission: now.Add(-time.Second)},
+	}
+	response := &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{SystemID: 1, ComponentID: 1, Message: &common.MessageMissionCount{Count: 2}}}
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, value message.Message) error {
+		if _, ok := value.(*common.MessageMissionRequestList); !ok {
+			t.Fatalf("unexpected write: %T", value)
+		}
+		a.observeMissionProtocolMessage(response)
+		return nil
+	}
+	if err := a.startMissionReadback(context.Background(), target, events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatal("stale response entered the new readback epoch during handoff")
+	}
+	// A frame can have arrived before handoff yet acquire mavlinkMu only
+	// after the writer clears the gate. Its original arrival must still lose.
+	a.observeMissionProtocolMessageAt(response, now)
+	if len(events) != 0 {
+		t.Fatal("delayed pre-handoff observer entered the new epoch")
+	}
+	a.observeMissionProtocolMessage(response)
+	if len(events) != 1 {
+		t.Fatal("post-handoff response was not admitted")
+	}
+}
+
+func TestMissionRecoveryCannotChangeAutopilotTarget(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		a, closeWAL := testMissionAgent(t)
+		defer closeWAL()
+		ctx := context.Background()
+		command := validMissionCommand(t, "target-bound")
+		raw, fingerprint, err := missionCommandIdentity(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err = a.wal.ReserveMissionDeployment(ctx, command.CommandId, fingerprint, raw); err != nil {
+			t.Fatal(err)
+		}
+		if !missing {
+			if err = a.wal.BindMissionDeploymentTarget(ctx, command.CommandId, a.commandTargetIdentity(a.mavlinkTarget)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err = a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint); err != nil {
+			t.Fatal(err)
+		}
+		a.mavlinkTarget.systemID = 2
+		a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *agentv1.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
+			t.Fatal("mission recovery reached unrelated target")
+			return "", 0, nil, nil
+		}
+		result := a.executeMissionDeployment(ctx, command)
+		if result.Status != agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN || !strings.Contains(result.Message, "target") {
+			t.Fatalf("missing=%v result=%+v", missing, result)
+		}
+	}
+}
+
+func TestMissionUploadRevalidatesAfterDurableFence(t *testing.T) {
+	for _, change := range []string{"armed", "target", "autopilot", "vehicle", "heartbeat", "landed", "deadline", "canceled"} {
+		t.Run(change, func(t *testing.T) {
+			command := validMissionCommand(t, "post-fence-"+change)
+			now := time.Now()
+			target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1, heartbeatAt: now,
+				landedState: common.MAV_LANDED_STATE_ON_GROUND, landedStateAt: now}
+			a := &Agent{mavlinkTarget: target, options: &AgentOptions{AircraftCommandTimeout: 20 * time.Millisecond}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			fenced := false
+			target.beforeMissionEffect = func(_ *mavlinkTarget) error {
+				fenced = true
+				a.mavlinkMu.Lock()
+				switch change {
+				case "armed":
+					a.mavlinkTarget.armed = true
+				case "target":
+					a.mavlinkTarget = &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 2}
+				case "autopilot":
+					a.mavlinkTarget.autopilot++
+				case "vehicle":
+					a.mavlinkTarget.vehicleType++
+				case "heartbeat":
+					a.mavlinkTarget.heartbeatAt = now.Add(-2 * missionEvidenceTTL)
+				case "landed":
+					a.mavlinkTarget.landedState = common.MAV_LANDED_STATE_IN_AIR
+				case "canceled":
+					cancel()
+				}
+				a.mavlinkMu.Unlock()
+				if change == "deadline" {
+					time.Sleep(time.Until(time.UnixMilli(command.ExpiresAtUnixMs)) + 2*time.Millisecond)
+				}
+				return nil
+			}
+			home := &agentv1.MissionItem{Frame: 0, Command: 16, LatitudeE7: -353632508, LongitudeE7: 1491652252, AltitudeM: 200}
+			writes := 0
+			a.writeMAVLinkMessage = func(_ *gomavlib.Channel, outbound message.Message) error {
+				switch value := outbound.(type) {
+				case *common.MessageMissionRequestList:
+					a.pendingMissionEvents <- &common.MessageMissionCount{Count: 1, MissionType: common.MAV_MISSION_TYPE_MISSION}
+				case *common.MessageMissionRequestInt:
+					a.pendingMissionEvents <- missionItemINT(target, home, value.Seq)
+				case *common.MessageMissionCount:
+					writes++
+				}
+				return nil
+			}
+			if change == "deadline" {
+				command.ExpiresAtUnixMs = time.Now().Add(200 * time.Millisecond).UnixMilli()
+			}
+			_, _, _, err := a.executeMAVLinkMissionDeployment(ctx, target, command.Plan, false, command.ExpiresAtUnixMs)
+			if err == nil || !fenced || writes != 0 {
+				t.Fatalf("error=%v fenced=%v mission writes=%d", err, fenced, writes)
+			}
+		})
+	}
 }

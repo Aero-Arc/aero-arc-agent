@@ -236,6 +236,15 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		return result
 	}
 
+	if err := a.wal.BindMissionDeploymentTarget(ctx, command.CommandId, a.commandTargetIdentity(target)); err != nil {
+		result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
+		if effectStarted {
+			result.Status = agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN
+		}
+		result.Message = "mission recovery target unavailable or changed: " + err.Error()
+		return result
+	}
+
 	if recovery {
 		digest, _, _, readbackErr := a.deployMAVLinkMission(ctx, target, command.Plan, true, command.ExpiresAtUnixMs)
 		result.OnboardMissionDigest = digest
@@ -286,18 +295,25 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		result.Message = "fresh authoritative MAVLink evidence must show the aircraft disarmed and on ground"
 		return result
 	}
-	if !effectStarted {
-		if err := a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint); err != nil {
-			result.Status = agentv1.MissionDeploymentResult_STATUS_TEMPORARY_ERROR
-			result.Message = err.Error()
-			return result
+	target.beforeMissionEffect = func(selected *mavlinkTarget) error {
+		if err := a.wal.BindMissionDeploymentTarget(ctx, command.CommandId, a.commandTargetIdentity(selected)); err != nil {
+			return err
 		}
+		return a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint)
 	}
 	digest, count, ack, err := a.deployMAVLinkMission(ctx, target, command.Plan, false, command.ExpiresAtUnixMs)
 	result.OnboardMissionDigest = digest
 	result.UploadedItemCount = count
 	result.MavlinkMissionAckType = ack
 	switch {
+	case errors.Is(err, wal.ErrMissionEffectOwnershipUnknown):
+		result.Status = agentv1.MissionDeploymentResult_STATUS_OUTCOME_UNKNOWN
+		result.Message = err.Error()
+		return a.persistMissionResult(ctx, fingerprint, result, true)
+	case errors.Is(err, wal.ErrCommandSuperseded):
+		result.Status = agentv1.MissionDeploymentResult_STATUS_REJECTED
+		result.Message = err.Error()
+		return a.persistMissionResult(ctx, fingerprint, result, false)
 	case err == nil && digest == command.Binding.MissionDigest:
 		result.Status = agentv1.MissionDeploymentResult_STATUS_APPLIED
 		result.Message = "onboard mission readback digest verified"

@@ -43,6 +43,11 @@ var ErrOperationCommandConflict = errors.New("operation command ID reused with a
 // with a different immutable command payload.
 var ErrMissionDeploymentConflict = errors.New("mission deployment command ID reused with a different payload")
 
+// ErrMissionEffectOwnershipUnknown prevents replacement writes when an older
+// WAL cannot establish which legacy command owns the latest aircraft effect.
+// Readback reconciliation remains permitted; missing history is not supersession.
+var ErrMissionEffectOwnershipUnknown = errors.New("legacy mission effect ownership is unknown; replacement upload requires reconciliation")
+
 var (
 	// ErrTelemetryFrameNotFound reports an ACK for no durable WAL sequence.
 	ErrTelemetryFrameNotFound = errors.New("telemetry ACK sequence does not exist")
@@ -224,7 +229,18 @@ func configureDB(db *sql.DB) error {
 func initDB(db *sql.DB) error {
 	// for seq we would need to emit 1000frames a second over 200million years to overflow
 	query := `
-	CREATE TABLE IF NOT EXISTS telemetry_frames (
+	CREATE TABLE IF NOT EXISTS c2_commands (
+ command_id TEXT PRIMARY KEY, digest TEXT NOT NULL, payload BLOB NOT NULL, evidence BLOB NOT NULL, effect_started INTEGER NOT NULL DEFAULT 0
+ );
+ CREATE TABLE IF NOT EXISTS c2_command_targets (command_id TEXT PRIMARY KEY, target TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS legacy_aircraft_effect (id INTEGER PRIMARY KEY CHECK(id=1), c2_rowid INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS legacy_effect_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL);
+ INSERT INTO legacy_effect_revision(id,revision) VALUES(1,0) ON CONFLICT(id) DO NOTHING;
+ CREATE TRIGGER IF NOT EXISTS legacy_effect_insert_revision AFTER INSERT ON legacy_aircraft_effect BEGIN UPDATE legacy_effect_revision SET revision=revision+1 WHERE id=1; END;
+ CREATE TRIGGER IF NOT EXISTS legacy_effect_update_revision AFTER UPDATE ON legacy_aircraft_effect BEGIN UPDATE legacy_effect_revision SET revision=revision+1 WHERE id=1; END;
+ CREATE TABLE IF NOT EXISTS mission_effect_ownership(command_id TEXT PRIMARY KEY,legacy_revision INTEGER NOT NULL,c2_rowid INTEGER NOT NULL);
+
+ CREATE TABLE IF NOT EXISTS telemetry_frames (
 		seq INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at INTEGER NOT NULL,
 		payload BLOB NOT NULL,
@@ -246,6 +262,7 @@ func initDB(db *sql.DB) error {
 		command_kind TEXT NOT NULL DEFAULT '',
 		payload_fingerprint TEXT NOT NULL DEFAULT ''
 	);
+	CREATE TABLE IF NOT EXISTS mission_deployment_targets(command_id TEXT PRIMARY KEY,target TEXT NOT NULL);
 	CREATE TABLE IF NOT EXISTS mission_deployments (
 		command_id TEXT PRIMARY KEY,
 		payload_fingerprint TEXT NOT NULL,
@@ -825,7 +842,7 @@ func (w *WAL) applyOperationCommand(ctx context.Context, commandID, kind, finger
 	defer tx.Rollback()
 	var missionExists bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM mission_deployments WHERE command_id = ?)`, commandID).Scan(&missionExists); err != nil {
+		SELECT 1 FROM mission_deployments WHERE command_id = ? UNION ALL SELECT 1 FROM c2_commands WHERE command_id = ?)`, commandID, commandID).Scan(&missionExists); err != nil {
 		return false, fmt.Errorf("check operation command ID namespace: %w", err)
 	}
 	if missionExists {
@@ -911,20 +928,28 @@ func (w *WAL) ReserveMissionDeployment(ctx context.Context, commandID, fingerpri
 		return MissionDeploymentRecord{}, false, fmt.Errorf("begin mission deployment reservation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var operationExists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM operation_context_commands WHERE command_id = ?)`, commandID).Scan(&operationExists); err != nil {
-		return MissionDeploymentRecord{}, false, fmt.Errorf("check mission command ID namespace: %w", err)
-	}
-	if operationExists {
-		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
-	}
 	now := time.Now().UnixNano()
+	// Acquire the writer lock before checking both command namespaces.
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO mission_deployments
 		(command_id, payload_fingerprint, command_payload, state, created_at, updated_at)
 		VALUES(?, ?, ?, 'prepared', ?, ?)`, commandID, fingerprint, payload, now, now)
 	if err != nil {
 		return MissionDeploymentRecord{}, false, fmt.Errorf("reserve mission deployment: %w", err)
+	}
+	var operationExists bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM operation_context_commands WHERE command_id=?)`, commandID).Scan(&operationExists); err != nil {
+		return MissionDeploymentRecord{}, false, err
+	}
+	if operationExists {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
+	var commandPayload []byte
+	err = tx.QueryRowContext(ctx, `SELECT payload FROM c2_commands WHERE command_id=?`, commandID).Scan(&commandPayload)
+	if err == nil && !pairedMissionCommand(commandID, commandPayload, payload) {
+		return MissionDeploymentRecord{}, false, ErrMissionDeploymentConflict
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return MissionDeploymentRecord{}, false, err
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -970,7 +995,10 @@ func (w *WAL) LoadMissionDeployment(ctx context.Context, commandID string) (Miss
 }
 
 // MarkMissionDeploymentEffectStarted commits the write-intent fence before the
-// first MAVLink mission message is handed to the transport.
+// first MAVLink mission message is handed to the transport, and rechecks latest
+// ownership before every replacement retry. A paired durable C2
+// effect fence commits in the same transaction; an unpaired legacy mission
+// supersedes older durable observations. Prepared/busy admission never does so.
 //
 // Parameters:
 //   - ctx: bounds the durable state transition.
@@ -978,9 +1006,77 @@ func (w *WAL) LoadMissionDeployment(ctx context.Context, commandID string) (Miss
 //   - fingerprint: prevents a reused ID from mutating another command row.
 //
 // Returns:
-//   - error: reports identity conflict, cancellation, or a SQLite write failure.
+//   - error: reports identity conflict, ErrCommandSuperseded when newer authority
+//     owns the effect, cancellation, or a SQLite write failure.
 func (w *WAL) MarkMissionDeploymentEffectStarted(ctx context.Context, commandID, fingerprint string) error {
-	return w.updateMissionDeployment(ctx, commandID, fingerprint, "effect_started", nil)
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Serialize the ownership check with all other effect fences.
+	if _, err = tx.ExecContext(ctx, `UPDATE mission_deployments SET updated_at=updated_at WHERE command_id=?`, commandID); err != nil {
+		return err
+	}
+	var previous string
+	if err = tx.QueryRowContext(ctx, `SELECT state FROM mission_deployments WHERE command_id=? AND payload_fingerprint=?`, commandID, fingerprint).Scan(&previous); err != nil {
+		return ErrMissionDeploymentConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE mission_deployments SET state='effect_started',updated_at=? WHERE command_id=? AND payload_fingerprint=? AND state IN ('prepared','effect_started','outcome_unknown')`, time.Now().UnixNano(), commandID, fingerprint)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrMissionDeploymentConflict
+	}
+	var paired bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM c2_commands WHERE command_id=?)`, commandID).Scan(&paired); err != nil {
+		return err
+	}
+	if paired {
+		result, err = tx.ExecContext(ctx, `UPDATE c2_commands SET effect_started=1 WHERE command_id=? AND rowid>COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) AND NOT EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>c2_commands.rowid AND newer.effect_started=1)`, commandID)
+		if err != nil {
+			return err
+		}
+		n, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return ErrCommandSuperseded
+		}
+	} else if previous != "prepared" {
+		var recorded bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM mission_effect_ownership WHERE command_id=?)`, commandID).Scan(&recorded); err != nil {
+			return err
+		}
+		if !recorded {
+			// Old WALs did not record the identity of legacy effects. Backfilling
+			// the current fence would wrongly authorize an older command after
+			// a newer legacy write. Preserve uncertainty instead of inventing it.
+			return ErrMissionEffectOwnershipUnknown
+		}
+		var latest bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM mission_effect_ownership o JOIN legacy_effect_revision r ON r.id=1 AND r.revision=o.legacy_revision WHERE o.command_id=? AND NOT EXISTS(SELECT 1 FROM c2_commands WHERE effect_started=1 AND rowid>o.c2_rowid))`, commandID).Scan(&latest); err != nil {
+			return err
+		}
+		if !latest {
+			return ErrCommandSuperseded
+		}
+	} else {
+		// A legacy mission write also supersedes earlier durable observations.
+		if _, err = tx.ExecContext(ctx, `INSERT INTO legacy_aircraft_effect(id,c2_rowid) SELECT 1,COALESCE(MAX(rowid),0) FROM c2_commands WHERE true ON CONFLICT(id) DO UPDATE SET c2_rowid=MAX(c2_rowid,excluded.c2_rowid)`); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO mission_effect_ownership(command_id,legacy_revision,c2_rowid) SELECT ?,revision,(SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1) FROM legacy_effect_revision WHERE id=1`, commandID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // StoreMissionDeploymentResult durably records a terminal or uncertain result.

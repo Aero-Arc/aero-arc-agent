@@ -61,6 +61,7 @@ type telemetryStreamWindow struct {
 	permits         chan struct{}
 	progress        chan struct{}
 	progressTimeout time.Duration
+	retryAfter      atomic.Int64
 }
 
 func withTelemetryStreamWindow(ctx context.Context, maximum int64) context.Context {
@@ -88,6 +89,18 @@ func acquireTelemetryPermit(ctx context.Context) error {
 		return nil
 	}
 	for {
+		// Relay admission may depend on a control message on this same stream.
+		// Back off only the sender; keep receiving control and committing ACKs.
+		if delay := time.Until(time.Unix(0, window.retryAfter.Load())); delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				continue
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+		}
 		select {
 		case window.permits <- struct{}{}:
 			if len(window.permits) == cap(window.permits) {
@@ -189,7 +202,7 @@ type Agent struct {
 	dialFn         func(ctx context.Context) (*grpc.ClientConn, error)
 	registerFn     func(ctx context.Context) error
 	openStreamFn   func(ctx context.Context) (grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], error)
-	ackLoopFn      func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error
+	ackLoopFn      func(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], cancelStream context.CancelFunc) error
 	sleepWithBack  func(ctx context.Context, d time.Duration) bool
 	closeWALFn     func(ctx context.Context) error
 	closeMAVLinkFn func(ctx context.Context)
@@ -202,6 +215,10 @@ type Agent struct {
 	operationContext   *wal.OperationContext
 	sendMu             sync.Mutex
 
+	c2AdmissionMu         sync.Mutex
+	c2Mu                  sync.Mutex
+	c2Pending             *pendingC2
+	protocolQuiet         protocolQuiet
 	mavlinkMu             sync.Mutex
 	mavlinkTarget         *mavlinkTarget
 	mavlinkHeartbeatSeq   uint64
@@ -287,11 +304,15 @@ func NewAgent(options *AgentOptions) (*Agent, error) {
 	}
 
 	if options.Debug {
+		address := options.DebugMAVLinkAddress
+		if address == "" {
+			address = "0.0.0.0:14550"
+		}
 		slog.LogAttrs(context.Background(), slog.LevelInfo, "debug mode enabled, using UDP mavlinkserver")
 		a.node = &gomavlib.Node{
 			Endpoints: []gomavlib.EndpointConf{
 				gomavlib.EndpointUDPServer{
-					Address: "0.0.0.0:14550",
+					Address: address,
 				},
 			},
 			OutVersion:     gomavlib.V2,
@@ -794,7 +815,8 @@ func (a *Agent) register(ctx context.Context) error {
 
 	agentID := identity.Resolve().FinalID
 	req := &agentv1.RegisterRequest{
-		AgentId: agentID,
+		AgentId:               agentID,
+		ExecutionCapabilities: []string{"mavlink_command_v1", "mission_upload_v1"},
 	}
 
 	slog.LogAttrs(
@@ -890,7 +912,7 @@ type relayStreamReceive struct {
 // commits. This prevents a burst of successful telemetry ACKs from placing
 // operation-context or aircraft control messages behind one SQLite FULL commit
 // per frame.
-func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage]) error {
+func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[agentv1.AgentStreamMessage, agentv1.RelayStreamMessage], cancelStream context.CancelFunc) error {
 	commandCtx, cancelCommands := context.WithCancel(ctx)
 	ackCtx, cancelACKs := context.WithCancel(ctx)
 	var commandWG sync.WaitGroup
@@ -918,6 +940,7 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 		}
 	}()
 	defer func() {
+		cancelStream()
 		cancelCommands()
 		cancelACKs()
 		commandWG.Wait()
@@ -951,7 +974,9 @@ func (a *Agent) runAckLoop(ctx context.Context, stream grpc.BidiStreamingClient[
 				continue
 			}
 			var err error
-			if command := message.GetAircraftCommand(); command != nil {
+			if command := message.GetDurableCommand(); command != nil {
+				err = a.dispatchDurableCommand(commandCtx, stream, command, &commandWG, commandErrors)
+			} else if command := message.GetAircraftCommand(); command != nil {
 				err = a.dispatchAircraftCommand(commandCtx, stream, command, &commandWG, commandErrors)
 			} else if mission := message.GetDeployMission(); mission != nil {
 				err = a.dispatchMissionDeployment(commandCtx, stream, mission, &commandWG, commandErrors)
@@ -1027,6 +1052,9 @@ func (a *Agent) runTelemetryACKWorker(ctx context.Context, acknowledgments <-cha
 				return err
 			}
 			if err := a.handleTelemetryAck(ctx, ack); err != nil {
+				if errors.Is(err, ErrTelemetryRetry) && telemetryWindow(ctx) != nil {
+					continue
+				}
 				return err
 			}
 		case <-ticker.C:
@@ -1178,6 +1206,11 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 		slog.LogAttrs(ctx, slog.LevelDebug, "telemetry_ack_seq_only", slog.Uint64("seq", ack.GetSeq()))
 	}
 	if result.Changed {
+		if disposition == wal.TelemetryAckRetry {
+			if window := telemetryWindow(ctx); window != nil {
+				window.retryAfter.Store(time.Now().Add(time.Second).UnixNano())
+			}
+		}
 		releaseTelemetryPermit(ctx)
 	}
 	switch ack.GetStatus() {
@@ -1477,7 +1510,7 @@ func (a *Agent) runWithReconnect(ctx context.Context) error {
 		// 5. Run the ack loop until it ends or context is cancelled.
 		go func() {
 			defer func() { streamStopped <- struct{}{} }()
-			errChan <- a.ackLoopFn(connCtx, stream)
+			errChan <- a.ackLoopFn(connCtx, stream, cancelConn)
 		}()
 
 		select {
