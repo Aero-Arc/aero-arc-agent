@@ -8,9 +8,26 @@ import (
 	"time"
 
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
+	"github.com/bluenviron/gomavlib/v3"
+	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
+	"github.com/bluenviron/gomavlib/v3/pkg/frame"
 	"github.com/makinje/aero-arc-agent/internal/wal"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestCompletionPreservesPreHandoffArrival(t *testing.T) {
+	a := &Agent{mavlinkTarget: &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}}
+	arrival := time.Now().Add(-time.Second)
+	o, ok := a.completionObservationAt(&gomavlib.EventFrame{Channel: a.mavlinkTarget.channel, Frame: &frame.V2Frame{SystemID: 1, ComponentID: 1, Message: &common.MessageHeartbeat{}}}, arrival)
+	if !ok || o.at != arrival.UnixNano() {
+		t.Fatalf("arrival restamped: %+v", o)
+	}
+	watch := wal.FlightWatch{Target: o.target, HandoffAt: time.Now().UnixNano()}
+	changed, evidence, err := reduceCompletion(&watch, o, "epoch", &completionSamples{})
+	if err != nil || changed || evidence != nil {
+		t.Fatalf("pre-handoff evidence admitted: %v %v %v", changed, evidence, err)
+	}
+}
 
 func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 	for _, early := range []bool{false, true} {

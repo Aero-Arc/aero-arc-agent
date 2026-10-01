@@ -576,10 +576,11 @@ func (a *Agent) runMAVLinkEvents(ctx context.Context, events <-chan gomavlib.Eve
 			}
 
 			if frameEvt, ok := evt.(*gomavlib.EventFrame); ok {
+				arrivedAt := time.Now()
 				// Control evidence must be observed before any telemetry work. WAL
 				// backpressure must never make a valid aircraft ACK time out.
 				a.observeMAVLinkFrame(frameEvt)
-				if observation, ok := a.completionObservation(frameEvt); ok {
+				if observation, ok := a.completionObservationAt(frameEvt, arrivedAt); ok {
 					a.accumulateCompletion(observation)
 				}
 				slog.LogAttrs(

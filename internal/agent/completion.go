@@ -41,6 +41,10 @@ type completionSamples struct {
 }
 
 func (a *Agent) completionObservation(frame *gomavlib.EventFrame) (completionObservation, bool) {
+	return a.completionObservationAt(frame, time.Now())
+}
+
+func (a *Agent) completionObservationAt(frame *gomavlib.EventFrame, arrivedAt time.Time) (completionObservation, bool) {
 	a.mavlinkMu.Lock()
 	target := a.mavlinkTarget
 	if target != nil {
@@ -54,7 +58,7 @@ func (a *Agent) completionObservation(frame *gomavlib.EventFrame) (completionObs
 	}
 	a.stateMu.RLock()
 	current := a.operationContext
-	o := completionObservation{target: a.completionTargetIdentity(target), channel: frame.Channel, at: time.Now().UnixNano()}
+	o := completionObservation{target: a.completionTargetIdentity(target), channel: frame.Channel, at: arrivedAt.UnixNano()}
 	if current != nil {
 		o.context = &pb.OperationContext{AircraftId: current.AircraftID, FlightId: current.FlightID, IntentId: current.IntentID, IntentVersion: current.IntentVersion}
 	}
