@@ -475,7 +475,11 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		}
 		watch, loadErr := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
 		if loadErr == nil {
-			completionWatch = &watch
+			// A start without terminal recovery leaves a rejected predecessor's
+			// watch intact. That historical watch cannot own this new effect.
+			if watch.Command.GetCommandId() == c.CommandId {
+				completionWatch = &watch
+			}
 		} else if !errors.Is(loadErr, sql.ErrNoRows) {
 			return reject("flight watch preparation failed: " + loadErr.Error())
 		}
@@ -518,7 +522,7 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		pending.completionCommandID = c.CommandId
 	}
 	a.mavlinkMu.Unlock()
-	if c.Definition == "MISSION_START" {
+	if completionWatch != nil {
 		if err = a.wal.RecordFlightWatchHandoff(ctx, c, handoffAt.UnixNano()); err != nil {
 			return e, save("outcome_unknown", "mission handoff evidence persistence failed: "+err.Error(), "agent", true)
 		}

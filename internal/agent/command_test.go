@@ -607,3 +607,60 @@ func TestGenericUnavailableWriterDoesNotConsumeEffect(t *testing.T) {
 		t.Fatalf("missing writer consumed effect: %+v %v", r, err)
 	}
 }
+
+func TestMissionStartWithoutRecoveryDoesNotReuseRejectedWatch(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := testC2Command(t)
+	c.Definition = "MISSION_START"
+	c.GetMavlink().Command = uint32(common.MAV_CMD_MISSION_START)
+	c.GetMavlink().Parameters = make([]float32, 7)
+	c.GetMavlink().Observation = "unavailable"
+	c.CommandDigest, _ = commanddigest.Digest(c)
+	a.operationContext = &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}
+	a.mavlinkTarget.armed = true
+	a.mavlinkTarget.autopilot = common.MAV_AUTOPILOT_ARDUPILOTMEGA
+	a.mavlinkTarget.vehicleType = common.MAV_TYPE_QUADROTOR
+	now := time.Now()
+	a.protocolQuiet = protocolQuiet{channel: a.mavlinkTarget.channel, system: 1, component: 1, since: now.Add(-time.Minute), last: now}
+	old := proto.Clone(c).(*pb.DurableCommand)
+	old.CommandId = "rejected-start"
+	old.GetMavlink().MissionPrecondition = &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Autocontinue: true, Param4: 1}}}
+	payload, _ := proto.Marshal(old)
+	evidence, _ := proto.Marshal(&pb.CommandEvidence{CommandId: old.CommandId, Events: []*pb.CommandEvent{{Stage: "rejected"}}})
+	if err := a.wal.AdmitCommand(ctx, old.CommandId, wal.CommandRecord{Digest: "old", Payload: payload, Evidence: evidence}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.wal.BeginFlightWatch(ctx, old, a.completionTargetIdentity(a.mavlinkTarget)); err != nil {
+		t.Fatal(err)
+	}
+	var writes atomic.Int32
+	a.writeMAVLinkMessage = func(*gomavlib.Channel, message.Message) error { writes.Add(1); return nil }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			a.mavlinkMu.Lock()
+			pending := a.c2Pending
+			if pending != nil && pending.terminalACK != nil {
+				pending.terminalACK <- c2TerminalACK{result: common.MAV_RESULT_ACCEPTED, at: time.Now()}
+				a.mavlinkMu.Unlock()
+				return
+			}
+			a.mavlinkMu.Unlock()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	e, err := a.executeDurableCommand(ctx, c, nil)
+	cancel()
+	<-done
+	if err != nil || !hasStage(e, "applied") || hasStage(e, "outcome_unknown") || writes.Load() != 1 {
+		t.Fatalf("replacement start: evidence=%v error=%v writes=%d", e, err, writes.Load())
+	}
+	watch, err := a.wal.LoadFlightWatch(context.Background(), c.Context.FlightId)
+	if err != nil || watch.Command.GetCommandId() != old.CommandId || watch.HandoffAt != 0 || watch.StartACKAt != 0 {
+		t.Fatalf("historical watch changed: %+v %v", watch, err)
+	}
+}
