@@ -278,6 +278,10 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		a.mavlinkMu.Unlock()
 		return reject("fresh autopilot target unavailable")
 	}
+	if c.Definition == "MISSION_START" && !target.armed {
+		a.mavlinkMu.Unlock()
+		return reject("mission start requires a fresh armed autopilot heartbeat")
+	}
 	pending := &pendingC2{target: target, command: m.Command, after: time.Now(), frames: make(chan *gomavlib.EventFrame, 64)}
 	a.c2Pending = pending
 	a.mavlinkMu.Unlock()
@@ -374,6 +378,11 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	for len(pending.frames) > 0 {
 		<-pending.frames
 	}
+	if c.Definition == "MISSION_START" {
+		if err = a.wal.BeginFlightWatch(ctx, c, completionTargetIdentity(target)); err != nil {
+			return reject("flight watch preparation failed before effect: " + err.Error())
+		}
+	}
 	if err = save("", "", "", true); err != nil {
 		return nil, err
 	}
@@ -388,19 +397,14 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	if ctx.Err() != nil || time.Now().UnixMilli() >= c.ExpiresAtUnixMs {
 		return reject("authorization expired or execution canceled before effect")
 	}
-	if c.Definition == "MISSION_START" {
-		if err = a.wal.BeginFlightWatch(ctx, c); err != nil {
-			return nil, err
-		}
-	}
 	if ctx.Err() != nil || time.Now().UnixMilli() >= c.ExpiresAtUnixMs {
 		return reject("authorization expired or execution canceled before effect")
 	}
 	a.mavlinkMu.Lock()
-	validTarget := sameValidatedTarget(a.mavlinkTarget, target)
+	validTarget := sameValidatedTarget(a.mavlinkTarget, target) && (c.Definition != "MISSION_START" || a.mavlinkTarget.armed)
 	a.mavlinkMu.Unlock()
 	if !validTarget {
-		return reject("autopilot target changed after effect fence")
+		return reject("autopilot target or armed precondition changed after effect fence")
 	}
 	if err = a.writeMAVLinkMessage(target.channel, request); err != nil {
 		return e, save("outcome_unknown", err.Error(), "mavlink_transport", true)

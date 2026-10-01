@@ -34,6 +34,7 @@ type AgentOptions struct {
 	WALFlushTimeout            time.Duration
 	AircraftCommandTimeout     time.Duration
 	MissionProtocolQuietPeriod time.Duration
+	DebugMAVLinkAddress        string
 	Debug                      bool
 }
 
@@ -73,5 +74,6 @@ func GetAgentOptions(c *cli.Command) (*AgentOptions, error) {
 		MissionProtocolQuietPeriod: c.Duration("mission-protocol-quiet-period"),
 		SkipTLSVerification:        c.Bool("skip-tls-verification"),
 		Debug:                      c.Bool("debug"),
+		DebugMAVLinkAddress:        c.String("debug-mavlink-address"),
 	}, nil
 }

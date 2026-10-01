@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1683,5 +1684,47 @@ func TestStart_ImmediateCancel(t *testing.T) {
 	}
 	if !errors.Is(err, shutdownErr) {
 		t.Errorf("Start did not surface shutdown error: %v", err)
+	}
+}
+
+func TestAckFailureCancelsBlockedDurableProgressSend(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sending := make(chan struct{})
+	command := testC2Command(t)
+	var once sync.Once
+	received := false
+	stream := &mockStream{
+		sendFunc: func(*agentv1.AgentStreamMessage) error {
+			once.Do(func() { close(sending) })
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		recvFunc: func() (*agentv1.RelayStreamMessage, error) {
+			if !received {
+				received = true
+				return &agentv1.RelayStreamMessage{Payload: &agentv1.RelayStreamMessage_DurableCommand{DurableCommand: command}}, nil
+			}
+			select {
+			case <-sending:
+				return &agentv1.RelayStreamMessage{Payload: &agentv1.RelayStreamMessage_TelemetryAck{TelemetryAck: &agentv1.TelemetryAck{Seq: 0}}}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.runAckLoop(ctx, stream, cancel) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidTelemetryAck) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("blocked progress send deadlocked stream teardown")
 	}
 }

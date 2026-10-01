@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 )
 
 type completionObservation struct {
+	target       string
+	channel      *gomavlib.Channel
 	context      *pb.OperationContext
 	at           int64
 	kind         string
@@ -28,6 +31,8 @@ type completionObservation struct {
 }
 
 type completionSamples struct {
+	target      string
+	channel     *gomavlib.Channel
 	flight      string
 	armed       bool
 	mode        uint32
@@ -50,7 +55,7 @@ func (a *Agent) completionObservation(frame *gomavlib.EventFrame) (completionObs
 		a.stateMu.RUnlock()
 		return completionObservation{}, false
 	}
-	o := completionObservation{context: &pb.OperationContext{AircraftId: current.AircraftID, FlightId: current.FlightID, IntentId: current.IntentID, IntentVersion: current.IntentVersion}, at: time.Now().UnixNano()}
+	o := completionObservation{target: completionTargetIdentity(target), channel: frame.Channel, context: &pb.OperationContext{AircraftId: current.AircraftID, FlightId: current.FlightID, IntentId: current.IntentID, IntentVersion: current.IntentVersion}, at: time.Now().UnixNano()}
 	a.stateMu.RUnlock()
 	switch m := frame.Message().(type) {
 	case *common.MessageHeartbeat:
@@ -100,7 +105,7 @@ func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, 
 	if err != nil {
 		return err
 	}
-	if watch.Done {
+	if watch.Done || watch.Target == "" || watch.Target != o.target {
 		return nil
 	}
 	c := watch.Command
@@ -124,8 +129,8 @@ func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, 
 	if c.Context.AircraftId != o.context.AircraftId || c.Context.IntentId != o.context.IntentId || c.Context.IntentVersion != o.context.IntentVersion || watch.HandoffAt == 0 || o.at < watch.HandoffAt {
 		return nil
 	}
-	if samples.flight != o.context.FlightId {
-		*samples = completionSamples{flight: o.context.FlightId}
+	if samples.flight != o.context.FlightId || samples.target != o.target || samples.channel != o.channel {
+		*samples = completionSamples{flight: o.context.FlightId, target: o.target, channel: o.channel}
 	}
 	switch o.kind {
 	case "heartbeat":
@@ -235,4 +240,14 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// The endpoint and MAVLink identity/profile survive process restart. A changed
+// endpoint or autopilot identity requires explicit recovery, never automatic
+// rebinding of a flight watch. MAVLink IDs are not cryptographic hardware IDs.
+func completionTargetIdentity(target *mavlinkTarget) string {
+	if target == nil || target.channel == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s/%d/%d/%d/%d", target.channel.String(), target.systemID, target.componentID, target.vehicleType, target.autopilot)
 }

@@ -41,7 +41,7 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: evidence}); err != nil {
 				t.Fatal(err)
 			}
-			if err = w.BeginFlightWatch(ctx, c); err != nil {
+			if err = w.BeginFlightWatch(ctx, c, "test-target"); err != nil {
 				t.Fatal(err)
 			}
 			if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
@@ -64,16 +64,21 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 					t.Fatalf("pending=%v err=%v want=%d", p, err, want)
 				}
 			}
-			observe(completionObservation{kind: "heartbeat", mode: 3})
-			observe(completionObservation{kind: "landed", landed: 1})
+			observe(completionObservation{target: "test-target", kind: "heartbeat", mode: 3})
+			observe(completionObservation{target: "test-target", kind: "landed", landed: 1})
 			pending(0)
-			observe(completionObservation{kind: "heartbeat", armed: true, mode: 3, at: int64(time.Second)})
-			observe(completionObservation{kind: "landed", landed: 2, at: int64(time.Second)})
+			observe(completionObservation{target: "test-target", kind: "heartbeat", armed: true, mode: 3, at: int64(time.Second)})
+			observe(completionObservation{target: "test-target", kind: "landed", landed: 2, at: int64(time.Second)})
 			if early {
-				observe(completionObservation{kind: "heartbeat", armed: true, mode: 6, at: int64(2 * time.Second)})
+				observe(completionObservation{target: "test-target", kind: "heartbeat", armed: true, mode: 6, at: int64(2 * time.Second)})
 			} else {
-				observe(completionObservation{kind: "mission", sequence: 1, at: int64(2 * time.Second)})
+				observe(completionObservation{target: "test-target", kind: "mission", sequence: 1, at: int64(2 * time.Second)})
 			}
+			// Another selected autopilot cannot finish this flight, including
+			// observations queued before the selection changes again.
+			observe(completionObservation{target: "other-target", kind: "heartbeat", at: int64(3 * time.Second)})
+			observe(completionObservation{target: "other-target", kind: "landed", landed: 1, at: int64(3 * time.Second)})
+			pending(0)
 			// A restart loses cached observations, but retains the airborne/terminal milestones.
 			if err = w.Close(); err != nil {
 				t.Fatal(err)
@@ -84,11 +89,11 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			}
 			a.wal = w
 			samples = completionSamples{}
-			observe(completionObservation{kind: "landed", landed: 1, at: int64(3 * time.Second)})
+			observe(completionObservation{target: "test-target", kind: "landed", landed: 1, at: int64(3 * time.Second)})
 			pending(0)
-			observe(completionObservation{kind: "heartbeat", at: int64(10 * time.Second)})
+			observe(completionObservation{target: "test-target", kind: "heartbeat", at: int64(10 * time.Second)})
 			pending(0) // stale landed observation cannot complete
-			observe(completionObservation{kind: "landed", landed: 1, at: int64(11 * time.Second)})
+			observe(completionObservation{target: "test-target", kind: "landed", landed: 1, at: int64(11 * time.Second)})
 			pending(1)
 			events, err := w.PendingFlightCompletions(ctx)
 			if err != nil {
@@ -108,7 +113,7 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			if err = w.AcknowledgeFlightCompletion(ctx, &pb.FlightCompletionReceipt{EventId: events[0].EventId, PayloadSha256: digest}); err != nil {
 				t.Fatal(err)
 			}
-			observe(completionObservation{kind: "heartbeat", at: int64(12 * time.Second)})
+			observe(completionObservation{target: "test-target", kind: "heartbeat", at: int64(12 * time.Second)})
 			pending(0)
 		})
 	}
@@ -122,7 +127,7 @@ func TestAckFailureCancelsStreamBeforeWaitingForBlockedCompletionSend(t *testing
 	c := testC2Command(t)
 	c.CommandId = "start"
 	c.Execution = &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Autocontinue: true, Param4: 1}}}}}
-	if err := a.wal.BeginFlightWatch(ctx, c); err != nil {
+	if err := a.wal.BeginFlightWatch(ctx, c, "test-target"); err != nil {
 		t.Fatal(err)
 	}
 	watch, err := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
@@ -175,13 +180,14 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 		t.Fatal(err)
 	}
-	if err = w.BeginFlightWatch(ctx, c); err != nil {
+	if err = w.BeginFlightWatch(ctx, c, "test-target"); err != nil {
 		t.Fatal(err)
 	}
 	watch, err := w.LoadFlightWatch(ctx, c.Context.FlightId)
 	if err != nil {
 		t.Fatal(err)
 	}
+	watch.Target = "/1/1/2/3"
 	watch.HandoffAt = time.Now().Add(-2 * time.Second).UnixNano()
 	watch.AirborneAt = time.Now().Add(-time.Second).UnixNano()
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
@@ -245,7 +251,7 @@ func TestCompletionIgnoresQueuedPreHandoffObservations(t *testing.T) {
 	if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 		t.Fatal(err)
 	}
-	if err = w.BeginFlightWatch(ctx, c); err != nil {
+	if err = w.BeginFlightWatch(ctx, c, "test-target"); err != nil {
 		t.Fatal(err)
 	}
 	handoff := time.Now().Add(time.Second).UnixNano()
@@ -256,6 +262,7 @@ func TestCompletionIgnoresQueuedPreHandoffObservations(t *testing.T) {
 	samples := completionSamples{}
 	// Simulate queued observations captured after API issue but before the effect.
 	for _, o := range []completionObservation{{kind: "heartbeat", armed: true, mode: 6}, {kind: "landed", landed: 2}, {kind: "heartbeat", armed: true, mode: 6}, {kind: "landed", landed: 1}, {kind: "heartbeat", armed: false}} {
+		o.target = "test-target"
 		o.context = c.Context
 		o.at = handoff - 1
 		if err = a.observeCompletion(ctx, o, "epoch", &samples); err != nil {
@@ -271,7 +278,7 @@ func TestCompletionIgnoresQueuedPreHandoffObservations(t *testing.T) {
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err = a.observeCompletion(ctx, completionObservation{context: c.Context, at: handoff + 1, kind: "heartbeat", armed: true, mode: 6}, "epoch", &samples); err != nil {
+	if err = a.observeCompletion(ctx, completionObservation{target: "test-target", context: c.Context, at: handoff + 1, kind: "heartbeat", armed: true, mode: 6}, "epoch", &samples); err != nil {
 		t.Fatal(err)
 	}
 	if samples.heartbeatAt != 0 {

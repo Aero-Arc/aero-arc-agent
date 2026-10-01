@@ -30,19 +30,19 @@ func TestFlightWatchReplacementRequiresRejectedUnflownStart(t *testing.T) {
 	if err = w.AdmitCommand(ctx, "first", CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 		t.Fatal(err)
 	}
-	if err = w.BeginFlightWatch(ctx, first); err != nil {
+	if err = w.BeginFlightWatch(ctx, first, "test-target"); err != nil {
 		t.Fatal(err)
 	}
 	second := proto.Clone(first).(*pb.DurableCommand)
 	second.CommandId = "second"
-	if err = w.BeginFlightWatch(ctx, second); err == nil {
+	if err = w.BeginFlightWatch(ctx, second, "test-target"); err == nil {
 		t.Fatal("unresolved start was replaced")
 	}
 	raw, _ = proto.Marshal(&pb.CommandEvidence{CommandId: "first", CommandDigest: "digest", Events: []*pb.CommandEvent{{EventId: "first/rejected", Stage: "rejected"}}})
 	if err = w.SaveCommand(ctx, "first", "digest", raw, true); err != nil {
 		t.Fatal(err)
 	}
-	if err = w.BeginFlightWatch(ctx, second); err != nil {
+	if err = w.BeginFlightWatch(ctx, second, "test-target"); err != nil {
 		t.Fatal(err)
 	}
 	watch, err := w.LoadFlightWatch(ctx, "flight")
@@ -53,7 +53,7 @@ func TestFlightWatchReplacementRequiresRejectedUnflownStart(t *testing.T) {
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err = w.BeginFlightWatch(ctx, first); err == nil {
+	if err = w.BeginFlightWatch(ctx, first, "test-target"); err == nil {
 		t.Fatal("airborne watch replaced")
 	}
 }

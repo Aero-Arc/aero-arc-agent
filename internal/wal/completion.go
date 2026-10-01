@@ -18,6 +18,7 @@ import (
 // FlightWatch retains flight milestones across restarts; fresh ground samples
 // are deliberately process-local so a restart cannot combine stale observations.
 type FlightWatch struct {
+	Target string `json:"target"`
 	// HandoffAt fences observations captured before the successful mission-start write.
 	HandoffAt  int64              `json:"handoff_at"`
 	Command    *pb.DurableCommand `json:"command"`
@@ -70,12 +71,13 @@ func (v *FlightWatch) UnmarshalJSON(raw []byte) error {
 // Existing flight authority is immutable, including after process restart.
 //
 // Parameters: ctx bounds the SQLite transaction; c is the mission-start authority
-// containing exact flight context and a verified mission precondition.
+// containing exact flight context and a verified mission precondition; target
+// is the verified transport/system/component/profile binding, immutable on replay.
 // Returns: nil after creating/replaying the watch, or as a no-op when no mission
 // precondition or terminal RTL/LAND exists. Different start authority can replace
 // only a rejected, never-airborne watch; active/applied/unresolved predecessors,
 // malformed persisted state, encoding errors, and SQLite failures return errors.
-func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand) error {
+func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand, target string) error {
 	m := c.GetMavlink()
 	if m == nil || m.MissionPrecondition == nil || len(m.MissionPrecondition.Items) == 0 {
 		return nil
@@ -85,7 +87,10 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand) error 
 	if last != 20 && last != 21 {
 		return nil
 	}
-	raw, err := json.Marshal(FlightWatch{Command: c})
+	if target == "" {
+		return errors.New("flight watch requires an autopilot target binding")
+	}
+	raw, err := json.Marshal(FlightWatch{Command: c, Target: target})
 	if err != nil {
 		return err
 	}
@@ -106,6 +111,9 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand) error 
 		return err
 	}
 	if old.Command.CommandId == c.CommandId {
+		if old.Target != target {
+			return errors.New("flight watch autopilot target changed")
+		}
 		return tx.Commit()
 	}
 	if old.AirborneAt != 0 || old.TerminalAt != 0 || old.Done {
