@@ -278,12 +278,13 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	default:
 		return reject("unsupported observation capability")
 	}
+	// Match mission admission order: context binding before aircraft slot.
+	a.operationContextMu.Lock()
+	defer a.operationContextMu.Unlock()
 	if !a.tryBeginAircraftCommand() {
 		return reject("aircraft execution is busy")
 	}
 	defer a.endAircraftCommand()
-	a.operationContextMu.Lock()
-	defer a.operationContextMu.Unlock()
 	a.stateMu.RLock()
 	active = a.operationContext
 	a.stateMu.RUnlock()
@@ -571,19 +572,16 @@ func (a *Agent) waitC2Quiet(ctx context.Context, p *pendingC2, expires int64) er
 func (a *Agent) executeC2Mission(ctx context.Context, c *pb.DurableCommand, e *pb.CommandEvidence, save func(string, string, string, bool) error) (*pb.CommandEvidence, error) {
 	mission := c.GetMission()
 	var err error
-	if err = save("", "", "", true); err != nil {
-		return nil, err
-	}
 	result := a.executeMissionDeployment(ctx, mission)
 	switch result.Status {
 	case pb.MissionDeploymentResult_STATUS_APPLIED, pb.MissionDeploymentResult_STATUS_ALREADY_APPLIED:
-		if err = save("applied", "mission accepted and verified onboard", "mavlink_mission_protocol", true); err == nil {
-			err = save("observed", "onboard digest "+result.OnboardMissionDigest, "mavlink_mission_readback", true)
+		if err = save("applied", "mission accepted and verified onboard", "mavlink_mission_protocol", false); err == nil {
+			err = save("observed", "onboard digest "+result.OnboardMissionDigest, "mavlink_mission_readback", false)
 		}
 	case pb.MissionDeploymentResult_STATUS_REJECTED, pb.MissionDeploymentResult_STATUS_BINDING_MISMATCH:
-		err = save("rejected", result.Message, "agent", true)
+		err = save("rejected", result.Message, "agent", false)
 	default:
-		err = save("outcome_unknown", result.Message, "mavlink_mission_protocol", true)
+		err = save("outcome_unknown", result.Message, "mavlink_mission_protocol", false)
 	}
 	return e, err
 }
