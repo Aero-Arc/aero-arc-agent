@@ -985,7 +985,9 @@ func (w *WAL) LoadMissionDeployment(ctx context.Context, commandID string) (Miss
 }
 
 // MarkMissionDeploymentEffectStarted commits the write-intent fence before the
-// first MAVLink mission message is handed to the transport.
+// first MAVLink mission message is handed to the transport. A paired durable C2
+// effect fence commits in the same transaction; an unpaired legacy mission
+// supersedes older durable observations. Prepared/busy admission never does so.
 //
 // Parameters:
 //   - ctx: bounds the durable state transition.
@@ -993,9 +995,48 @@ func (w *WAL) LoadMissionDeployment(ctx context.Context, commandID string) (Miss
 //   - fingerprint: prevents a reused ID from mutating another command row.
 //
 // Returns:
-//   - error: reports identity conflict, cancellation, or a SQLite write failure.
+//   - error: reports identity conflict, ErrCommandSuperseded when newer authority
+//     owns the effect, cancellation, or a SQLite write failure.
 func (w *WAL) MarkMissionDeploymentEffectStarted(ctx context.Context, commandID, fingerprint string) error {
-	return w.updateMissionDeployment(ctx, commandID, fingerprint, "effect_started", nil)
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `UPDATE mission_deployments SET state='effect_started',updated_at=? WHERE command_id=? AND payload_fingerprint=? AND state='prepared'`, time.Now().UnixNano(), commandID, fingerprint)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrMissionDeploymentConflict
+	}
+	var paired bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM c2_commands WHERE command_id=?)`, commandID).Scan(&paired); err != nil {
+		return err
+	}
+	if paired {
+		result, err = tx.ExecContext(ctx, `UPDATE c2_commands SET effect_started=1 WHERE command_id=? AND rowid>COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) AND NOT EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>c2_commands.rowid AND newer.effect_started=1)`, commandID)
+		if err != nil {
+			return err
+		}
+		n, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return ErrCommandSuperseded
+		}
+	} else {
+		// A legacy mission write also supersedes earlier durable observations.
+		if _, err = tx.ExecContext(ctx, `INSERT INTO legacy_aircraft_effect(id,c2_rowid) SELECT 1,COALESCE(MAX(rowid),0) FROM c2_commands WHERE true ON CONFLICT(id) DO UPDATE SET c2_rowid=MAX(c2_rowid,excluded.c2_rowid)`); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // StoreMissionDeploymentResult durably records a terminal or uncertain result.

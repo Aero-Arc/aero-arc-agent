@@ -406,3 +406,62 @@ func TestMalformedDurableCommandsDoNotEndTelemetry(t *testing.T) {
 		}
 	}
 }
+
+func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
+	for _, scenario := range []string{"busy", "no-target", "no-transport", "write"} {
+		t.Run(scenario, func(t *testing.T) {
+			a, closeWAL := testMissionAgent(t)
+			defer closeWAL()
+			ctx := context.Background()
+			if err := a.wal.AdmitCommand(ctx, "older", wal.CommandRecord{Digest: "older", Payload: []byte{}, Evidence: []byte{}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := a.wal.BeginCommandEffect(ctx, "older", "older"); err != nil {
+				t.Fatal(err)
+			}
+			mission := validMissionCommand(t, "mission-c2")
+			c := &pb.DurableCommand{CommandId: mission.CommandId, OperatorId: "operator-1", AircraftId: "aircraft-1", AgentId: identity.Resolve().FinalID, Context: &pb.OperationContext{AircraftId: "aircraft-1", FlightId: "flight-1", IntentId: "intent-1", IntentVersion: 1}, Definition: "MISSION_UPLOAD", DefinitionVersion: 1, Capability: "mission_upload_v1", IssuedAtUnixMs: mission.IssuedAtUnixMs, ExpiresAtUnixMs: mission.ExpiresAtUnixMs, RecoveryPolicy: "mission_readback_v1", Execution: &pb.DurableCommand_Mission{Mission: mission}}
+			var err error
+			c.CommandDigest, err = commanddigest.Digest(c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "busy" {
+				a.aircraftCommandActive = true
+			}
+			if scenario == "no-target" {
+				a.mavlinkTarget = nil
+			}
+			writes := 0
+			if scenario != "no-transport" {
+				a.deployMAVLinkMission = func(context.Context, *mavlinkTarget, *pb.MissionPlan, bool, int64) (string, uint32, *uint32, error) {
+					writes++
+					record, err := a.wal.LoadCommand(ctx, c.CommandId)
+					if err != nil || !record.EffectStarted {
+						t.Fatalf("write without paired fence: %+v %v", record, err)
+					}
+					return mission.Binding.MissionDigest, 1, nil, nil
+				}
+			}
+			e, err := a.executeDurableCommand(ctx, c, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := a.wal.LoadCommand(ctx, c.CommandId)
+			if err != nil {
+				t.Fatal(err)
+			}
+			latest, err := a.wal.CommandIsLatest(ctx, "older")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "write" {
+				if writes != 1 || !record.EffectStarted || latest || !hasStage(e, "observed") {
+					t.Fatalf("write result: %+v latest=%v writes=%d", e, latest, writes)
+				}
+			} else if writes != 0 || record.EffectStarted || !latest {
+				t.Fatalf("effect-free attempt superseded prior command: %+v latest=%v writes=%d", record, latest, writes)
+			}
+		})
+	}
+}
