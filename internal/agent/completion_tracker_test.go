@@ -30,8 +30,12 @@ func TestCompletionPreservesPreHandoffArrival(t *testing.T) {
 }
 
 func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
-	for _, early := range []bool{false, true} {
-		t.Run(map[bool]string{false: "mission", true: "land"}[early], func(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		early, pendingHandoff bool
+	}{{name: "mission"}, {name: "land", early: true}, {name: "before-handoff-commit", pendingHandoff: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			early := test.early
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "agent.db")
 			w, err := wal.New(ctx, path, 0, 0)
@@ -48,12 +52,22 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 			if err = w.BeginFlightWatch(ctx, c, "target"); err != nil {
 				t.Fatal(err)
 			}
-			if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
-				t.Fatal(err)
+			if !test.pendingHandoff {
+				if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
+					t.Fatal(err)
+				}
 			}
 			a := &Agent{wal: w}
 			if err = a.restoreCompletionTrackers(ctx); err != nil {
 				t.Fatal(err)
+			}
+			if test.pendingHandoff {
+				watch, loadErr := w.LoadFlightWatch(ctx, c.Context.FlightId)
+				if loadErr != nil {
+					t.Fatal(loadErr)
+				}
+				watch.HandoffAt = at
+				a.trackFlightCompletion(watch)
 			}
 			observe := func(o completionObservation) { o.target = "target"; o.at += at; a.accumulateCompletion(o) }
 			observe(completionObservation{kind: "heartbeat", armed: true, mode: 3, at: 1})
@@ -108,6 +122,16 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 			}
 			if err = tx.Rollback(); err != nil {
 				t.Fatal(err)
+			}
+			if test.pendingHandoff {
+				a.flushCompletionTrackers(ctx)
+				events, loadErr := w.PendingFlightCompletions(ctx)
+				if loadErr != nil || len(events) != 0 {
+					t.Fatalf("uncommitted handoff published: %v %v", events, loadErr)
+				}
+				if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
+					t.Fatal(err)
+				}
 			}
 			a.flushCompletionTrackers(ctx)
 			if a.completionWritesPending() {

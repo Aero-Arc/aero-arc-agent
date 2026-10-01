@@ -431,9 +431,16 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	for len(pending.frames) > 0 {
 		<-pending.frames
 	}
+	var completionWatch *wal.FlightWatch
 	if c.Definition == "MISSION_START" {
 		if err = a.wal.BeginFlightWatch(ctx, c, a.completionTargetIdentity(target)); err != nil {
 			return reject("flight watch preparation failed before effect: " + err.Error())
+		}
+		watch, loadErr := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
+		if loadErr == nil {
+			completionWatch = &watch
+		} else if !errors.Is(loadErr, sql.ErrNoRows) {
+			return reject("flight watch preparation failed: " + loadErr.Error())
 		}
 	}
 	if err = save("", "", "", true); err != nil {
@@ -463,18 +470,16 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		return e, save("outcome_unknown", err.Error(), "mavlink_transport", true)
 	}
 	handoffAt := time.Now()
+	if completionWatch != nil {
+		completionWatch.HandoffAt = handoffAt.UnixNano()
+		a.trackFlightCompletion(*completionWatch)
+	}
 	a.mavlinkMu.Lock()
 	pending.after = handoffAt
 	a.mavlinkMu.Unlock()
 	if c.Definition == "MISSION_START" {
 		if err = a.wal.RecordFlightWatchHandoff(ctx, c, handoffAt.UnixNano()); err != nil {
 			return e, save("outcome_unknown", "mission handoff evidence persistence failed: "+err.Error(), "agent", true)
-		}
-		watch, loadErr := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
-		if loadErr == nil {
-			a.trackFlightCompletion(watch)
-		} else if !errors.Is(loadErr, sql.ErrNoRows) {
-			return e, save("outcome_unknown", "mission completion tracking unavailable: "+loadErr.Error(), "agent", true)
 		}
 	}
 	execution, cancel := context.WithTimeout(ctx, 20*time.Second)
