@@ -367,18 +367,25 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		if m.Parameters[1] != 0 {
 			return reject("force arm/disarm is not supported")
 		}
-		if err = save("", "", "", true); err != nil {
-			return nil, err
-		}
 		effectCtx, cancelEffect := context.WithDeadline(ctx, time.UnixMilli(c.ExpiresAtUnixMs))
-		if err = save("awaiting_ack", "Awaiting autopilot ACK", "agent", true); err != nil {
-			cancelEffect()
+		defer cancelEffect()
+		if err = save("awaiting_ack", "Awaiting autopilot ACK", "agent", false); err != nil {
 			return nil, err
 		}
 		prepared.validatedTarget = target
 		prepared.durableEffect = true
+		var fenceErr error
+		prepared.beforeEffect = func() error {
+			fenceErr = save("", "", "", true)
+			return fenceErr
+		}
 		result := a.executePreparedAircraftCommand(effectCtx, prepared)
-		cancelEffect()
+		if fenceErr != nil {
+			return nil, fenceErr
+		}
+		if !effectOwned {
+			return reject(result.Message)
+		}
 		switch result.Status {
 		case pb.AircraftCommandResult_STATUS_ACCEPTED:
 			if err = save("applied", result.Message, "mavlink_command_ack", true); err != nil {

@@ -65,6 +65,7 @@ type pendingMAVLinkCommand struct {
 
 type preparedAircraftCommand struct {
 	durableEffect   bool
+	beforeEffect    func() error
 	validatedTarget *mavlinkTarget
 	command         *agentv1.AircraftCommand
 	result          *agentv1.AircraftCommandResult
@@ -543,6 +544,29 @@ func (a *Agent) executePreparedAircraftCommand(ctx context.Context, prepared *pr
 		if err := a.wal.RecordLegacyAircraftEffect(commandCtx); err != nil {
 			result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
 			result.Message = "persist legacy effect fence: " + err.Error()
+			return result
+		}
+	}
+	if prepared.beforeEffect != nil {
+		if err := prepared.beforeEffect(); err != nil {
+			result.Status = agentv1.AircraftCommandResult_STATUS_DELIVERY_FAILED
+			result.Message = "persist durable effect fence: " + err.Error()
+			return result
+		}
+	}
+	// A SQLite fence can block. Recheck the deadline and target after it.
+	if err := commandCtx.Err(); err != nil {
+		result.Status = agentv1.AircraftCommandResult_STATUS_TIMEOUT
+		result.Message = "command canceled after effect fence: " + err.Error()
+		return result
+	}
+	if prepared.validatedTarget != nil {
+		a.mavlinkMu.Lock()
+		valid := sameValidatedTarget(a.mavlinkTarget, prepared.validatedTarget)
+		a.mavlinkMu.Unlock()
+		if !valid {
+			result.Status = agentv1.AircraftCommandResult_STATUS_REJECTED
+			result.Message = "validated autopilot target changed after effect fence"
 			return result
 		}
 	}

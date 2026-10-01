@@ -316,6 +316,11 @@ func TestDurableArmRejectsTargetChangedDuringMissionReadback(t *testing.T) {
 	if err != nil || !hasStage(e, "rejected") || writes.Load() != 0 {
 		t.Fatalf("retargeted ARM: %v err=%v writes=%d", e, err, writes.Load())
 	}
+	record, err := a.wal.LoadCommand(context.Background(), c.CommandId)
+	if err != nil || record.EffectStarted {
+		t.Fatalf("effect-free target rejection consumed fence: %+v %v", record, err)
+	}
+
 }
 
 func TestSupersededAdmissionCannotAcquireEffectPermit(t *testing.T) {
@@ -552,5 +557,24 @@ func TestCommandObservationCannotChangeEffectTarget(t *testing.T) {
 	_, err := a.observeDurableCommand(ctx, c, e, func(string, string, string, bool) error { saves++; return nil })
 	if err != nil || saves != 0 || a.c2Pending != nil {
 		t.Fatalf("misattributed target: saves=%d err=%v", saves, err)
+	}
+}
+
+func TestDurableArmUnavailableWriterDoesNotConsumeEffect(t *testing.T) {
+	a, cleanup := testMissionAgent(t)
+	defer cleanup()
+	c := testC2Command(t)
+	a.operationContext = &wal.OperationContext{AircraftID: c.AircraftId, FlightID: c.Context.FlightId, IntentID: c.Context.IntentId, IntentVersion: 1}
+	a.mavlinkTarget.autopilot = common.MAV_AUTOPILOT_ARDUPILOTMEGA
+	a.mavlinkTarget.vehicleType = common.MAV_TYPE_QUADROTOR
+	a.mavlinkTarget.heartbeatAt = time.Now()
+	a.writeMAVLinkCommand = nil
+	e, err := a.executeDurableCommand(context.Background(), c, nil)
+	if err != nil || !hasStage(e, "rejected") {
+		t.Fatalf("no-writer result=%v err=%v", e, err)
+	}
+	record, err := a.wal.LoadCommand(context.Background(), c.CommandId)
+	if err != nil || record.EffectStarted {
+		t.Fatalf("missing writer consumed effect: %+v %v", record, err)
 	}
 }
