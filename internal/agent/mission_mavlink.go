@@ -14,9 +14,10 @@ import (
 )
 
 type missionTransactionTarget struct {
-	channel     *gomavlib.Channel
-	systemID    uint8
-	componentID uint8
+	readbackHandoff bool
+	channel         *gomavlib.Channel
+	systemID        uint8
+	componentID     uint8
 }
 
 func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
@@ -33,13 +34,13 @@ func (a *Agent) observeMissionProtocolMessage(frame *gomavlib.EventFrame) {
 		return
 	}
 	a.mavlinkMu.Lock()
+	defer a.mavlinkMu.Unlock()
 	if current := a.mavlinkTarget; current != nil && current.channel == frame.Channel && current.systemID == frame.SystemID() && current.componentID == frame.ComponentID() {
 		a.protocolQuiet.mission = time.Now()
 	}
 	target := a.pendingMissionTarget
 	events := a.pendingMissionEvents
-	matched := target != nil && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
-	a.mavlinkMu.Unlock()
+	matched := target != nil && !target.readbackHandoff && target.channel == frame.Channel && target.systemID == frame.SystemID() && target.componentID == frame.ComponentID()
 	if !matched || events == nil {
 		return
 	}
@@ -311,13 +312,8 @@ func (a *Agent) readbackMAVLinkHome(ctx context.Context, target *mavlinkTarget, 
 			a.resetMissionQuiet()
 		}
 	}()
-	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+	if err := a.startMissionReadback(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish HOME readback epoch: %w", err)
-	}
-	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
-		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
-	}); err != nil {
-		return nil, err
 	}
 	responseTimeout := a.aircraftCommandTimeout()
 	timeout := time.NewTimer(responseTimeout)
@@ -420,7 +416,6 @@ func (a *Agent) beginMissionReadbackEpoch(ctx context.Context, target *mavlinkTa
 	// traffic gaps or failed transfers the conservative cancellation path remains.
 	a.mavlinkMu.Lock()
 	idle := a.protocolQuietForLocked(target, 0, true, time.Now()) >= a.missionReadbackQuietPeriod()
-	a.protocolQuiet.mission = time.Now()
 	a.mavlinkMu.Unlock()
 	if idle && !consumeReadyMissionEvent(events) {
 		return nil
@@ -462,13 +457,8 @@ func (a *Agent) readbackMAVLinkWireMissionWithin(ctx context.Context, target *ma
 			a.resetMissionQuiet()
 		}
 	}()
-	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+	if err := a.startMissionReadback(ctx, target, events); err != nil {
 		return nil, fmt.Errorf("establish full mission readback epoch: %w", err)
-	}
-	if err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
-		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
-	}); err != nil {
-		return nil, err
 	}
 	timeout := time.NewTimer(responseTimeout)
 	defer timeout.Stop()
@@ -586,4 +576,30 @@ func (a *Agent) missionReadbackQuietPeriod() time.Duration {
 		return a.options.MissionProtocolQuietPeriod
 	}
 	return a.aircraftCommandTimeout()
+}
+
+// startMissionReadback closes receive admission while handing off the request.
+// Traffic arriving after the idle check cannot enter the next response epoch.
+func (a *Agent) startMissionReadback(ctx context.Context, target *mavlinkTarget, events <-chan message.Message) error {
+	if err := a.beginMissionReadbackEpoch(ctx, target, events); err != nil {
+		return err
+	}
+	a.mavlinkMu.Lock()
+	pending := a.pendingMissionTarget
+	if pending != nil {
+		pending.readbackHandoff = true
+	}
+	for consumeReadyMissionEvent(events) {
+	}
+	a.mavlinkMu.Unlock()
+	err := a.writeMAVLinkMessage(target.channel, &common.MessageMissionRequestList{
+		TargetSystem: target.systemID, TargetComponent: target.componentID, MissionType: common.MAV_MISSION_TYPE_MISSION,
+	})
+	a.mavlinkMu.Lock()
+	if pending != nil && a.pendingMissionTarget == pending {
+		pending.readbackHandoff = false
+	}
+	a.protocolQuiet.mission = time.Now()
+	a.mavlinkMu.Unlock()
+	return err
 }

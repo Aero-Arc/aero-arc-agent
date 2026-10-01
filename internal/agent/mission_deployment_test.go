@@ -1306,7 +1306,8 @@ func testMissionAgent(t *testing.T) (*Agent, func()) {
 	}
 	now := time.Now()
 	a := &Agent{
-		wal: w,
+		wal:     w,
+		options: &AgentOptions{Debug: true},
 		operationContext: &wal.OperationContext{
 			AircraftID: "aircraft-1", FlightID: "flight-1", IntentID: "intent-1", IntentVersion: 1,
 		},
@@ -1341,4 +1342,34 @@ func setMissionDigest(t *testing.T, command *agentv1.DeployMissionCommand) {
 		t.Fatal(err)
 	}
 	command.Binding.MissionDigest = digest
+}
+
+func TestMissionReadbackDropsResponsesDuringRequestHandoff(t *testing.T) {
+	channel := &gomavlib.Channel{}
+	target := &mavlinkTarget{channel: channel, systemID: 1, componentID: 1}
+	events := make(chan message.Message, 4)
+	now := time.Now()
+	a := &Agent{options: &AgentOptions{AircraftCommandTimeout: time.Millisecond}, mavlinkTarget: target,
+		pendingMissionTarget: &missionTransactionTarget{channel: channel, systemID: 1, componentID: 1},
+		pendingMissionEvents: events,
+		protocolQuiet:        protocolQuiet{channel: channel, system: 1, component: 1, since: now.Add(-time.Second), last: now, mission: now.Add(-time.Second)},
+	}
+	response := &gomavlib.EventFrame{Channel: channel, Frame: &frame.V2Frame{SystemID: 1, ComponentID: 1, Message: &common.MessageMissionCount{Count: 2}}}
+	a.writeMAVLinkMessage = func(_ *gomavlib.Channel, value message.Message) error {
+		if _, ok := value.(*common.MessageMissionRequestList); !ok {
+			t.Fatalf("unexpected write: %T", value)
+		}
+		a.observeMissionProtocolMessage(response)
+		return nil
+	}
+	if err := a.startMissionReadback(context.Background(), target, events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatal("stale response entered the new readback epoch during handoff")
+	}
+	a.observeMissionProtocolMessage(response)
+	if len(events) != 1 {
+		t.Fatal("post-handoff response was not admitted")
+	}
 }

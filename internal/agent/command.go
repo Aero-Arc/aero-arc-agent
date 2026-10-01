@@ -308,10 +308,14 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		a.mavlinkMu.Unlock()
 		return reject("mission start requires a fresh armed autopilot heartbeat")
 	}
+	targetIdentity := a.commandTargetIdentity(target)
 	pending := &pendingC2{target: target, command: m.Command, after: time.Now(), frames: make(chan *gomavlib.EventFrame, 64)}
 	a.c2Pending = pending
 	a.mavlinkMu.Unlock()
 	defer func() { a.mavlinkMu.Lock(); a.c2Pending = nil; a.mavlinkMu.Unlock() }()
+	if err = a.wal.BindCommandTarget(ctx, c.CommandId, targetIdentity); err != nil {
+		return reject(err.Error())
+	}
 	if m.VehicleProfile != "arducopter_v1" || target.autopilot != common.MAV_AUTOPILOT_ARDUPILOTMEGA {
 		return reject("unsupported vehicle profile")
 	}
@@ -472,8 +476,8 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	}
 }
 
-// observeDurableCommand consumes only fresh messages from the currently selected
-// autopilot. It is safe after expiry and across restart because it issues no effect.
+// observeDurableCommand consumes only fresh messages from the journaled effect
+// target. It is safe after expiry and across restart because it issues no effect.
 func (a *Agent) observeDurableCommand(ctx context.Context, c *pb.DurableCommand, e *pb.CommandEvidence, save func(string, string, string, bool) error) (*pb.CommandEvidence, error) {
 	m := c.GetMavlink()
 	if m == nil {
@@ -489,13 +493,20 @@ func (a *Agent) observeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	if !latest {
 		return e, save("observation_superseded", "newer aircraft command prevents attributing observations to this command", "agent_journal", true)
 	}
+	record, err := a.wal.LoadCommand(ctx, c.CommandId)
+	if err != nil {
+		return nil, err
+	}
+	if record.Target == "" {
+		return e, save("observation_unavailable", "historical effect has no durable target binding", "agent_journal", true)
+	}
 	a.mavlinkMu.Lock()
 	target := a.mavlinkTarget
 	if target != nil {
 		snapshot := *target
 		target = &snapshot
 	}
-	if target == nil || target.channel == nil {
+	if target == nil || target.channel == nil || a.commandTargetIdentity(target) != record.Target {
 		a.mavlinkMu.Unlock()
 		return e, nil
 	}
