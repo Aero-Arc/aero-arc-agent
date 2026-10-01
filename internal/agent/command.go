@@ -201,6 +201,13 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		if err != nil {
 			return err
 		}
+		if stage == "applied" && c.Definition == "MISSION_START" {
+			for _, event := range e.Events {
+				if event.Stage == "applied" {
+					a.acceptCompletionStart(c.CommandId, time.UnixMilli(event.OccurredAtUnixMs+1).UnixNano())
+				}
+			}
+		}
 		err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
 		if errors.Is(err, wal.ErrCommandSuperseded) {
 			e.Events = e.Events[:previousEvents]
@@ -218,6 +225,9 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		}
 		if err == nil && stage == "applied" && c.Definition == "MISSION_START" {
 			watch, loadErr := a.wal.LoadFlightWatch(ctx, c.Context.FlightId)
+			if loadErr == nil {
+				watch, loadErr = a.wal.LoadUnresolvedFlightWatch(ctx, watch.Target)
+			}
 			if loadErr == nil {
 				a.trackFlightCompletion(watch)
 			} else if !errors.Is(loadErr, sql.ErrNoRows) {

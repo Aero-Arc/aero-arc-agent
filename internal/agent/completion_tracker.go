@@ -42,6 +42,20 @@ func (a *Agent) trackFlightCompletion(watch wal.FlightWatch) {
 	a.completionTrackers[watch.Target] = &completionTracker{watch: watch, epoch: uuid.NewString()}
 }
 
+// acceptCompletionStart opens the observation epoch before the applied journal
+// write, so slow storage cannot lose post-ACK samples. The worker still requires
+// that exact applied boundary to be durable before persisting any milestones.
+func (a *Agent) acceptCompletionStart(commandID string, appliedAfter int64) {
+	a.completionMu.Lock()
+	defer a.completionMu.Unlock()
+	for _, t := range a.completionTrackers {
+		if t.watch.Command.CommandId == commandID && t.watch.AppliedAfter == 0 {
+			t.watch.AppliedAfter = appliedAfter
+			t.samples = completionSamples{}
+		}
+	}
+}
+
 func (a *Agent) restoreCompletionTrackers(ctx context.Context) error {
 	a.completionMu.Lock()
 	if a.completionWake == nil {
@@ -116,7 +130,7 @@ func (a *Agent) flushCompletionTrackers(ctx context.Context) {
 		// Accumulation can begin before COMMAND_ACK arrives. Publication still
 		// requires persisted applied start authority, including after a retry.
 		owner, err := a.wal.LoadUnresolvedFlightWatch(ctx, p.watch.Target)
-		if err == nil && (owner.Command.CommandId != p.watch.Command.CommandId || owner.HandoffAt != p.watch.HandoffAt) {
+		if err == nil && (owner.Command.CommandId != p.watch.Command.CommandId || owner.HandoffAt != p.watch.HandoffAt || owner.AppliedAfter != p.watch.AppliedAfter) {
 			err = errors.New("completion authority changed")
 		}
 		if err == nil {

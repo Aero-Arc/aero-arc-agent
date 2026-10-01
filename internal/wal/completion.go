@@ -19,6 +19,8 @@ import (
 // are deliberately process-local so a restart cannot combine stale observations.
 type FlightWatch struct {
 	Target string `json:"target"`
+	// AppliedAfter is restored from command evidence, never trusted from watch JSON.
+	AppliedAfter int64 `json:"-"`
 	// HandoffAt fences observations captured before the successful mission-start write.
 	HandoffAt       int64              `json:"handoff_at"`
 	Command         *pb.DurableCommand `json:"command"`
@@ -432,9 +434,21 @@ func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (Fli
 		for _, event := range events.Events {
 			applied = applied || event.Stage == "applied"
 			rejected = rejected || event.Stage == "rejected"
+			if event.Stage == "applied" && event.OccurredAtUnixMs > 0 {
+				// Exclude the entire millisecond containing ACK acceptance.
+				watch.AppliedAfter = time.UnixMilli(event.OccurredAtUnixMs + 1).UnixNano()
+			}
 		}
 		if !applied || rejected {
 			continue
+		}
+		if watch.AppliedAfter == 0 || watch.MissionActiveAt < watch.AppliedAfter {
+			// Older accumulators could retain pre-ACK mission milestones.
+			watch.MissionActiveAt, watch.TerminalAt = 0, 0
+			watch.Outcome = ""
+		}
+		if watch.AppliedAfter == 0 || watch.AirborneAt < watch.AppliedAfter {
+			watch.AirborneAt = 0
 		}
 		if found != nil {
 			return FlightWatch{}, errors.New("multiple unresolved flight watches for autopilot")

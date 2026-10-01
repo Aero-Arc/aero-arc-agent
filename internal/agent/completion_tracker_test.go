@@ -18,7 +18,7 @@ import (
 
 func TestCompletionDoesNotAttributePreExistingRecoveryToNewStart(t *testing.T) {
 	for _, mode := range []uint32{6, 9} {
-		watch := wal.FlightWatch{Target: "target", HandoffAt: 1, Command: &pb.DurableCommand{Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 21}}}}}}}
+		watch := wal.FlightWatch{Target: "target", HandoffAt: 1, AppliedAfter: 2, Command: &pb.DurableCommand{Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 21}}}}}}}
 		samples := completionSamples{}
 		observe := func(o completionObservation) {
 			t.Helper()
@@ -51,6 +51,7 @@ func TestCompletionDoesNotAttributePreExistingRecoveryToNewStart(t *testing.T) {
 		if err = json.Unmarshal(raw, &watch); err != nil {
 			t.Fatal(err)
 		}
+		watch.AppliedAfter = 2 // restored from durable applied command evidence
 		samples = completionSamples{}
 		observe(completionObservation{kind: "heartbeat", armed: true, mode: mode, at: 6})
 		if watch.TerminalAt != 6 || watch.Outcome != "ended_early" {
@@ -73,6 +74,39 @@ func TestCompletionPreservesPreHandoffArrival(t *testing.T) {
 	}
 }
 
+func TestCompletionRejectsPreviousMissionUntilStartACK(t *testing.T) {
+	a := &Agent{}
+	watch := wal.FlightWatch{Target: "target", HandoffAt: 10, Command: &pb.DurableCommand{CommandId: "new-start", Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 21}}}}}}}
+	a.trackFlightCompletion(watch)
+	observe := func(o completionObservation) { o.target = "target"; a.accumulateCompletion(o) }
+	previousMission := func(at int64) {
+		observe(completionObservation{kind: "heartbeat", armed: true, mode: 3, at: at})
+		observe(completionObservation{kind: "landed", landed: 2, at: at})
+		observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_ACTIVE), missionMode: 1, at: at})
+		observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_COMPLETE), sequence: 1, at: at + 1})
+	}
+	previousMission(11) // arrival after handoff, before the new start ACK
+	a.acceptCompletionStart("different-start", 20)
+	previousMission(13)
+	a.acceptCompletionStart("new-start", 20)
+	previousMission(15) // delayed observer retains its original pre-ACK arrival
+	tracker := a.completionTrackers["target"]
+	if tracker.watch.AirborneAt != 0 || tracker.watch.MissionActiveAt != 0 || tracker.watch.TerminalAt != 0 || tracker.revision != 0 {
+		t.Fatalf("previous mission admitted: %+v", tracker)
+	}
+	observe(completionObservation{kind: "heartbeat", armed: true, mode: 3, at: 21})
+	observe(completionObservation{kind: "landed", landed: 2, at: 22})
+	observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_COMPLETE), sequence: 1, at: 23})
+	if tracker.watch.TerminalAt != 0 {
+		t.Fatal("pre-ACK ACTIVE unlocked a post-ACK COMPLETE")
+	}
+	observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_ACTIVE), missionMode: 1, at: 24})
+	observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_COMPLETE), sequence: 1, at: 25})
+	if tracker.watch.MissionActiveAt != 24 || tracker.watch.TerminalAt != 25 {
+		t.Fatalf("post-ACK mission milestones missing: %+v", tracker.watch)
+	}
+}
+
 func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 	for _, test := range []struct {
 		name                  string
@@ -89,7 +123,7 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 			defer func() { _ = w.Close() }()
 			at := time.Now().UnixNano()
 			c := &pb.DurableCommand{CommandId: "start", AgentId: "agent", Context: &pb.OperationContext{AircraftId: "aircraft", FlightId: "flight", IntentId: "intent", IntentVersion: 1}, IssuedAtUnixMs: at / int64(time.Millisecond), Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPreconditionId: "mission", MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Autocontinue: true, Param4: 1}}}}}}
-			raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: "start", Events: []*pb.CommandEvent{{Stage: "applied"}}})
+			raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: "start", Events: []*pb.CommandEvent{{Stage: "applied", OccurredAtUnixMs: (at / int64(time.Millisecond)) - 1}}})
 			if err = w.AdmitCommand(ctx, "start", wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 				t.Fatal(err)
 			}
@@ -111,6 +145,7 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 					t.Fatal(loadErr)
 				}
 				watch.HandoffAt = at
+				watch.AppliedAfter = time.UnixMilli(at / int64(time.Millisecond)).UnixNano()
 				a.trackFlightCompletion(watch)
 			}
 			observe := func(o completionObservation) { o.target = "target"; o.at += at; a.accumulateCompletion(o) }

@@ -37,7 +37,7 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			at := time.Now().UnixNano()
 			binding := &pb.OperationContext{AircraftId: "aircraft", FlightId: "flight", IntentId: "intent", IntentVersion: 1}
 			c := &pb.DurableCommand{CommandId: "start", AgentId: "agent", Context: binding, IssuedAtUnixMs: at / int64(time.Millisecond), Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPreconditionId: "mission", MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Autocontinue: true, Param4: 1}}}}}}
-			evidence, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied"}}})
+			evidence, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied", OccurredAtUnixMs: time.Now().Add(-3 * time.Second).UnixMilli()}}})
 			if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: evidence}); err != nil {
 				t.Fatal(err)
 			}
@@ -181,7 +181,7 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	c := testC2Command(t)
 	c.GetMavlink().MissionPrecondition = &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Param4: 1, Autocontinue: true}}}
 	c.GetMavlink().MissionPreconditionId = "mission"
-	raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied"}}})
+	raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied", OccurredAtUnixMs: time.Now().Add(-3 * time.Second).UnixMilli()}}})
 	if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestCompletionIgnoresQueuedPreHandoffObservations(t *testing.T) {
 	defer func() { _ = w.Close() }()
 	c := testC2Command(t)
 	c.GetMavlink().MissionPrecondition = &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 21, Param4: 1, Autocontinue: true}}}
-	raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied"}}})
+	raw, _ := proto.Marshal(&pb.CommandEvidence{CommandId: c.CommandId, Events: []*pb.CommandEvent{{Stage: "applied", OccurredAtUnixMs: time.Now().Add(-3 * time.Second).UnixMilli()}}})
 	if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 		t.Fatal(err)
 	}

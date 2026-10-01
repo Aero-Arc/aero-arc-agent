@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIncompleteMissionWatchesAreQuarantinedOnUpgrade(t *testing.T) {
@@ -270,6 +271,50 @@ func TestFlightWatchIndexMigratesHistoryAndIsolatesCorruption(t *testing.T) {
 	}
 	if _, err = w.LoadUnresolvedFlightWatch(ctx, "healthy-target"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("completed watch remains active: %v", err)
+	}
+}
+
+func TestFlightWatchRestoresAppliedBoundaryFromCommandEvidence(t *testing.T) {
+	for _, stamp := range []int64{0, 100} {
+		t.Run(fmt.Sprint(stamp), func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "boundary.db")
+			w, err := New(ctx, path, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &pb.DurableCommand{CommandId: "start", Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{SchemaVersion: 1, Items: []*pb.MissionItem{{Command: 20}}}}}}
+			raw, _ := proto.Marshal(&pb.CommandEvidence{Events: []*pb.CommandEvent{{Stage: "applied", OccurredAtUnixMs: stamp}}})
+			if err = w.AdmitCommand(ctx, "start", CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
+				t.Fatal(err)
+			}
+			if err = w.BeginFlightWatch(ctx, c, "target"); err != nil {
+				t.Fatal(err)
+			}
+			watch := FlightWatch{Target: "target", Command: c, HandoffAt: 1, AppliedAfter: 2, AirborneAt: 3, MissionActiveAt: 4, TerminalAt: 5, Outcome: "mission_completed"}
+			if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err = w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			w, err = New(ctx, path, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = w.Close() }()
+			watch, err = w.LoadUnresolvedFlightWatch(ctx, "target")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := int64(0)
+			if stamp > 0 {
+				want = time.UnixMilli(stamp + 1).UnixNano()
+			}
+			if watch.AppliedAfter != want || watch.AirborneAt != 0 || watch.MissionActiveAt != 0 || watch.TerminalAt != 0 || watch.Outcome != "" {
+				t.Fatalf("pre-ACK milestones or watch-supplied boundary trusted: %+v", watch)
+			}
+		})
 	}
 }
 

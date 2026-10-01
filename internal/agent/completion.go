@@ -162,7 +162,7 @@ func (a *Agent) observeCompletion(ctx context.Context, o completionObservation, 
 // reduceCompletion performs no I/O: bounded state retains milestones even when
 // the persistence worker is blocked. Samples retain their original capture times.
 func reduceCompletion(watch *wal.FlightWatch, o completionObservation, epoch string, samples *completionSamples) (bool, *pb.FlightCompletionEvidence, error) {
-	if watch.Done || watch.Target != o.target || watch.HandoffAt == 0 || o.at < watch.HandoffAt {
+	if watch.Done || watch.Target != o.target || watch.HandoffAt == 0 || o.at < watch.HandoffAt || watch.AppliedAfter == 0 || o.at < watch.AppliedAfter {
 		return false, nil, nil
 	}
 	c := watch.Command

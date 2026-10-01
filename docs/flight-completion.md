@@ -13,11 +13,21 @@ structure. Invalid payloads remain preserved and quarantined, and cannot reach
 the completion reducer.
 
 Terminal classification requires observed airborne AUTO execution with active
-MISSION_CURRENT evidence after the start handoff, matching the MISSION_START
+MISSION_CURRENT evidence after the start's accepted COMMAND_ACK, matching the MISSION_START
 observation predicate. This milestone persists across restart. A recovery mode that
 was already present before the autopilot processes MISSION_START cannot by
 itself mark the new flight ended early; an older watch lacking this milestone
 must observe AUTO before that fallback can be used.
+
+The observation boundary comes from the applied command event and excludes its
+entire timestamp millisecond. Pre-ACK samples, including buffered ACTIVE and
+COMPLETE messages from an earlier mission, cannot seed completion milestones.
+The accumulator opens before the applied journal write so storage delays do not
+drop later evidence, but its worker requires that exact boundary to be durable.
+Restart derives the boundary from command evidence rather than trusting watch
+JSON, and discards older milestones preceding it. Missing applied timestamps
+fail closed. This remains MAVLink correlation, not an autopilot-issued mission
+execution identity.
 
 Completion tracking is bound to the immutable, applied MISSION_START command and
 its verified terminal RTL/LAND mission. It requires observed airborne state,
