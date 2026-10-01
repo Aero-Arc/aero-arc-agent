@@ -73,6 +73,7 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			pending(0)
 			observe(completionObservation{target: "test-target", kind: "heartbeat", armed: true, mode: 3, at: int64(time.Second)})
 			observe(completionObservation{target: "test-target", kind: "landed", landed: 2, at: int64(time.Second)})
+			observe(completionObservation{target: "test-target", kind: "mission", missionState: uint32(common.MISSION_STATE_ACTIVE), missionMode: 1, at: int64(time.Second)})
 			if early {
 				observe(completionObservation{target: "test-target", kind: "heartbeat", armed: true, mode: 6, at: int64(2 * time.Second)})
 			} else {

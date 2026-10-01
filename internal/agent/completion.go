@@ -27,6 +27,7 @@ type completionObservation struct {
 	landed       uint32
 	sequence     uint32
 	missionState uint32
+	missionMode  uint32
 }
 
 type completionSamples struct {
@@ -75,6 +76,7 @@ func (a *Agent) completionObservationAt(frame *gomavlib.EventFrame, arrivedAt ti
 		o.kind = "mission"
 		o.sequence = uint32(m.Seq)
 		o.missionState = uint32(m.MissionState)
+		o.missionMode = uint32(m.MissionMode)
 	default:
 		return completionObservation{}, false
 	}
@@ -187,18 +189,19 @@ func reduceCompletion(watch *wal.FlightWatch, o completionObservation, epoch str
 		return false, nil, nil
 	}
 	// A pre-existing RTL/LAND heartbeat may arrive after transport handoff but
-	// before MISSION_START takes effect. Establish airborne AUTO execution first.
+	// before MISSION_START takes effect. Establish airborne AUTO execution with
+	// active MISSION_CURRENT evidence, matching the command observation predicate.
 	// Persist this milestone so a restart during later recovery retains it.
-	if watch.MissionActiveAt == 0 && samples.armed && samples.mode == 3 && samples.landed == uint32(common.MAV_LANDED_STATE_IN_AIR) && fresh(samples.heartbeatAt) && fresh(samples.landedAt) {
+	if watch.MissionActiveAt == 0 && o.kind == "mission" && o.missionState == uint32(common.MISSION_STATE_ACTIVE) && o.missionMode == 1 && samples.armed && samples.mode == 3 && samples.landed == uint32(common.MAV_LANDED_STATE_IN_AIR) && fresh(samples.heartbeatAt) && fresh(samples.landedAt) {
 		watch.MissionActiveAt = o.at
 		changed = true
 	}
-	if watch.TerminalAt == 0 {
+	if watch.TerminalAt == 0 && watch.MissionActiveAt > 0 {
 		if o.kind == "mission" && samples.mode == 3 && samples.armed && fresh(samples.heartbeatAt) && (o.sequence == uint32(len(c.GetMavlink().MissionPrecondition.Items)) || o.missionState == uint32(common.MISSION_STATE_COMPLETE)) {
 			watch.TerminalAt = o.at
 			watch.Outcome = "mission_completed"
 			changed = true
-		} else if watch.MissionActiveAt > 0 && o.kind == "heartbeat" && o.armed && (o.mode == 6 || o.mode == 9) {
+		} else if o.kind == "heartbeat" && o.armed && (o.mode == 6 || o.mode == 9) {
 			watch.TerminalAt = o.at
 			watch.Outcome = "ended_early"
 			changed = true

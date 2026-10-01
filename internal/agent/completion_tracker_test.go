@@ -34,6 +34,11 @@ func TestCompletionDoesNotAttributePreExistingRecoveryToNewStart(t *testing.T) {
 			t.Fatalf("pre-existing recovery classified as ending: %+v", watch)
 		}
 		observe(completionObservation{kind: "heartbeat", armed: true, mode: 3, at: 5})
+		observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_COMPLETE), sequence: 1, at: 5})
+		if watch.MissionActiveAt != 0 || watch.TerminalAt != 0 {
+			t.Fatal("AUTO with stale completed mission counted as execution")
+		}
+		observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_ACTIVE), missionMode: 1, at: 5})
 		if watch.MissionActiveAt != 5 {
 			t.Fatalf("AUTO execution not retained: %+v", watch)
 		}
@@ -111,6 +116,7 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 			observe := func(o completionObservation) { o.target = "target"; o.at += at; a.accumulateCompletion(o) }
 			observe(completionObservation{kind: "heartbeat", armed: true, mode: 3, at: 1})
 			observe(completionObservation{kind: "landed", landed: 2, at: 2})
+			observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_ACTIVE), missionMode: 1, at: 2})
 			// Hold SQLite's writer lock while the worker attempts to persist the
 			// airborne milestone. Ingest must continue without waiting on that lock.
 			db, err := sql.Open("sqlite", path)
