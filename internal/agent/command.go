@@ -22,10 +22,12 @@ import (
 )
 
 type pendingC2 struct {
-	target  *mavlinkTarget
-	command uint32
-	after   time.Time
-	frames  chan *gomavlib.EventFrame
+	target              *mavlinkTarget
+	command             uint32
+	after               time.Time
+	frames              chan *gomavlib.EventFrame
+	completionCommandID string
+	acceptedAt          time.Time
 }
 
 func (a *Agent) observeC2Frame(frame *gomavlib.EventFrame) {
@@ -51,6 +53,10 @@ func (a *Agent) observeC2FrameAt(frame *gomavlib.EventFrame, arrivedAt time.Time
 	// profile carried by this frame as well as the previously selected profile.
 	if heartbeat, ok := frame.Message().(*common.MessageHeartbeat); ok && (heartbeat.Autopilot != p.target.autopilot || heartbeat.Type != p.target.vehicleType) {
 		return
+	}
+	if ack, ok := frame.Message().(*common.MessageCommandAck); ok && p.completionCommandID != "" && p.acceptedAt.IsZero() && uint32(ack.Command) == p.command && ack.Result == common.MAV_RESULT_ACCEPTED && (ack.TargetSystem == 0 || ack.TargetSystem == mavlinkSourceSystemID) && (ack.TargetComponent == 0 || ack.TargetComponent == mavlinkSourceComponentID) {
+		p.acceptedAt = arrivedAt
+		a.acceptCompletionStart(p.completionCommandID, arrivedAt.UnixNano()+1)
 	}
 	select {
 	case p.frames <- frame:
@@ -200,13 +206,6 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 		b, err := proto.Marshal(e)
 		if err != nil {
 			return err
-		}
-		if stage == "applied" && c.Definition == "MISSION_START" {
-			for _, event := range e.Events {
-				if event.Stage == "applied" {
-					a.acceptCompletionStart(c.CommandId, time.UnixMilli(event.OccurredAtUnixMs+1).UnixNano())
-				}
-			}
 		}
 		err = a.wal.SaveCommand(ctx, c.CommandId, digest, b, effect)
 		if errors.Is(err, wal.ErrCommandSuperseded) {
@@ -495,6 +494,9 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 	}
 	a.mavlinkMu.Lock()
 	pending.after = handoffAt
+	if completionWatch != nil {
+		pending.completionCommandID = c.CommandId
+	}
 	a.mavlinkMu.Unlock()
 	if c.Definition == "MISSION_START" {
 		if err = a.wal.RecordFlightWatchHandoff(ctx, c, handoffAt.UnixNano()); err != nil {
@@ -516,6 +518,17 @@ func (a *Agent) executeDurableCommand(ctx context.Context, c *pb.DurableCommand,
 					continue
 				}
 				if v.Result == common.MAV_RESULT_ACCEPTED {
+					if completionWatch != nil {
+						a.mavlinkMu.Lock()
+						acceptedAt := pending.acceptedAt
+						a.mavlinkMu.Unlock()
+						if acceptedAt.IsZero() {
+							return e, save("outcome_unknown", "start ACK arrival boundary unavailable", "agent", true)
+						}
+						if err = a.wal.RecordFlightWatchACK(ctx, c, acceptedAt.UnixNano()); err != nil {
+							return nil, err
+						}
+					}
 					if err = save("applied", "autopilot accepted command; observation pending", "mavlink_command_ack", true); err != nil {
 						return nil, err
 					}

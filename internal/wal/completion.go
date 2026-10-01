@@ -19,8 +19,9 @@ import (
 // are deliberately process-local so a restart cannot combine stale observations.
 type FlightWatch struct {
 	Target string `json:"target"`
-	// AppliedAfter is restored from command evidence, never trusted from watch JSON.
+	// AppliedAfter is derived from the persisted start ACK, only with applied authority.
 	AppliedAfter int64 `json:"-"`
+	StartACKAt   int64 `json:"start_ack_at"`
 	// HandoffAt fences observations captured before the successful mission-start write.
 	HandoffAt       int64              `json:"handoff_at"`
 	Command         *pb.DurableCommand `json:"command"`
@@ -274,6 +275,22 @@ func (w *WAL) SaveFlightWatch(ctx context.Context, v FlightWatch, e *pb.FlightCo
 	return tx.Commit()
 }
 
+// RecordFlightWatchACK persists the captured acceptance boundary for a start.
+// Parameters: ctx bounds storage; c identifies the exact start; at is the ACK's
+// local MAVLink arrival time. Returns nil for an exact immutable binding, or an
+// error for a changed boundary, pre-handoff ACK, missing watch, or storage failure.
+func (w *WAL) RecordFlightWatchACK(ctx context.Context, c *pb.DurableCommand, at int64) error {
+	v, err := w.LoadFlightWatch(ctx, c.Context.FlightId)
+	if err != nil {
+		return err
+	}
+	if v.Command.CommandId != c.CommandId || v.HandoffAt == 0 || at < v.HandoffAt || (v.StartACKAt != 0 && v.StartACKAt != at) {
+		return errors.New("flight watch ACK boundary mismatch")
+	}
+	v.StartACKAt = at
+	return w.SaveFlightWatch(ctx, v, nil)
+}
+
 // PendingFlightCompletions returns bounded unacknowledged events for replay.
 //
 // Parameters: ctx bounds the read/quarantine transaction.
@@ -434,13 +451,12 @@ func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (Fli
 		for _, event := range events.Events {
 			applied = applied || event.Stage == "applied"
 			rejected = rejected || event.Stage == "rejected"
-			if event.Stage == "applied" && event.OccurredAtUnixMs > 0 {
-				// Exclude the entire millisecond containing ACK acceptance.
-				watch.AppliedAfter = time.UnixMilli(event.OccurredAtUnixMs + 1).UnixNano()
-			}
 		}
 		if !applied || rejected {
 			continue
+		}
+		if watch.HandoffAt > 0 && watch.StartACKAt >= watch.HandoffAt {
+			watch.AppliedAfter = watch.StartACKAt + 1
 		}
 		if watch.AppliedAfter == 0 || watch.MissionActiveAt < watch.AppliedAfter {
 			// Older accumulators could retain pre-ACK mission milestones.

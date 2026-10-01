@@ -47,6 +47,9 @@ func TestCompletionRequiresAirborneRecoveryAndFreshDisarmedGround(t *testing.T) 
 			if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
 				t.Fatal(err)
 			}
+			if err = w.RecordFlightWatchACK(ctx, c, at); err != nil {
+				t.Fatal(err)
+			}
 			a := &Agent{wal: w}
 			samples := completionSamples{}
 			observe := func(o completionObservation) {
@@ -193,6 +196,7 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	watch.HandoffAt = time.Now().Add(-2 * time.Second).UnixNano()
+	watch.StartACKAt = watch.HandoffAt
 	watch.AirborneAt = time.Now().Add(-time.Second).UnixNano()
 	watch.MissionActiveAt = watch.AirborneAt
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
@@ -266,6 +270,9 @@ func TestCompletionIgnoresQueuedPreHandoffObservations(t *testing.T) {
 	}
 	handoff := time.Now().Add(time.Second).UnixNano()
 	if err = w.RecordFlightWatchHandoff(ctx, c, handoff); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.RecordFlightWatchACK(ctx, c, handoff); err != nil {
 		t.Fatal(err)
 	}
 	a := &Agent{wal: w}

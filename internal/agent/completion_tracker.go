@@ -51,6 +51,7 @@ func (a *Agent) acceptCompletionStart(commandID string, appliedAfter int64) {
 	for _, t := range a.completionTrackers {
 		if t.watch.Command.CommandId == commandID && t.watch.AppliedAfter == 0 {
 			t.watch.AppliedAfter = appliedAfter
+			t.watch.StartACKAt = appliedAfter - 1
 			t.samples = completionSamples{}
 		}
 	}

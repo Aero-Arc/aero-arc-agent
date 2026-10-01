@@ -75,7 +75,10 @@ func TestCompletionPreservesPreHandoffArrival(t *testing.T) {
 }
 
 func TestCompletionRejectsPreviousMissionUntilStartACK(t *testing.T) {
-	a := &Agent{}
+	target := &mavlinkTarget{channel: &gomavlib.Channel{}, systemID: 1, componentID: 1}
+	a := &Agent{mavlinkTarget: target}
+	pending := &pendingC2{target: target, command: uint32(common.MAV_CMD_MISSION_START), after: time.Unix(0, 10), completionCommandID: "new-start", frames: make(chan *gomavlib.EventFrame, 64)}
+	a.c2Pending = pending
 	watch := wal.FlightWatch{Target: "target", HandoffAt: 10, Command: &pb.DurableCommand{CommandId: "new-start", Context: &pb.OperationContext{FlightId: "flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 21}}}}}}}
 	a.trackFlightCompletion(watch)
 	observe := func(o completionObservation) { o.target = "target"; a.accumulateCompletion(o) }
@@ -88,7 +91,9 @@ func TestCompletionRejectsPreviousMissionUntilStartACK(t *testing.T) {
 	previousMission(11) // arrival after handoff, before the new start ACK
 	a.acceptCompletionStart("different-start", 20)
 	previousMission(13)
-	a.acceptCompletionStart("new-start", 20)
+	// The reader sees acceptance and immediate progress while the command
+	// goroutine has not consumed even the ACK from its queue.
+	a.observeC2FrameAt(&gomavlib.EventFrame{Channel: target.channel, Frame: &frame.V2Frame{SystemID: 1, ComponentID: 1, Message: &common.MessageCommandAck{Command: common.MAV_CMD_MISSION_START, Result: common.MAV_RESULT_ACCEPTED}}}, time.Unix(0, 20))
 	previousMission(15) // delayed observer retains its original pre-ACK arrival
 	tracker := a.completionTrackers["target"]
 	if tracker.watch.AirborneAt != 0 || tracker.watch.MissionActiveAt != 0 || tracker.watch.TerminalAt != 0 || tracker.revision != 0 {
@@ -104,6 +109,9 @@ func TestCompletionRejectsPreviousMissionUntilStartACK(t *testing.T) {
 	observe(completionObservation{kind: "mission", missionState: uint32(common.MISSION_STATE_COMPLETE), sequence: 1, at: 25})
 	if tracker.watch.MissionActiveAt != 24 || tracker.watch.TerminalAt != 25 {
 		t.Fatalf("post-ACK mission milestones missing: %+v", tracker.watch)
+	}
+	if len(pending.frames) != 1 || tracker.watch.StartACKAt != 20 || tracker.watch.AppliedAfter != 21 {
+		t.Fatalf("ACK arrival lost before command consumer ran: %+v", tracker.watch)
 	}
 }
 
@@ -134,6 +142,9 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 				if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
 					t.Fatal(err)
 				}
+				if err = w.RecordFlightWatchACK(ctx, c, at); err != nil {
+					t.Fatal(err)
+				}
 			}
 			a := &Agent{wal: w}
 			if err = a.restoreCompletionTrackers(ctx); err != nil {
@@ -145,7 +156,8 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 					t.Fatal(loadErr)
 				}
 				watch.HandoffAt = at
-				watch.AppliedAfter = time.UnixMilli(at / int64(time.Millisecond)).UnixNano()
+				watch.StartACKAt = at
+				watch.AppliedAfter = at + 1
 				a.trackFlightCompletion(watch)
 			}
 			observe := func(o completionObservation) { o.target = "target"; o.at += at; a.accumulateCompletion(o) }
@@ -210,6 +222,9 @@ func TestCompletionMilestonesSurvivePersistenceBackpressure(t *testing.T) {
 					t.Fatalf("uncommitted handoff published: %v %v", events, loadErr)
 				}
 				if err = w.RecordFlightWatchHandoff(ctx, c, at); err != nil {
+					t.Fatal(err)
+				}
+				if err = w.RecordFlightWatchACK(ctx, c, at); err != nil {
 					t.Fatal(err)
 				}
 			}

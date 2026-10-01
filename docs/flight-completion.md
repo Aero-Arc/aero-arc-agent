@@ -19,14 +19,14 @@ was already present before the autopilot processes MISSION_START cannot by
 itself mark the new flight ended early; an older watch lacking this milestone
 must observe AUTO before that fallback can be used.
 
-The observation boundary comes from the applied command event and excludes its
-entire timestamp millisecond. Pre-ACK samples, including buffered ACTIVE and
+The MAVLink reader captures the correlated accepted ACK's arrival time and opens
+the completion accumulator immediately, before the command goroutine consumes
+the ACK. The boundary excludes samples at or before that nanosecond. Pre-ACK samples, including buffered ACTIVE and
 COMPLETE messages from an earlier mission, cannot seed completion milestones.
-The accumulator opens before the applied journal write so storage delays do not
-drop later evidence, but its worker requires that exact boundary to be durable.
-Restart derives the boundary from command evidence rather than trusting watch
-JSON, and discards older milestones preceding it. Missing applied timestamps
-fail closed. This remains MAVLink correlation, not an autopilot-issued mission
+The worker requires that exact captured boundary and applied command authority
+to be durable before committing milestones. Restart restores the captured ACK
+boundary and discards older milestones preceding it. Missing captured ACKs fail
+closed; command processing time is not a substitute. This remains MAVLink correlation, not an autopilot-issued mission
 execution identity.
 
 Completion tracking is bound to the immutable, applied MISSION_START command and

@@ -274,7 +274,7 @@ func TestFlightWatchIndexMigratesHistoryAndIsolatesCorruption(t *testing.T) {
 	}
 }
 
-func TestFlightWatchRestoresAppliedBoundaryFromCommandEvidence(t *testing.T) {
+func TestFlightWatchRestoresCapturedACKBoundaryWithAppliedAuthority(t *testing.T) {
 	for _, stamp := range []int64{0, 100} {
 		t.Run(fmt.Sprint(stamp), func(t *testing.T) {
 			ctx := context.Background()
@@ -292,6 +292,9 @@ func TestFlightWatchRestoresAppliedBoundaryFromCommandEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			watch := FlightWatch{Target: "target", Command: c, HandoffAt: 1, AppliedAfter: 2, AirborneAt: 3, MissionActiveAt: 4, TerminalAt: 5, Outcome: "mission_completed"}
+			if stamp > 0 {
+				watch.StartACKAt = time.UnixMilli(stamp).UnixNano()
+			}
 			if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
 				t.Fatal(err)
 			}
@@ -309,7 +312,7 @@ func TestFlightWatchRestoresAppliedBoundaryFromCommandEvidence(t *testing.T) {
 			}
 			want := int64(0)
 			if stamp > 0 {
-				want = time.UnixMilli(stamp + 1).UnixNano()
+				want = time.UnixMilli(stamp).UnixNano() + 1
 			}
 			if watch.AppliedAfter != want || watch.AirborneAt != 0 || watch.MissionActiveAt != 0 || watch.TerminalAt != 0 || watch.Outcome != "" {
 				t.Fatalf("pre-ACK milestones or watch-supplied boundary trusted: %+v", watch)
