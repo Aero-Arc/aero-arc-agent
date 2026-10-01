@@ -128,7 +128,7 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand, target
 		return err
 	}
 	var quarantined bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM flight_watch_index WHERE quarantine_reason<>'' AND (target='' OR target=?))`, target).Scan(&quarantined); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM flight_watch_index WHERE done=0 AND quarantine_reason<>'' AND (target='' OR target=?))`, target).Scan(&quarantined); err != nil {
 		return err
 	}
 	if quarantined {

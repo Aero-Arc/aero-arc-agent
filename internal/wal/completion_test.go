@@ -195,6 +195,13 @@ func TestFlightWatchIndexMigratesHistoryAndIsolatesCorruption(t *testing.T) {
 	if err = w.BeginFlightWatch(ctx, next, "other-target"); err == nil {
 		t.Fatal("quarantined ownership allowed a new start")
 	}
+	// Completed quarantined history must not reserve the target forever.
+	if _, err = w.db.Exec(`UPDATE flight_watch_index SET done=1 WHERE flight_id='broken'`); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.BeginFlightWatch(ctx, next, "other-target"); err != nil {
+		t.Fatalf("completed quarantine blocked a new flight: %v", err)
+	}
 	// Corruption of already indexed history is irrelevant to the active target:
 	// no JSON expression or decoder should touch these completed records.
 	if _, err = w.db.Exec(`UPDATE flight_watches SET payload=X'ff' WHERE flight_id LIKE 'old-%' OR flight_id='broken'`); err != nil {
