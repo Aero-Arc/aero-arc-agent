@@ -30,3 +30,12 @@ and require operator reconciliation; command issue time is not a substitute.
 Malformed or identity/digest-mismatched completion rows are preserved in SQLite
 and excluded through `flight_completion_quarantine`, with a logged reason for
 operator repair. They never acknowledge delivery or block healthy later events.
+
+Flight-watch routing uses `flight_watch_index` target/done metadata, maintained
+in the same transaction as the watch. Startup backfills older payloads in bounded
+batches; heartbeat processing reads only unfinished watches for its exact target,
+not retained historical mission payloads. Malformed legacy watches retain their
+original bytes and a logged quarantine reason. A corrupt known target blocks its
+own unresolved authority; an undecodable legacy target blocks attribution and
+new starts until operator repair because ownership cannot safely be inferred.
+No quarantine record is treated as completion or permission to retry a start.

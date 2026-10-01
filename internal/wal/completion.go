@@ -92,7 +92,7 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand, target
 	if _, err = tx.ExecContext(ctx, `UPDATE flight_watches SET payload=payload WHERE flight_id=?`, c.Context.FlightId); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT w.payload,COALESCE(c.evidence,X'') FROM flight_watches w LEFT JOIN c2_commands c ON c.command_id=w.start_command_id WHERE w.start_command_id<>? AND json_extract(w.payload,'$.done')=0 AND json_extract(w.payload,'$.target')=?`, c.CommandId, target)
+	rows, err := tx.QueryContext(ctx, `SELECT w.payload,COALESCE(c.evidence,X'') FROM flight_watches w LEFT JOIN c2_commands c ON c.command_id=w.start_command_id JOIN flight_watch_index i ON i.flight_id=w.flight_id WHERE w.start_command_id<>? AND i.done=0 AND i.target=?`, c.CommandId, target)
 	if err != nil {
 		return err
 	}
@@ -127,6 +127,13 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand, target
 	if err != nil {
 		return err
 	}
+	var quarantined bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM flight_watch_index WHERE quarantine_reason<>'' AND (target='' OR target=?))`, target).Scan(&quarantined); err != nil {
+		return err
+	}
+	if quarantined {
+		return errors.New("unresolved quarantined flight watch requires operator repair")
+	}
 	m := c.GetMavlink()
 	if m == nil || m.MissionPrecondition == nil || len(m.MissionPrecondition.Items) == 0 {
 		return tx.Commit()
@@ -141,6 +148,9 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand, target
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO flight_watches(flight_id,start_command_id,payload) VALUES(?,?,?) ON CONFLICT(flight_id) DO NOTHING`, c.Context.FlightId, c.CommandId, raw); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO flight_watch_index(flight_id,target,done) VALUES(?,?,0) ON CONFLICT(flight_id) DO NOTHING`, c.Context.FlightId, target); err != nil {
 		return err
 	}
 	var previous []byte
@@ -181,6 +191,9 @@ func (w *WAL) BeginFlightWatch(ctx context.Context, c *pb.DurableCommand, target
 		return errors.New("previous mission start outcome is unresolved")
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE flight_watches SET start_command_id=?,payload=? WHERE flight_id=?`, c.CommandId, raw, c.Context.FlightId); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE flight_watch_index SET target=?,done=0 WHERE flight_id=?`, target, c.Context.FlightId); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -243,6 +256,17 @@ func (w *WAL) SaveFlightWatch(ctx context.Context, v FlightWatch, e *pb.FlightCo
 	}
 	if n != 1 {
 		return errors.New("flight watch changed")
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE flight_watch_index SET done=? WHERE flight_id=? AND target=? AND quarantine_reason=''`, v.Done, v.Command.Context.FlightId, v.Target)
+	if err != nil {
+		return err
+	}
+	n, err = result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errors.New("flight watch target changed or quarantined")
 	}
 	return tx.Commit()
 }
@@ -370,7 +394,15 @@ func (w *WAL) AcknowledgeFlightCompletion(ctx context.Context, r *pb.FlightCompl
 // Returns: the unique matching watch, sql.ErrNoRows when none is eligible, or a
 // decoding/storage/ambiguity error. Multiple candidates never authorize attribution.
 func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (FlightWatch, error) {
-	rows, err := w.db.QueryContext(ctx, `SELECT w.payload,c.evidence FROM flight_watches w JOIN c2_commands c ON c.command_id=w.start_command_id WHERE json_extract(w.payload,'$.done')=0 AND json_extract(w.payload,'$.target')=?`, target)
+	var unknown bool
+	if err := w.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM flight_watch_index WHERE (target='' OR target=?) AND done=0 AND quarantine_reason<>'')`, target).Scan(&unknown); err != nil {
+		return FlightWatch{}, err
+	}
+	if unknown {
+		return FlightWatch{}, errors.New("quarantined unresolved watch may own target; operator repair required")
+	}
+
+	rows, err := w.db.QueryContext(ctx, `SELECT w.payload,c.evidence FROM flight_watches w JOIN c2_commands c ON c.command_id=w.start_command_id JOIN flight_watch_index i ON i.flight_id=w.flight_id WHERE i.done=0 AND i.target=?`, target)
 	if err != nil {
 		return FlightWatch{}, err
 	}
@@ -385,6 +417,9 @@ func (w *WAL) LoadUnresolvedFlightWatch(ctx context.Context, target string) (Fli
 		var events pb.CommandEvidence
 		if err = json.Unmarshal(raw, &watch); err != nil {
 			return FlightWatch{}, err
+		}
+		if watch.Target != target || watch.Done || watch.Command.GetCommandId() == "" || watch.Command.GetContext().GetFlightId() == "" {
+			return FlightWatch{}, errors.New("flight watch disagrees with indexed authority")
 		}
 		if err = proto.Unmarshal(evidence, &events); err != nil {
 			return FlightWatch{}, err

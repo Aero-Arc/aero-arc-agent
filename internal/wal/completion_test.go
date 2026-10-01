@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/aero-arc/aero-arc-protos/flightcompletion"
@@ -125,5 +126,110 @@ func TestUnfinishedTargetWatchBlocksOtherFlightsIncludingNoWatchStarts(t *testin
 	}
 	if _, err = w.LoadFlightWatch(ctx, "next-flight"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("blocked admission persisted watch: %v", err)
+	}
+}
+
+func TestFlightWatchIndexMigratesHistoryAndIsolatesCorruption(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	w, err := New(ctx, path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := &pb.DurableCommand{CommandId: "healthy", Context: &pb.OperationContext{FlightId: "healthy-flight"}, Execution: &pb.DurableCommand_Mavlink{Mavlink: &pb.MavlinkExecution{MissionPrecondition: &pb.MissionPlan{Items: []*pb.MissionItem{{Command: 20}}}}}}
+	evidence, _ := proto.Marshal(&pb.CommandEvidence{Events: []*pb.CommandEvent{{Stage: "applied"}}})
+	if err = w.AdmitCommand(ctx, command.CommandId, CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: evidence}); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.BeginFlightWatch(ctx, command, "healthy-target"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-index database with retained completed missions and a
+	// malformed protobuf in an unrelated watch whose routing JSON is intact.
+	for i := 0; i < 80; i++ {
+		c := proto.Clone(command).(*pb.DurableCommand)
+		c.CommandId = fmt.Sprintf("old-%d", i)
+		c.Context.FlightId = c.CommandId
+		raw, marshalErr := json.Marshal(FlightWatch{Command: c, Target: "healthy-target", Done: true})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, err = w.db.Exec(`INSERT INTO flight_watches(flight_id,start_command_id,payload) VALUES(?,?,?)`, c.CommandId, c.CommandId, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	corrupt := []byte(`{"target":"other-target","done":false,"command":{"invalidProtoField":true}}`)
+	if _, err = w.db.Exec(`INSERT INTO flight_watches VALUES('broken','broken',?)`, corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.db.Exec(`DROP TABLE flight_watch_index`); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w, err = New(ctx, path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	watch, err := w.LoadUnresolvedFlightWatch(ctx, "healthy-target")
+	if err != nil || watch.Command.GetCommandId() != command.CommandId {
+		t.Fatalf("healthy watch=%+v err=%v", watch, err)
+	}
+	var retained []byte
+	var reason string
+	if err = w.db.QueryRow(`SELECT w.payload,i.quarantine_reason FROM flight_watches w JOIN flight_watch_index i ON i.flight_id=w.flight_id WHERE w.flight_id='broken'`).Scan(&retained, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(retained, corrupt) || reason == "" {
+		t.Fatal("corrupt watch was not retained and quarantined")
+	}
+	next := proto.Clone(command).(*pb.DurableCommand)
+	next.CommandId = "new"
+	next.Context.FlightId = "new"
+	if err = w.BeginFlightWatch(ctx, next, "other-target"); err == nil {
+		t.Fatal("quarantined ownership allowed a new start")
+	}
+	// Corruption of already indexed history is irrelevant to the active target:
+	// no JSON expression or decoder should touch these completed records.
+	if _, err = w.db.Exec(`UPDATE flight_watches SET payload=X'ff' WHERE flight_id LIKE 'old-%' OR flight_id='broken'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.LoadUnresolvedFlightWatch(ctx, "healthy-target"); err != nil {
+		t.Fatal(err)
+	}
+	watch.Done = true
+	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.LoadUnresolvedFlightWatch(ctx, "healthy-target"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("completed watch remains active: %v", err)
+	}
+}
+
+func TestFlightWatchUnknownCorruptLegacyAuthorityFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	w, err := New(ctx, filepath.Join(t.TempDir(), "unknown.db"), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err = w.db.Exec(`INSERT INTO flight_watches VALUES('broken','broken',X'ff')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = ensureFlightWatchIndex(w.db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = w.LoadUnresolvedFlightWatch(ctx, "any-target"); err == nil || errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("unknown corrupt ownership did not fail closed: %v", err)
 	}
 }

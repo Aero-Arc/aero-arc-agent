@@ -184,14 +184,13 @@ func TestShutdownDrainsAcceptedTerminalObservation(t *testing.T) {
 	if err = w.AdmitCommand(ctx, c.CommandId, wal.CommandRecord{Digest: "digest", Payload: []byte{}, Evidence: raw}); err != nil {
 		t.Fatal(err)
 	}
-	if err = w.BeginFlightWatch(ctx, c, "test-target"); err != nil {
+	if err = w.BeginFlightWatch(ctx, c, "udp-server:0.0.0.0:14550/1/1/2/3"); err != nil {
 		t.Fatal(err)
 	}
 	watch, err := w.LoadFlightWatch(ctx, c.Context.FlightId)
 	if err != nil {
 		t.Fatal(err)
 	}
-	watch.Target = "udp-server:0.0.0.0:14550/1/1/2/3"
 	watch.HandoffAt = time.Now().Add(-2 * time.Second).UnixNano()
 	watch.AirborneAt = time.Now().Add(-time.Second).UnixNano()
 	if err = w.SaveFlightWatch(ctx, watch, nil); err != nil {

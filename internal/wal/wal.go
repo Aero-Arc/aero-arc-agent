@@ -320,7 +320,7 @@ func initDB(db *sql.DB) error {
 		return err
 	}
 
-	return nil
+	return ensureFlightWatchIndex(db)
 }
 
 // ensureTelemetryPendingSince adds the durable send-epoch timestamp to WALs
