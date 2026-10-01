@@ -914,7 +914,7 @@ func TestBatchedTelemetryACKsSustainFreshnessRespectWindowAndDispatchControl(t *
 	senderDone := make(chan error, 1)
 	ackDone := make(chan error, 1)
 	go func() { senderDone <- a.handleTelemetryFrames(ownerCtx, stream) }()
-	go func() { ackDone <- a.runAckLoop(ownerCtx, stream, func() {}) }()
+	go func() { ackDone <- a.runAckLoop(ownerCtx, stream, cancel) }()
 	select {
 	case latency := <-controlACK:
 		t.Logf("control dispatch latency behind 100 ACKs: %v", latency)
