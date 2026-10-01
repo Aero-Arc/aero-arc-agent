@@ -232,6 +232,12 @@ func initDB(db *sql.DB) error {
  );
  CREATE TABLE IF NOT EXISTS c2_command_targets (command_id TEXT PRIMARY KEY, target TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS legacy_aircraft_effect (id INTEGER PRIMARY KEY CHECK(id=1), c2_rowid INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS legacy_effect_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL);
+ INSERT INTO legacy_effect_revision(id,revision) VALUES(1,0) ON CONFLICT(id) DO NOTHING;
+ CREATE TRIGGER IF NOT EXISTS legacy_effect_insert_revision AFTER INSERT ON legacy_aircraft_effect BEGIN UPDATE legacy_effect_revision SET revision=revision+1 WHERE id=1; END;
+ CREATE TRIGGER IF NOT EXISTS legacy_effect_update_revision AFTER UPDATE ON legacy_aircraft_effect BEGIN UPDATE legacy_effect_revision SET revision=revision+1 WHERE id=1; END;
+ CREATE TABLE IF NOT EXISTS mission_effect_ownership(command_id TEXT PRIMARY KEY,legacy_revision INTEGER NOT NULL,c2_rowid INTEGER NOT NULL);
+
  CREATE TABLE IF NOT EXISTS telemetry_frames (
 		seq INTEGER PRIMARY KEY AUTOINCREMENT,
 		created_at INTEGER NOT NULL,
@@ -987,7 +993,8 @@ func (w *WAL) LoadMissionDeployment(ctx context.Context, commandID string) (Miss
 }
 
 // MarkMissionDeploymentEffectStarted commits the write-intent fence before the
-// first MAVLink mission message is handed to the transport. A paired durable C2
+// first MAVLink mission message is handed to the transport, and rechecks latest
+// ownership before every replacement retry. A paired durable C2
 // effect fence commits in the same transaction; an unpaired legacy mission
 // supersedes older durable observations. Prepared/busy admission never does so.
 //
@@ -1005,7 +1012,15 @@ func (w *WAL) MarkMissionDeploymentEffectStarted(ctx context.Context, commandID,
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, `UPDATE mission_deployments SET state='effect_started',updated_at=? WHERE command_id=? AND payload_fingerprint=? AND state='prepared'`, time.Now().UnixNano(), commandID, fingerprint)
+	// Serialize the ownership check with all other effect fences.
+	if _, err = tx.ExecContext(ctx, `UPDATE mission_deployments SET updated_at=updated_at WHERE command_id=?`, commandID); err != nil {
+		return err
+	}
+	var previous string
+	if err = tx.QueryRowContext(ctx, `SELECT state FROM mission_deployments WHERE command_id=? AND payload_fingerprint=?`, commandID, fingerprint).Scan(&previous); err != nil {
+		return ErrMissionDeploymentConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE mission_deployments SET state='effect_started',updated_at=? WHERE command_id=? AND payload_fingerprint=? AND state IN ('prepared','effect_started','outcome_unknown')`, time.Now().UnixNano(), commandID, fingerprint)
 	if err != nil {
 		return err
 	}
@@ -1032,9 +1047,20 @@ func (w *WAL) MarkMissionDeploymentEffectStarted(ctx context.Context, commandID,
 		if n != 1 {
 			return ErrCommandSuperseded
 		}
+	} else if previous != "prepared" {
+		var latest bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM mission_effect_ownership o JOIN legacy_effect_revision r ON r.id=1 AND r.revision=o.legacy_revision WHERE o.command_id=? AND NOT EXISTS(SELECT 1 FROM c2_commands WHERE effect_started=1 AND rowid>o.c2_rowid))`, commandID).Scan(&latest); err != nil {
+			return err
+		}
+		if !latest {
+			return ErrCommandSuperseded
+		}
 	} else {
 		// A legacy mission write also supersedes earlier durable observations.
 		if _, err = tx.ExecContext(ctx, `INSERT INTO legacy_aircraft_effect(id,c2_rowid) SELECT 1,COALESCE(MAX(rowid),0) FROM c2_commands WHERE true ON CONFLICT(id) DO UPDATE SET c2_rowid=MAX(c2_rowid,excluded.c2_rowid)`); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO mission_effect_ownership(command_id,legacy_revision,c2_rowid) SELECT ?,revision,(SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1) FROM legacy_effect_revision WHERE id=1`, commandID); err != nil {
 			return err
 		}
 	}

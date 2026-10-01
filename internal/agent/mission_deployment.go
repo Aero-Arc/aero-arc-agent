@@ -299,10 +299,7 @@ func (a *Agent) executeMissionDeployment(ctx context.Context, command *agentv1.D
 		if err := a.wal.BindMissionDeploymentTarget(ctx, command.CommandId, a.commandTargetIdentity(selected)); err != nil {
 			return err
 		}
-		if !effectStarted {
-			return a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint)
-		}
-		return nil
+		return a.wal.MarkMissionDeploymentEffectStarted(ctx, command.CommandId, fingerprint)
 	}
 	digest, count, ack, err := a.deployMAVLinkMission(ctx, target, command.Plan, false, command.ExpiresAtUnixMs)
 	result.OnboardMissionDigest = digest
