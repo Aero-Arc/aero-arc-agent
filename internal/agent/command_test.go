@@ -411,7 +411,7 @@ func TestMalformedDurableCommandsDoNotEndTelemetry(t *testing.T) {
 }
 
 func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
-	for _, scenario := range []string{"busy", "no-target", "no-transport", "write", "superseded"} {
+	for _, scenario := range []string{"busy", "no-target", "no-transport", "write", "superseded", "prepared-superseded"} {
 		t.Run(scenario, func(t *testing.T) {
 			a, closeWAL := testMissionAgent(t)
 			defer closeWAL()
@@ -456,6 +456,22 @@ func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if scenario == "prepared-superseded" {
+				a.aircraftCommandActive = true
+				if _, err := a.executeDurableCommand(ctx, c, nil); err != nil {
+					t.Fatal(err)
+				}
+				a.aircraftCommandActive = false
+				if err := a.wal.RecordLegacyAircraftEffect(ctx); err != nil {
+					t.Fatal(err)
+				}
+				a.deployMAVLinkMission = func(_ context.Context, _ *mavlinkTarget, _ *pb.MissionPlan, recovery bool, _ int64) (string, uint32, *uint32, error) {
+					if !recovery {
+						t.Fatal("superseded command attempted upload")
+					}
+					return mission.Binding.MissionDigest, 1, nil, nil
+				}
+			}
 			e, err := a.executeDurableCommand(ctx, c, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -468,8 +484,8 @@ func TestC2MissionEffectFenceBeginsAtMissionWrite(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if scenario == "superseded" {
-				if writes != 0 || record.EffectStarted || !hasStage(e, "rejected") || hasStage(e, "outcome_unknown") {
+			if scenario == "superseded" || scenario == "prepared-superseded" {
+				if writes != 0 || record.EffectStarted || !hasStage(e, "rejected") || hasStage(e, "applied") {
 					t.Fatalf("superseded mission not definitively rejected: %+v", e)
 				}
 				replay, err := a.executeDurableCommand(ctx, c, nil)

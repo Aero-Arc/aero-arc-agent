@@ -87,7 +87,9 @@ func (w *WAL) AdmitCommand(ctx context.Context, id string, r CommandRecord) erro
 //
 // Returns: nil after atomic merge; ErrObservationSuperseded if a new observed
 // event crosses a newer durable or legacy effect. Existing observations replay
-// unchanged. Conflicting evidence, identity mismatch, and storage errors roll back.
+// unchanged. ErrCommandSuperseded rejects new applied evidence for an effect-free
+// command overtaken by newer authority. Conflicting evidence, identity mismatch,
+// and storage errors roll back.
 func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byte, effect bool) error {
 	incoming := &pb.CommandEvidence{}
 	if err := proto.Unmarshal(evidence, incoming); err != nil {
@@ -122,6 +124,18 @@ func (w *WAL) SaveCommand(ctx context.Context, id, digest string, evidence []byt
 			}
 		}
 		if !found {
+			// Matching readback is not evidence that a prepared command applied
+			// when newer authority installed the same mission. Check atomically
+			// with persistence so even another WAL user cannot race attribution.
+			if event.Stage == "applied" {
+				var superseded bool
+				if err = tx.QueryRowContext(ctx, `SELECT effect_started=0 AND (rowid<=COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) OR EXISTS(SELECT 1 FROM c2_commands newer WHERE newer.rowid>current.rowid AND newer.effect_started=1)) FROM c2_commands current WHERE command_id=?`, id).Scan(&superseded); err != nil {
+					return err
+				}
+				if superseded {
+					return ErrCommandSuperseded
+				}
+			}
 			if event.Stage == "observed" {
 				var latest bool
 				if err = tx.QueryRowContext(ctx, `SELECT rowid>COALESCE((SELECT c2_rowid FROM legacy_aircraft_effect WHERE id=1),0) AND rowid=(SELECT MAX(rowid) FROM c2_commands WHERE effect_started=1) FROM c2_commands WHERE command_id=?`, id).Scan(&latest); err != nil {
