@@ -4,10 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"log/slog"
-	"path/filepath"
-	"strings"
 	"time"
 
 	pb "github.com/aero-arc/aero-arc-protos/gen/go/aeroarc/agent/v1"
@@ -256,28 +253,5 @@ func (a *Agent) requestCompletionObservations(ctx context.Context) {
 // endpoint or autopilot identity requires explicit recovery, never automatic
 // rebinding of a flight watch. MAVLink IDs are not cryptographic hardware IDs.
 func (a *Agent) completionTargetIdentity(target *mavlinkTarget) string {
-	if target == nil || target.channel == nil {
-		return ""
-	}
-	if a.options == nil {
-		return ""
-	}
-	endpoint := ""
-	if a.options.Debug {
-		address := strings.TrimSpace(a.options.DebugMAVLinkAddress)
-		if address == "" {
-			address = "0.0.0.0:14550"
-		}
-		endpoint = "udp-server:" + address
-	} else {
-		if a.options.SerialPath == "" {
-			return ""
-		}
-		path, err := filepath.Abs(a.options.SerialPath)
-		if err != nil {
-			return ""
-		}
-		endpoint = "serial:" + path
-	}
-	return fmt.Sprintf("%s/%d/%d/%d/%d", endpoint, target.systemID, target.componentID, target.vehicleType, target.autopilot)
+	return a.commandTargetIdentity(target)
 }

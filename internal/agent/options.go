@@ -36,7 +36,6 @@ type AgentOptions struct {
 	MissionProtocolQuietPeriod time.Duration
 	DebugMAVLinkAddress        string
 	Debug                      bool
-	DebugMAVLinkAddress        string
 }
 
 // GetAgentOptions builds Agent runtime options from CLI flags and the API-key
