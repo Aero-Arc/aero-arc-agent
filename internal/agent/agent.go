@@ -61,6 +61,7 @@ type telemetryStreamWindow struct {
 	permits         chan struct{}
 	progress        chan struct{}
 	progressTimeout time.Duration
+	retryAfter      atomic.Int64
 }
 
 func withTelemetryStreamWindow(ctx context.Context, maximum int64) context.Context {
@@ -88,6 +89,18 @@ func acquireTelemetryPermit(ctx context.Context) error {
 		return nil
 	}
 	for {
+		// Relay admission may depend on a control message on this same stream.
+		// Back off only the sender; keep receiving control and committing ACKs.
+		if delay := time.Until(time.Unix(0, window.retryAfter.Load())); delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				continue
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+		}
 		select {
 		case window.permits <- struct{}{}:
 			if len(window.permits) == cap(window.permits) {
@@ -1039,6 +1052,9 @@ func (a *Agent) runTelemetryACKWorker(ctx context.Context, acknowledgments <-cha
 				return err
 			}
 			if err := a.handleTelemetryAck(ctx, ack); err != nil {
+				if errors.Is(err, ErrTelemetryRetry) && telemetryWindow(ctx) != nil {
+					continue
+				}
 				return err
 			}
 		case <-ticker.C:
@@ -1190,6 +1206,11 @@ func (a *Agent) handleTelemetryAck(ctx context.Context, ack *agentv1.TelemetryAc
 		slog.LogAttrs(ctx, slog.LevelDebug, "telemetry_ack_seq_only", slog.Uint64("seq", ack.GetSeq()))
 	}
 	if result.Changed {
+		if disposition == wal.TelemetryAckRetry {
+			if window := telemetryWindow(ctx); window != nil {
+				window.retryAfter.Store(time.Now().Add(time.Second).UnixNano())
+			}
+		}
 		releaseTelemetryPermit(ctx)
 	}
 	switch ack.GetStatus() {
